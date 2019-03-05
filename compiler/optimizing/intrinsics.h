@@ -27,21 +27,32 @@ namespace art {
 class CompilerDriver;
 class DexFile;
 
+// Positive floating-point infinities.
+static constexpr uint32_t kPositiveInfinityFloat = 0x7f800000U;
+static constexpr uint64_t kPositiveInfinityDouble = UINT64_C(0x7ff0000000000000);
+
+static constexpr uint32_t kNanFloat = 0x7fc00000U;
+static constexpr uint64_t kNanDouble = 0x7ff8000000000000;
+
 // Recognize intrinsics from HInvoke nodes.
 class IntrinsicsRecognizer : public HOptimization {
  public:
-  IntrinsicsRecognizer(HGraph* graph, const DexFile* dex_file, CompilerDriver* driver)
-      : HOptimization(graph, true, kIntrinsicsRecognizerPassName),
-        dex_file_(dex_file), driver_(driver) {}
+  IntrinsicsRecognizer(HGraph* graph,
+                       OptimizingCompilerStats* stats,
+                       const char* name = kIntrinsicsRecognizerPassName)
+      : HOptimization(graph, name, stats) {}
 
-  void Run() OVERRIDE;
+  bool Run() OVERRIDE;
+
+  // Static helper that recognizes intrinsic call. Returns true on success.
+  // If it fails due to invoke type mismatch, wrong_invoke_type is set.
+  // Useful to recognize intrinsics on individual calls outside this full pass.
+  static bool Recognize(HInvoke* invoke, ArtMethod* method, /*out*/ bool* wrong_invoke_type)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   static constexpr const char* kIntrinsicsRecognizerPassName = "intrinsics_recognition";
 
  private:
-  const DexFile* dex_file_;
-  CompilerDriver* driver_;
-
   DISALLOW_COPY_AND_ASSIGN(IntrinsicsRecognizer);
 };
 
@@ -55,12 +66,12 @@ class IntrinsicVisitor : public ValueObject {
     switch (invoke->GetIntrinsic()) {
       case Intrinsics::kNone:
         return;
-#define OPTIMIZING_INTRINSICS(Name, IsStatic) \
-      case Intrinsics::k ## Name:             \
-        Visit ## Name(invoke);                \
+#define OPTIMIZING_INTRINSICS(Name, ...) \
+      case Intrinsics::k ## Name: \
+        Visit ## Name(invoke);    \
         return;
 #include "intrinsics_list.h"
-INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
+        INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
 #undef INTRINSICS_LIST
 #undef OPTIMIZING_INTRINSICS
 
@@ -70,11 +81,11 @@ INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
 
   // Define visitor methods.
 
-#define OPTIMIZING_INTRINSICS(Name, IsStatic)                    \
+#define OPTIMIZING_INTRINSICS(Name, ...) \
   virtual void Visit ## Name(HInvoke* invoke ATTRIBUTE_UNUSED) { \
   }
 #include "intrinsics_list.h"
-INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
+  INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
 #undef INTRINSICS_LIST
 #undef OPTIMIZING_INTRINSICS
 
@@ -83,9 +94,9 @@ INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
                             InvokeDexCallingConventionVisitor* calling_convention_visitor) {
     if (kIsDebugBuild && invoke->IsInvokeStaticOrDirect()) {
       HInvokeStaticOrDirect* invoke_static_or_direct = invoke->AsInvokeStaticOrDirect();
-      // When we do not run baseline, explicit clinit checks triggered by static
-      // invokes must have been pruned by art::PrepareForRegisterAllocation.
-      DCHECK(codegen->IsBaseline() || !invoke_static_or_direct->IsStaticWithExplicitClinitCheck());
+      // Explicit clinit checks triggered by static invokes must have been
+      // pruned by art::PrepareForRegisterAllocation.
+      DCHECK(!invoke_static_or_direct->IsStaticWithExplicitClinitCheck());
     }
 
     if (invoke->GetNumberOfArguments() == 0) {
@@ -97,7 +108,7 @@ INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
 
     // We're moving potentially two or more locations to locations that could overlap, so we need
     // a parallel move resolver.
-    HParallelMove parallel_move(codegen->GetGraph()->GetArena());
+    HParallelMove parallel_move(codegen->GetGraph()->GetAllocator());
 
     for (size_t i = 0; i < invoke->GetNumberOfArguments(); i++) {
       HInstruction* input = invoke->InputAt(i);
@@ -110,12 +121,245 @@ INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
     codegen->GetMoveResolver()->EmitNativeCode(&parallel_move);
   }
 
+  static void ComputeIntegerValueOfLocations(HInvoke* invoke,
+                                             CodeGenerator* codegen,
+                                             Location return_location,
+                                             Location first_argument_location);
+
+  // Temporary data structure for holding Integer.valueOf data for generating code.
+  // We only use it if the boot image contains the IntegerCache objects.
+  struct IntegerValueOfInfo {
+    static constexpr uint32_t kInvalidReference = static_cast<uint32_t>(-1);
+
+    IntegerValueOfInfo();
+
+    // Offset of the Integer.value field for initializing a newly allocated instance.
+    uint32_t value_offset;
+    // The low value in the cache.
+    int32_t low;
+    // The length of the cache array.
+    uint32_t length;
+
+    // Boot image offset of java.lang.Integer for allocating an instance.
+    uint32_t integer_boot_image_offset;  // Set to kInvalidReference when compiling the boot image.
+
+    // This union contains references to the boot image. For app AOT or JIT compilation,
+    // these are the boot image offsets of the target. For boot image compilation, the
+    // location shall be known only at link time, so we encode a symbolic reference using
+    // IntrinsicObjects::EncodePatch().
+    union {
+      // The target value for a constant input in the cache range. If the constant input
+      // is out of range (use `low` and `length` to check), this value is bogus (set to
+      // kInvalidReference) and the code must allocate a new Integer.
+      uint32_t value_boot_image_reference;
+
+      // The cache array data used for a non-constant input in the cache range.
+      // If the input is out of range, the code must allocate a new Integer.
+      uint32_t array_data_boot_image_reference;
+    };
+  };
+
+  static IntegerValueOfInfo ComputeIntegerValueOfInfo(
+      HInvoke* invoke, const CompilerOptions& compiler_options);
+
  protected:
   IntrinsicVisitor() {}
 
  private:
   DISALLOW_COPY_AND_ASSIGN(IntrinsicVisitor);
 };
+
+#define GENERIC_OPTIMIZATION(name, bit)                \
+public:                                                \
+void Set##name() { SetBit(k##name); }                  \
+bool Get##name() const { return IsBitSet(k##name); }   \
+private:                                               \
+static constexpr size_t k##name = bit
+
+class IntrinsicOptimizations : public ValueObject {
+ public:
+  explicit IntrinsicOptimizations(HInvoke* invoke)
+      : value_(invoke->GetIntrinsicOptimizations()) {}
+  explicit IntrinsicOptimizations(const HInvoke& invoke)
+      : value_(invoke.GetIntrinsicOptimizations()) {}
+
+  static constexpr int kNumberOfGenericOptimizations = 2;
+  GENERIC_OPTIMIZATION(DoesNotNeedDexCache, 0);
+  GENERIC_OPTIMIZATION(DoesNotNeedEnvironment, 1);
+
+ protected:
+  bool IsBitSet(uint32_t bit) const {
+    DCHECK_LT(bit, sizeof(uint32_t) * kBitsPerByte);
+    return (*value_ & (1 << bit)) != 0u;
+  }
+
+  void SetBit(uint32_t bit) {
+    DCHECK_LT(bit, sizeof(uint32_t) * kBitsPerByte);
+    *(const_cast<uint32_t* const>(value_)) |= (1 << bit);
+  }
+
+ private:
+  const uint32_t* const value_;
+
+  DISALLOW_COPY_AND_ASSIGN(IntrinsicOptimizations);
+};
+
+#undef GENERIC_OPTIMIZATION
+
+#define INTRINSIC_OPTIMIZATION(name, bit)                             \
+public:                                                               \
+void Set##name() { SetBit(k##name); }                                 \
+bool Get##name() const { return IsBitSet(k##name); }                  \
+private:                                                              \
+static constexpr size_t k##name = (bit) + kNumberOfGenericOptimizations
+
+class StringEqualsOptimizations : public IntrinsicOptimizations {
+ public:
+  explicit StringEqualsOptimizations(HInvoke* invoke) : IntrinsicOptimizations(invoke) {}
+
+  INTRINSIC_OPTIMIZATION(ArgumentNotNull, 0);
+  INTRINSIC_OPTIMIZATION(ArgumentIsString, 1);
+  INTRINSIC_OPTIMIZATION(NoReadBarrierForStringClass, 2);
+
+ private:
+  DISALLOW_COPY_AND_ASSIGN(StringEqualsOptimizations);
+};
+
+class SystemArrayCopyOptimizations : public IntrinsicOptimizations {
+ public:
+  explicit SystemArrayCopyOptimizations(HInvoke* invoke) : IntrinsicOptimizations(invoke) {}
+
+  INTRINSIC_OPTIMIZATION(SourceIsNotNull, 0);
+  INTRINSIC_OPTIMIZATION(DestinationIsNotNull, 1);
+  INTRINSIC_OPTIMIZATION(DestinationIsSource, 2);
+  INTRINSIC_OPTIMIZATION(CountIsSourceLength, 3);
+  INTRINSIC_OPTIMIZATION(CountIsDestinationLength, 4);
+  INTRINSIC_OPTIMIZATION(DoesNotNeedTypeCheck, 5);
+  INTRINSIC_OPTIMIZATION(DestinationIsTypedObjectArray, 6);
+  INTRINSIC_OPTIMIZATION(DestinationIsNonPrimitiveArray, 7);
+  INTRINSIC_OPTIMIZATION(DestinationIsPrimitiveArray, 8);
+  INTRINSIC_OPTIMIZATION(SourceIsNonPrimitiveArray, 9);
+  INTRINSIC_OPTIMIZATION(SourceIsPrimitiveArray, 10);
+
+ private:
+  DISALLOW_COPY_AND_ASSIGN(SystemArrayCopyOptimizations);
+};
+
+#undef INTRISIC_OPTIMIZATION
+
+//
+// Macros for use in the intrinsics code generators.
+//
+
+// Defines an unimplemented intrinsic: that is, a method call that is recognized as an
+// intrinsic to exploit e.g. no side-effects or exceptions, but otherwise not handled
+// by this architecture-specific intrinsics code generator. Eventually it is implemented
+// as a true method call.
+#define UNIMPLEMENTED_INTRINSIC(Arch, Name)                                               \
+void IntrinsicLocationsBuilder ## Arch::Visit ## Name(HInvoke* invoke ATTRIBUTE_UNUSED) { \
+}                                                                                         \
+void IntrinsicCodeGenerator ## Arch::Visit ## Name(HInvoke* invoke ATTRIBUTE_UNUSED) {    \
+}
+
+// Defines a list of unreached intrinsics: that is, method calls that are recognized as
+// an intrinsic, and then always converted into HIR instructions before they reach any
+// architecture-specific intrinsics code generator.
+#define UNREACHABLE_INTRINSIC(Arch, Name)                                \
+void IntrinsicLocationsBuilder ## Arch::Visit ## Name(HInvoke* invoke) { \
+  LOG(FATAL) << "Unreachable: intrinsic " << invoke->GetIntrinsic()      \
+             << " should have been converted to HIR";                    \
+}                                                                        \
+void IntrinsicCodeGenerator ## Arch::Visit ## Name(HInvoke* invoke) {    \
+  LOG(FATAL) << "Unreachable: intrinsic " << invoke->GetIntrinsic()      \
+             << " should have been converted to HIR";                    \
+}
+#define UNREACHABLE_INTRINSICS(Arch)                            \
+UNREACHABLE_INTRINSIC(Arch, MathMinIntInt)                      \
+UNREACHABLE_INTRINSIC(Arch, MathMinLongLong)                    \
+UNREACHABLE_INTRINSIC(Arch, MathMinFloatFloat)                  \
+UNREACHABLE_INTRINSIC(Arch, MathMinDoubleDouble)                \
+UNREACHABLE_INTRINSIC(Arch, MathMaxIntInt)                      \
+UNREACHABLE_INTRINSIC(Arch, MathMaxLongLong)                    \
+UNREACHABLE_INTRINSIC(Arch, MathMaxFloatFloat)                  \
+UNREACHABLE_INTRINSIC(Arch, MathMaxDoubleDouble)                \
+UNREACHABLE_INTRINSIC(Arch, MathAbsInt)                         \
+UNREACHABLE_INTRINSIC(Arch, MathAbsLong)                        \
+UNREACHABLE_INTRINSIC(Arch, MathAbsFloat)                       \
+UNREACHABLE_INTRINSIC(Arch, MathAbsDouble)                      \
+UNREACHABLE_INTRINSIC(Arch, FloatFloatToIntBits)                \
+UNREACHABLE_INTRINSIC(Arch, DoubleDoubleToLongBits)             \
+UNREACHABLE_INTRINSIC(Arch, FloatIsNaN)                         \
+UNREACHABLE_INTRINSIC(Arch, DoubleIsNaN)                        \
+UNREACHABLE_INTRINSIC(Arch, IntegerRotateLeft)                  \
+UNREACHABLE_INTRINSIC(Arch, LongRotateLeft)                     \
+UNREACHABLE_INTRINSIC(Arch, IntegerRotateRight)                 \
+UNREACHABLE_INTRINSIC(Arch, LongRotateRight)                    \
+UNREACHABLE_INTRINSIC(Arch, IntegerCompare)                     \
+UNREACHABLE_INTRINSIC(Arch, LongCompare)                        \
+UNREACHABLE_INTRINSIC(Arch, IntegerSignum)                      \
+UNREACHABLE_INTRINSIC(Arch, LongSignum)                         \
+UNREACHABLE_INTRINSIC(Arch, StringCharAt)                       \
+UNREACHABLE_INTRINSIC(Arch, StringIsEmpty)                      \
+UNREACHABLE_INTRINSIC(Arch, StringLength)                       \
+UNREACHABLE_INTRINSIC(Arch, UnsafeLoadFence)                    \
+UNREACHABLE_INTRINSIC(Arch, UnsafeStoreFence)                   \
+UNREACHABLE_INTRINSIC(Arch, UnsafeFullFence)                    \
+UNREACHABLE_INTRINSIC(Arch, VarHandleFullFence)                 \
+UNREACHABLE_INTRINSIC(Arch, VarHandleAcquireFence)              \
+UNREACHABLE_INTRINSIC(Arch, VarHandleReleaseFence)              \
+UNREACHABLE_INTRINSIC(Arch, VarHandleLoadLoadFence)             \
+UNREACHABLE_INTRINSIC(Arch, VarHandleStoreStoreFence)           \
+UNREACHABLE_INTRINSIC(Arch, MethodHandleInvokeExact)            \
+UNREACHABLE_INTRINSIC(Arch, MethodHandleInvoke)                 \
+UNREACHABLE_INTRINSIC(Arch, VarHandleCompareAndExchange)        \
+UNREACHABLE_INTRINSIC(Arch, VarHandleCompareAndExchangeAcquire) \
+UNREACHABLE_INTRINSIC(Arch, VarHandleCompareAndExchangeRelease) \
+UNREACHABLE_INTRINSIC(Arch, VarHandleCompareAndSet)             \
+UNREACHABLE_INTRINSIC(Arch, VarHandleGet)                       \
+UNREACHABLE_INTRINSIC(Arch, VarHandleGetAcquire)                \
+UNREACHABLE_INTRINSIC(Arch, VarHandleGetAndAdd)                 \
+UNREACHABLE_INTRINSIC(Arch, VarHandleGetAndAddAcquire)          \
+UNREACHABLE_INTRINSIC(Arch, VarHandleGetAndAddRelease)          \
+UNREACHABLE_INTRINSIC(Arch, VarHandleGetAndBitwiseAnd)          \
+UNREACHABLE_INTRINSIC(Arch, VarHandleGetAndBitwiseAndAcquire)   \
+UNREACHABLE_INTRINSIC(Arch, VarHandleGetAndBitwiseAndRelease)   \
+UNREACHABLE_INTRINSIC(Arch, VarHandleGetAndBitwiseOr)           \
+UNREACHABLE_INTRINSIC(Arch, VarHandleGetAndBitwiseOrAcquire)    \
+UNREACHABLE_INTRINSIC(Arch, VarHandleGetAndBitwiseOrRelease)    \
+UNREACHABLE_INTRINSIC(Arch, VarHandleGetAndBitwiseXor)          \
+UNREACHABLE_INTRINSIC(Arch, VarHandleGetAndBitwiseXorAcquire)   \
+UNREACHABLE_INTRINSIC(Arch, VarHandleGetAndBitwiseXorRelease)   \
+UNREACHABLE_INTRINSIC(Arch, VarHandleGetAndSet)                 \
+UNREACHABLE_INTRINSIC(Arch, VarHandleGetAndSetAcquire)          \
+UNREACHABLE_INTRINSIC(Arch, VarHandleGetAndSetRelease)          \
+UNREACHABLE_INTRINSIC(Arch, VarHandleGetOpaque)                 \
+UNREACHABLE_INTRINSIC(Arch, VarHandleGetVolatile)               \
+UNREACHABLE_INTRINSIC(Arch, VarHandleSet)                       \
+UNREACHABLE_INTRINSIC(Arch, VarHandleSetOpaque)                 \
+UNREACHABLE_INTRINSIC(Arch, VarHandleSetRelease)                \
+UNREACHABLE_INTRINSIC(Arch, VarHandleSetVolatile)               \
+UNREACHABLE_INTRINSIC(Arch, VarHandleWeakCompareAndSet)         \
+UNREACHABLE_INTRINSIC(Arch, VarHandleWeakCompareAndSetAcquire)  \
+UNREACHABLE_INTRINSIC(Arch, VarHandleWeakCompareAndSetPlain)    \
+UNREACHABLE_INTRINSIC(Arch, VarHandleWeakCompareAndSetRelease)
+
+template <typename IntrinsicLocationsBuilder, typename Codegenerator>
+bool IsCallFreeIntrinsic(HInvoke* invoke, Codegenerator* codegen) {
+  if (invoke->GetIntrinsic() != Intrinsics::kNone) {
+    // This invoke may have intrinsic code generation defined. However, we must
+    // now also determine if this code generation is truly there and call-free
+    // (not unimplemented, no bail on instruction features, or call on slow path).
+    // This is done by actually calling the locations builder on the instruction
+    // and clearing out the locations once result is known. We assume this
+    // call only has creating locations as side effects!
+    // TODO: Avoid wasting Arena memory.
+    IntrinsicLocationsBuilder builder(codegen);
+    bool success = builder.TryDispatch(invoke) && !invoke->GetLocations()->CanCall();
+    invoke->SetLocations(nullptr);
+    return success;
+  }
+  return false;
+}
 
 }  // namespace art
 

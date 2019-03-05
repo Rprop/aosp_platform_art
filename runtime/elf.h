@@ -42,7 +42,7 @@ typedef uint64_t Elf64_Xword;
 typedef int64_t  Elf64_Sxword;
 
 // Object file magic string.
-static const char ElfMagic[] = { 0x7f, 'E', 'L', 'F', '\0' };
+static constexpr char ElfMagic[] = { 0x7f, 'E', 'L', 'F', '\0' };
 
 // e_ident size and indices.
 enum {
@@ -60,10 +60,13 @@ enum {
 };
 
 // BEGIN android-added for <elf.h> compat
-const char ELFMAG0 = ElfMagic[EI_MAG0];
-const char ELFMAG1 = ElfMagic[EI_MAG1];
-const char ELFMAG2 = ElfMagic[EI_MAG2];
-const char ELFMAG3 = ElfMagic[EI_MAG3];
+constexpr char ELFMAG0 = ElfMagic[EI_MAG0];
+constexpr char ELFMAG1 = ElfMagic[EI_MAG1];
+constexpr char ELFMAG2 = ElfMagic[EI_MAG2];
+constexpr char ELFMAG3 = ElfMagic[EI_MAG3];
+constexpr char ELFMAG[] = "\177ELF";
+constexpr int SELFMAG = 4;
+constexpr int NT_PRSTATUS = 1;
 // END android-added for <elf.h> compat
 
 struct Elf32_Ehdr {
@@ -1284,6 +1287,7 @@ enum : unsigned {
 
   SHT_MIPS_REGINFO        = 0x70000006, // Register usage information
   SHT_MIPS_OPTIONS        = 0x7000000d, // General options
+  SHT_MIPS_ABIFLAGS       = 0x7000002a, // Abiflags options
 
   SHT_HIPROC        = 0x7fffffff, // Highest processor arch-specific type.
   SHT_LOUSER        = 0x80000000, // Lowest type reserved for applications.
@@ -1410,7 +1414,9 @@ struct Elf32_Sym {
 };
 
 // BEGIN android-added for <elf.h> compat
+static inline unsigned char ELF32_ST_BIND(unsigned char st_info) { return st_info >> 4; }
 static inline unsigned char ELF32_ST_TYPE(unsigned char st_info) { return st_info & 0x0f; }
+static inline unsigned char ELF64_ST_BIND(unsigned char st_info) { return st_info >> 4; }
 static inline unsigned char ELF64_ST_TYPE(unsigned char st_info) { return st_info & 0x0f; }
 // END android-added for <elf.h> compat
 
@@ -1606,7 +1612,8 @@ enum {
   // MIPS program header types.
   PT_MIPS_REGINFO  = 0x70000000,  // Register usage information.
   PT_MIPS_RTPROC   = 0x70000001,  // Runtime procedure table.
-  PT_MIPS_OPTIONS  = 0x70000002   // Options segment.
+  PT_MIPS_OPTIONS  = 0x70000002,  // Options segment.
+  PT_MIPS_ABIFLAGS = 0x70000003   // Abiflags segment.
 };
 
 // Segment flag bits.

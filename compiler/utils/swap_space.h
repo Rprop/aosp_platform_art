@@ -17,81 +17,91 @@
 #ifndef ART_COMPILER_UTILS_SWAP_SPACE_H_
 #define ART_COMPILER_UTILS_SWAP_SPACE_H_
 
+#include <stddef.h>
+#include <stdint.h>
 #include <cstdlib>
 #include <list>
 #include <set>
-#include <stdint.h>
-#include <stddef.h>
+#include <vector>
 
-#include "base/debug_stack.h"
-#include "base/logging.h"
+#include <android-base/logging.h>
+
 #include "base/macros.h"
 #include "base/mutex.h"
-#include "mem_map.h"
 
 namespace art {
-
-// Chunk of space.
-struct SpaceChunk {
-  uint8_t* ptr;
-  size_t size;
-
-  uintptr_t Start() const {
-    return reinterpret_cast<uintptr_t>(ptr);
-  }
-  uintptr_t End() const {
-    return reinterpret_cast<uintptr_t>(ptr) + size;
-  }
-};
-
-inline bool operator==(const SpaceChunk& lhs, const SpaceChunk& rhs) {
-  return (lhs.size == rhs.size) && (lhs.ptr == rhs.ptr);
-}
-
-class SortChunkByPtr {
- public:
-  bool operator()(const SpaceChunk& a, const SpaceChunk& b) const {
-    return reinterpret_cast<uintptr_t>(a.ptr) < reinterpret_cast<uintptr_t>(b.ptr);
-  }
-};
 
 // An arena pool that creates arenas backed by an mmaped file.
 class SwapSpace {
  public:
   SwapSpace(int fd, size_t initial_size);
   ~SwapSpace();
-  void* Alloc(size_t size) LOCKS_EXCLUDED(lock_);
-  void Free(void* ptr, size_t size) LOCKS_EXCLUDED(lock_);
+  void* Alloc(size_t size) REQUIRES(!lock_);
+  void Free(void* ptr, size_t size) REQUIRES(!lock_);
 
   size_t GetSize() {
     return size_;
   }
 
  private:
-  SpaceChunk NewFileChunk(size_t min_size);
+  // Chunk of space.
+  struct SpaceChunk {
+    // We need mutable members as we keep these objects in a std::set<> (providing only const
+    // access) but we modify these members while carefully preserving the std::set<> ordering.
+    mutable uint8_t* ptr;
+    mutable size_t size;
 
-  int fd_;
-  size_t size_;
-  std::list<SpaceChunk> maps_;
+    uintptr_t Start() const {
+      return reinterpret_cast<uintptr_t>(ptr);
+    }
+    uintptr_t End() const {
+      return reinterpret_cast<uintptr_t>(ptr) + size;
+    }
+  };
 
-  // NOTE: Boost.Bimap would be useful for the two following members.
+  class SortChunkByPtr {
+   public:
+    bool operator()(const SpaceChunk& a, const SpaceChunk& b) const {
+      return reinterpret_cast<uintptr_t>(a.ptr) < reinterpret_cast<uintptr_t>(b.ptr);
+    }
+  };
 
-  // Map start of a free chunk to its size.
   typedef std::set<SpaceChunk, SortChunkByPtr> FreeByStartSet;
-  FreeByStartSet free_by_start_ GUARDED_BY(lock_);
 
   // Map size to an iterator to free_by_start_'s entry.
-  typedef std::pair<size_t, FreeByStartSet::const_iterator> FreeBySizeEntry;
+  struct FreeBySizeEntry {
+    FreeBySizeEntry(size_t sz, FreeByStartSet::const_iterator entry)
+        : size(sz), free_by_start_entry(entry) { }
+
+    // We need mutable members as we keep these objects in a std::set<> (providing only const
+    // access) but we modify these members while carefully preserving the std::set<> ordering.
+    mutable size_t size;
+    mutable FreeByStartSet::const_iterator free_by_start_entry;
+  };
   struct FreeBySizeComparator {
-    bool operator()(const FreeBySizeEntry& lhs, const FreeBySizeEntry& rhs) {
-      if (lhs.first != rhs.first) {
-        return lhs.first < rhs.first;
+    bool operator()(const FreeBySizeEntry& lhs, const FreeBySizeEntry& rhs) const {
+      if (lhs.size != rhs.size) {
+        return lhs.size < rhs.size;
       } else {
-        return lhs.second->Start() < rhs.second->Start();
+        return lhs.free_by_start_entry->Start() < rhs.free_by_start_entry->Start();
       }
     }
   };
   typedef std::set<FreeBySizeEntry, FreeBySizeComparator> FreeBySizeSet;
+
+  SpaceChunk NewFileChunk(size_t min_size) REQUIRES(lock_);
+
+  void RemoveChunk(FreeBySizeSet::const_iterator free_by_size_pos) REQUIRES(lock_);
+  void InsertChunk(const SpaceChunk& chunk) REQUIRES(lock_);
+
+  int fd_;
+  size_t size_;
+
+  // NOTE: Boost.Bimap would be useful for the two following members.
+
+  // Map start of a free chunk to its size.
+  FreeByStartSet free_by_start_ GUARDED_BY(lock_);
+  // Free chunks ordered by size.
   FreeBySizeSet free_by_size_ GUARDED_BY(lock_);
 
   mutable Mutex lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
@@ -115,7 +125,8 @@ class SwapAllocator<void> {
   explicit SwapAllocator(SwapSpace* swap_space) : swap_space_(swap_space) {}
 
   template <typename U>
-  SwapAllocator(const SwapAllocator<U>& other) : swap_space_(other.swap_space_) {}
+  SwapAllocator(const SwapAllocator<U>& other)
+      : swap_space_(other.swap_space_) {}
 
   SwapAllocator(const SwapAllocator& other) = default;
   SwapAllocator& operator=(const SwapAllocator& other) = default;
@@ -126,6 +137,9 @@ class SwapAllocator<void> {
 
   template <typename U>
   friend class SwapAllocator;
+
+  template <typename U>
+  friend bool operator==(const SwapAllocator<U>& lhs, const SwapAllocator<U>& rhs);
 };
 
 template <typename T>
@@ -147,7 +161,8 @@ class SwapAllocator {
   explicit SwapAllocator(SwapSpace* swap_space) : swap_space_(swap_space) {}
 
   template <typename U>
-  SwapAllocator(const SwapAllocator<U>& other) : swap_space_(other.swap_space_) {}
+  SwapAllocator(const SwapAllocator<U>& other)
+      : swap_space_(other.swap_space_) {}
 
   SwapAllocator(const SwapAllocator& other) = default;
   SwapAllocator& operator=(const SwapAllocator& other) = default;
@@ -163,7 +178,9 @@ class SwapAllocator {
   pointer allocate(size_type n, SwapAllocator<void>::pointer hint ATTRIBUTE_UNUSED = nullptr) {
     DCHECK_LE(n, max_size());
     if (swap_space_ == nullptr) {
-      return reinterpret_cast<T*>(malloc(n * sizeof(T)));
+      T* result = reinterpret_cast<T*>(malloc(n * sizeof(T)));
+      CHECK(result != nullptr || n == 0u);  // Abort if malloc() fails.
+      return result;
     } else {
       return reinterpret_cast<T*>(swap_space_->Alloc(n * sizeof(T)));
     }
@@ -199,7 +216,20 @@ class SwapAllocator {
 
   template <typename U>
   friend class SwapAllocator;
+
+  template <typename U>
+  friend bool operator==(const SwapAllocator<U>& lhs, const SwapAllocator<U>& rhs);
 };
+
+template <typename T>
+inline bool operator==(const SwapAllocator<T>& lhs, const SwapAllocator<T>& rhs) {
+  return lhs.swap_space_ == rhs.swap_space_;
+}
+
+template <typename T>
+inline bool operator!=(const SwapAllocator<T>& lhs, const SwapAllocator<T>& rhs) {
+  return !(lhs == rhs);
+}
 
 template <typename T>
 using SwapVector = std::vector<T, SwapAllocator<T>>;

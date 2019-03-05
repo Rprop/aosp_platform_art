@@ -16,25 +16,31 @@
 
 #include "common_compiler_test.h"
 
+#include <type_traits>
+
 #include "arch/instruction_set_features.h"
 #include "art_field-inl.h"
-#include "art_method.h"
+#include "art_method-inl.h"
+#include "base/callee_save_type.h"
+#include "base/enums.h"
+#include "base/utils.h"
 #include "class_linker.h"
-#include "compiled_method.h"
-#include "dex/pass_manager.h"
+#include "compiled_method-inl.h"
+#include "dex/descriptors_names.h"
 #include "dex/quick_compiler_callbacks.h"
-#include "dex/quick/dex_file_to_method_inliner_map.h"
 #include "dex/verification_results.h"
 #include "driver/compiler_driver.h"
 #include "driver/compiler_options.h"
+#include "jni/java_vm_ext.h"
 #include "interpreter/interpreter.h"
-#include "mirror/class_loader.h"
 #include "mirror/class-inl.h"
+#include "mirror/class_loader.h"
 #include "mirror/dex_cache.h"
 #include "mirror/object-inl.h"
-#include "scoped_thread_state_change.h"
-#include "thread-inl.h"
-#include "utils.h"
+#include "oat_quick_method_header.h"
+#include "scoped_thread_state_change-inl.h"
+#include "thread-current-inl.h"
+#include "utils/atomic_dex_ref_map-inl.h"
 
 namespace art {
 
@@ -52,53 +58,50 @@ void CommonCompilerTest::MakeExecutable(ArtMethod* method) {
         compiler_driver_->GetCompiledMethod(MethodReference(&dex_file,
                                                             method->GetDexMethodIndex()));
   }
-  if (compiled_method != nullptr) {
-    const SwapVector<uint8_t>* code = compiled_method->GetQuickCode();
-    uint32_t code_size = code->size();
-    CHECK_NE(0u, code_size);
-    const SwapVector<uint8_t>* vmap_table = compiled_method->GetVmapTable();
-    uint32_t vmap_table_offset = vmap_table->empty() ? 0u
-        : sizeof(OatQuickMethodHeader) + vmap_table->size();
-    const SwapVector<uint8_t>* mapping_table = compiled_method->GetMappingTable();
-    bool mapping_table_used = mapping_table != nullptr && !mapping_table->empty();
-    size_t mapping_table_size = mapping_table_used ? mapping_table->size() : 0U;
-    uint32_t mapping_table_offset = !mapping_table_used ? 0u
-        : sizeof(OatQuickMethodHeader) + vmap_table->size() + mapping_table_size;
-    const SwapVector<uint8_t>* gc_map = compiled_method->GetGcMap();
-    bool gc_map_used = gc_map != nullptr && !gc_map->empty();
-    size_t gc_map_size = gc_map_used ? gc_map->size() : 0U;
-    uint32_t gc_map_offset = !gc_map_used ? 0u
-        : sizeof(OatQuickMethodHeader) + vmap_table->size() + mapping_table_size + gc_map_size;
-    OatQuickMethodHeader method_header(mapping_table_offset, vmap_table_offset, gc_map_offset,
+  // If the code size is 0 it means the method was skipped due to profile guided compilation.
+  if (compiled_method != nullptr && compiled_method->GetQuickCode().size() != 0u) {
+    ArrayRef<const uint8_t> code = compiled_method->GetQuickCode();
+    const uint32_t code_size = code.size();
+    ArrayRef<const uint8_t> vmap_table = compiled_method->GetVmapTable();
+    const uint32_t vmap_table_offset = vmap_table.empty() ? 0u
+        : sizeof(OatQuickMethodHeader) + vmap_table.size();
+    // The method info is directly before the vmap table.
+    ArrayRef<const uint8_t> method_info = compiled_method->GetMethodInfo();
+    const uint32_t method_info_offset = method_info.empty() ? 0u
+        : vmap_table_offset + method_info.size();
+
+    OatQuickMethodHeader method_header(vmap_table_offset,
+                                       method_info_offset,
                                        compiled_method->GetFrameSizeInBytes(),
                                        compiled_method->GetCoreSpillMask(),
-                                       compiled_method->GetFpSpillMask(), code_size);
+                                       compiled_method->GetFpSpillMask(),
+                                       code_size);
 
     header_code_and_maps_chunks_.push_back(std::vector<uint8_t>());
     std::vector<uint8_t>* chunk = &header_code_and_maps_chunks_.back();
-    size_t size = sizeof(method_header) + code_size + vmap_table->size() + mapping_table_size +
-        gc_map_size;
-    size_t code_offset = compiled_method->AlignCode(size - code_size);
-    size_t padding = code_offset - (size - code_size);
-    chunk->reserve(padding + size);
+    const size_t max_padding = GetInstructionSetAlignment(compiled_method->GetInstructionSet());
+    const size_t size = method_info.size() + vmap_table.size() + sizeof(method_header) + code_size;
+    chunk->reserve(size + max_padding);
     chunk->resize(sizeof(method_header));
+    static_assert(std::is_trivially_copyable<OatQuickMethodHeader>::value, "Cannot use memcpy");
     memcpy(&(*chunk)[0], &method_header, sizeof(method_header));
-    chunk->insert(chunk->begin(), vmap_table->begin(), vmap_table->end());
-    if (mapping_table_used) {
-      chunk->insert(chunk->begin(), mapping_table->begin(), mapping_table->end());
-    }
-    if (gc_map_used) {
-      chunk->insert(chunk->begin(), gc_map->begin(), gc_map->end());
-    }
+    chunk->insert(chunk->begin(), vmap_table.begin(), vmap_table.end());
+    chunk->insert(chunk->begin(), method_info.begin(), method_info.end());
+    chunk->insert(chunk->end(), code.begin(), code.end());
+    CHECK_EQ(chunk->size(), size);
+    const void* unaligned_code_ptr = chunk->data() + (size - code_size);
+    size_t offset = dchecked_integral_cast<size_t>(reinterpret_cast<uintptr_t>(unaligned_code_ptr));
+    size_t padding = compiled_method->AlignCode(offset) - offset;
+    // Make sure no resizing takes place.
+    CHECK_GE(chunk->capacity(), chunk->size() + padding);
     chunk->insert(chunk->begin(), padding, 0);
-    chunk->insert(chunk->end(), code->begin(), code->end());
-    CHECK_EQ(padding + size, chunk->size());
-    const void* code_ptr = &(*chunk)[code_offset];
-    MakeExecutable(code_ptr, code->size());
+    const void* code_ptr = reinterpret_cast<const uint8_t*>(unaligned_code_ptr) + padding;
+    CHECK_EQ(code_ptr, static_cast<const void*>(chunk->data() + (chunk->size() - code_size)));
+    MakeExecutable(code_ptr, code.size());
     const void* method_code = CompiledMethod::CodePointer(code_ptr,
                                                           compiled_method->GetInstructionSet());
-    LOG(INFO) << "MakeExecutable " << PrettyMethod(method) << " code=" << method_code;
-    class_linker_->SetEntryPointsToCompiledCode(method, method_code);
+    LOG(INFO) << "MakeExecutable " << method->PrettyMethod() << " code=" << method_code;
+    method->SetEntryPointFromQuickCompiledCode(method_code);
   } else {
     // No code? You must mean to go into the interpreter.
     // Or the generic JNI...
@@ -116,52 +119,32 @@ void CommonCompilerTest::MakeExecutable(const void* code_start, size_t code_leng
   int result = mprotect(reinterpret_cast<void*>(base), len, PROT_READ | PROT_WRITE | PROT_EXEC);
   CHECK_EQ(result, 0);
 
-  // Flush instruction cache
-  // Only uses __builtin___clear_cache if GCC >= 4.3.3
-#if GCC_VERSION >= 40303
-  __builtin___clear_cache(reinterpret_cast<void*>(base), reinterpret_cast<void*>(base + len));
-#else
-  // Only warn if not Intel as Intel doesn't have cache flush instructions.
-#if !defined(__i386__) && !defined(__x86_64__)
-  UNIMPLEMENTED(WARNING) << "cache flush";
-#endif
-#endif
+  FlushInstructionCache(reinterpret_cast<char*>(base), reinterpret_cast<char*>(base + len));
 }
 
-void CommonCompilerTest::MakeExecutable(mirror::ClassLoader* class_loader, const char* class_name) {
+void CommonCompilerTest::MakeExecutable(ObjPtr<mirror::ClassLoader> class_loader,
+                                        const char* class_name) {
   std::string class_descriptor(DotToDescriptor(class_name));
   Thread* self = Thread::Current();
   StackHandleScope<1> hs(self);
   Handle<mirror::ClassLoader> loader(hs.NewHandle(class_loader));
-  mirror::Class* klass = class_linker_->FindClass(self, class_descriptor.c_str(), loader);
+  ObjPtr<mirror::Class> klass = class_linker_->FindClass(self, class_descriptor.c_str(), loader);
   CHECK(klass != nullptr) << "Class not found " << class_name;
-  size_t pointer_size = class_linker_->GetImagePointerSize();
-  for (auto& m : klass->GetDirectMethods(pointer_size)) {
-    MakeExecutable(&m);
-  }
-  for (auto& m : klass->GetVirtualMethods(pointer_size)) {
+  PointerSize pointer_size = class_linker_->GetImagePointerSize();
+  for (auto& m : klass->GetMethods(pointer_size)) {
     MakeExecutable(&m);
   }
 }
 
-// Get the set of image classes given to the compiler-driver in SetUp. Note: the compiler
-// driver assumes ownership of the set, so the test should properly release the set.
-std::unordered_set<std::string>* CommonCompilerTest::GetImageClasses() {
+// Get the set of image classes given to the compiler options in SetUp.
+std::unique_ptr<HashSet<std::string>> CommonCompilerTest::GetImageClasses() {
   // Empty set: by default no classes are retained in the image.
-  return new std::unordered_set<std::string>();
+  return std::make_unique<HashSet<std::string>>();
 }
 
-// Get the set of compiled classes given to the compiler-driver in SetUp. Note: the compiler
-// driver assumes ownership of the set, so the test should properly release the set.
-std::unordered_set<std::string>* CommonCompilerTest::GetCompiledClasses() {
-  // Null, no selection of compiled-classes.
-  return nullptr;
-}
-
-// Get the set of compiled methods given to the compiler-driver in SetUp. Note: the compiler
-// driver assumes ownership of the set, so the test should properly release the set.
-std::unordered_set<std::string>* CommonCompilerTest::GetCompiledMethods() {
-  // Null, no selection of compiled-methods.
+// Get ProfileCompilationInfo that should be passed to the driver.
+ProfileCompilationInfo* CommonCompilerTest::GetProfileCompilationInfo() {
+  // Null, profile information will not be taken into account.
   return nullptr;
 }
 
@@ -170,34 +153,59 @@ void CommonCompilerTest::SetUp() {
   {
     ScopedObjectAccess soa(Thread::Current());
 
-    const InstructionSet instruction_set = kRuntimeISA;
-    // Take the default set of instruction features from the build.
-    instruction_set_features_.reset(InstructionSetFeatures::FromCppDefines());
-
-    runtime_->SetInstructionSet(instruction_set);
-    for (int i = 0; i < Runtime::kLastCalleeSaveType; i++) {
-      Runtime::CalleeSaveType type = Runtime::CalleeSaveType(i);
+    runtime_->SetInstructionSet(instruction_set_);
+    for (uint32_t i = 0; i < static_cast<uint32_t>(CalleeSaveType::kLastCalleeSaveType); ++i) {
+      CalleeSaveType type = CalleeSaveType(i);
       if (!runtime_->HasCalleeSaveMethod(type)) {
         runtime_->SetCalleeSaveMethod(runtime_->CreateCalleeSaveMethod(), type);
       }
     }
 
-    // TODO: make selectable
-    Compiler::Kind compiler_kind = Compiler::kQuick;
-    timer_.reset(new CumulativeLogger("Compilation times"));
-    compiler_driver_.reset(new CompilerDriver(compiler_options_.get(),
-                                              verification_results_.get(),
-                                              method_inliner_map_.get(),
-                                              compiler_kind, instruction_set,
-                                              instruction_set_features_.get(),
-                                              true,
-                                              GetImageClasses(),
-                                              GetCompiledClasses(),
-                                              GetCompiledMethods(),
-                                              2, true, true, "", timer_.get(), -1, ""));
+    CreateCompilerDriver();
   }
-  // We typically don't generate an image in unit tests, disable this optimization by default.
-  compiler_driver_->SetSupportBootImageFixup(false);
+}
+
+void CommonCompilerTest::ApplyInstructionSet() {
+  // Copy local instruction_set_ and instruction_set_features_ to *compiler_options_;
+  CHECK(instruction_set_features_ != nullptr);
+  if (instruction_set_ == InstructionSet::kThumb2) {
+    CHECK_EQ(InstructionSet::kArm, instruction_set_features_->GetInstructionSet());
+  } else {
+    CHECK_EQ(instruction_set_, instruction_set_features_->GetInstructionSet());
+  }
+  compiler_options_->instruction_set_ = instruction_set_;
+  compiler_options_->instruction_set_features_ =
+      InstructionSetFeatures::FromBitmap(instruction_set_, instruction_set_features_->AsBitmap());
+  CHECK(compiler_options_->instruction_set_features_->Equals(instruction_set_features_.get()));
+}
+
+void CommonCompilerTest::OverrideInstructionSetFeatures(InstructionSet instruction_set,
+                                                        const std::string& variant) {
+  instruction_set_ = instruction_set;
+  std::string error_msg;
+  instruction_set_features_ =
+      InstructionSetFeatures::FromVariant(instruction_set, variant, &error_msg);
+  CHECK(instruction_set_features_ != nullptr) << error_msg;
+
+  if (compiler_options_ != nullptr) {
+    ApplyInstructionSet();
+  }
+}
+
+void CommonCompilerTest::CreateCompilerDriver() {
+  ApplyInstructionSet();
+
+  compiler_options_->boot_image_ = true;
+  compiler_options_->compile_pic_ = false;  // Non-PIC boot image is a test configuration.
+  compiler_options_->SetCompilerFilter(GetCompilerFilter());
+  compiler_options_->image_classes_.swap(*GetImageClasses());
+  compiler_driver_.reset(new CompilerDriver(compiler_options_.get(),
+                                            verification_results_.get(),
+                                            compiler_kind_,
+                                            &compiler_options_->image_classes_,
+                                            number_of_threads_,
+                                            /* swap_fd */ -1,
+                                            GetProfileCompilationInfo()));
 }
 
 void CommonCompilerTest::SetUpRuntimeOptions(RuntimeOptions* options) {
@@ -205,19 +213,26 @@ void CommonCompilerTest::SetUpRuntimeOptions(RuntimeOptions* options) {
 
   compiler_options_.reset(new CompilerOptions);
   verification_results_.reset(new VerificationResults(compiler_options_.get()));
-  method_inliner_map_.reset(new DexFileToMethodInlinerMap);
-  callbacks_.reset(new QuickCompilerCallbacks(verification_results_.get(),
-                                              method_inliner_map_.get(),
-                                              CompilerCallbacks::CallbackMode::kCompileApp));
+  QuickCompilerCallbacks* callbacks =
+      new QuickCompilerCallbacks(CompilerCallbacks::CallbackMode::kCompileApp);
+  callbacks->SetVerificationResults(verification_results_.get());
+  callbacks_.reset(callbacks);
+}
+
+Compiler::Kind CommonCompilerTest::GetCompilerKind() const {
+  return compiler_kind_;
+}
+
+void CommonCompilerTest::SetCompilerKind(Compiler::Kind compiler_kind) {
+  compiler_kind_ = compiler_kind;
 }
 
 void CommonCompilerTest::TearDown() {
-  timer_.reset();
   compiler_driver_.reset();
   callbacks_.reset();
-  method_inliner_map_.reset();
   verification_results_.reset();
   compiler_options_.reset();
+  image_reservation_.reset();
 
   CommonRuntimeTest::TearDown();
 }
@@ -227,22 +242,59 @@ void CommonCompilerTest::CompileClass(mirror::ClassLoader* class_loader, const c
   Thread* self = Thread::Current();
   StackHandleScope<1> hs(self);
   Handle<mirror::ClassLoader> loader(hs.NewHandle(class_loader));
-  mirror::Class* klass = class_linker_->FindClass(self, class_descriptor.c_str(), loader);
+  ObjPtr<mirror::Class> klass = class_linker_->FindClass(self, class_descriptor.c_str(), loader);
   CHECK(klass != nullptr) << "Class not found " << class_name;
   auto pointer_size = class_linker_->GetImagePointerSize();
-  for (auto& m : klass->GetDirectMethods(pointer_size)) {
-    CompileMethod(&m);
-  }
-  for (auto& m : klass->GetVirtualMethods(pointer_size)) {
+  for (auto& m : klass->GetMethods(pointer_size)) {
     CompileMethod(&m);
   }
 }
 
 void CommonCompilerTest::CompileMethod(ArtMethod* method) {
   CHECK(method != nullptr);
-  TimingLogger timings("CommonTest::CompileMethod", false, false);
+  TimingLogger timings("CommonCompilerTest::CompileMethod", false, false);
   TimingLogger::ScopedTiming t(__FUNCTION__, &timings);
-  compiler_driver_->CompileOne(Thread::Current(), method, &timings);
+  {
+    Thread* self = Thread::Current();
+    jobject class_loader = self->GetJniEnv()->GetVm()->AddGlobalRef(self, method->GetClassLoader());
+
+    DCHECK(!Runtime::Current()->IsStarted());
+    const DexFile* dex_file = method->GetDexFile();
+    uint16_t class_def_idx = method->GetClassDefIndex();
+    uint32_t method_idx = method->GetDexMethodIndex();
+    uint32_t access_flags = method->GetAccessFlags();
+    InvokeType invoke_type = method->GetInvokeType();
+    StackHandleScope<2> hs(self);
+    Handle<mirror::DexCache> dex_cache(hs.NewHandle(method->GetDexCache()));
+    Handle<mirror::ClassLoader> h_class_loader = hs.NewHandle(
+        self->DecodeJObject(class_loader)->AsClassLoader());
+    const DexFile::CodeItem* code_item = dex_file->GetCodeItem(method->GetCodeItemOffset());
+
+    std::vector<const DexFile*> dex_files;
+    dex_files.push_back(dex_file);
+
+    // Go to native so that we don't block GC during compilation.
+    ScopedThreadSuspension sts(self, kNative);
+
+    compiler_driver_->InitializeThreadPools();
+
+    compiler_driver_->PreCompile(class_loader, dex_files, &timings);
+
+    compiler_driver_->CompileOne(self,
+                                 class_loader,
+                                 *dex_file,
+                                 class_def_idx,
+                                 method_idx,
+                                 access_flags,
+                                 invoke_type,
+                                 code_item,
+                                 dex_cache,
+                                 h_class_loader);
+
+    compiler_driver_->FreeThreadPools();
+
+    self->GetJniEnv()->DeleteGlobalRef(class_loader);
+  }
   TimingLogger::ScopedTiming t2("MakeExecutable", &timings);
   MakeExecutable(method);
 }
@@ -252,11 +304,12 @@ void CommonCompilerTest::CompileDirectMethod(Handle<mirror::ClassLoader> class_l
                                              const char* signature) {
   std::string class_descriptor(DotToDescriptor(class_name));
   Thread* self = Thread::Current();
-  mirror::Class* klass = class_linker_->FindClass(self, class_descriptor.c_str(), class_loader);
+  ObjPtr<mirror::Class> klass =
+      class_linker_->FindClass(self, class_descriptor.c_str(), class_loader);
   CHECK(klass != nullptr) << "Class not found " << class_name;
   auto pointer_size = class_linker_->GetImagePointerSize();
-  ArtMethod* method = klass->FindDirectMethod(method_name, signature, pointer_size);
-  CHECK(method != nullptr) << "Direct method not found: "
+  ArtMethod* method = klass->FindClassMethod(method_name, signature, pointer_size);
+  CHECK(method != nullptr && method->IsDirect()) << "Direct method not found: "
       << class_name << "." << method_name << signature;
   CompileMethod(method);
 }
@@ -266,11 +319,12 @@ void CommonCompilerTest::CompileVirtualMethod(Handle<mirror::ClassLoader> class_
                                               const char* signature) {
   std::string class_descriptor(DotToDescriptor(class_name));
   Thread* self = Thread::Current();
-  mirror::Class* klass = class_linker_->FindClass(self, class_descriptor.c_str(), class_loader);
+  ObjPtr<mirror::Class> klass =
+      class_linker_->FindClass(self, class_descriptor.c_str(), class_loader);
   CHECK(klass != nullptr) << "Class not found " << class_name;
   auto pointer_size = class_linker_->GetImagePointerSize();
-  ArtMethod* method = klass->FindVirtualMethod(method_name, signature, pointer_size);
-  CHECK(method != nullptr) << "Virtual method not found: "
+  ArtMethod* method = klass->FindClassMethod(method_name, signature, pointer_size);
+  CHECK(method != nullptr && !method->IsDirect()) << "Virtual method not found: "
       << class_name << "." << method_name << signature;
   CompileMethod(method);
 }
@@ -282,7 +336,7 @@ void CommonCompilerTest::ReserveImageSpace() {
   MemMap::Init();
   image_reservation_.reset(MemMap::MapAnonymous("image reservation",
                                                 reinterpret_cast<uint8_t*>(ART_BASE_ADDRESS),
-                                                (size_t)100 * 1024 * 1024,  // 100MB
+                                                (size_t)120 * 1024 * 1024,  // 120MB
                                                 PROT_NONE,
                                                 false /* no need for 4gb flag with fixed mmap*/,
                                                 false /* not reusing existing reservation */,
@@ -292,6 +346,16 @@ void CommonCompilerTest::ReserveImageSpace() {
 
 void CommonCompilerTest::UnreserveImageSpace() {
   image_reservation_.reset();
+}
+
+void CommonCompilerTest::SetDexFilesForOatFile(const std::vector<const DexFile*>& dex_files) {
+  compiler_options_->dex_files_for_oat_file_ = dex_files;
+  compiler_driver_->compiled_classes_.AddDexFiles(dex_files);
+  compiler_driver_->dex_to_dex_compiler_.SetDexFiles(dex_files);
+}
+
+void CommonCompilerTest::ClearBootImageOption() {
+  compiler_options_->boot_image_ = false;
 }
 
 }  // namespace art

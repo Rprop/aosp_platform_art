@@ -13,26 +13,40 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 #ifndef ART_RUNTIME_MIRROR_STRING_INL_H_
 #define ART_RUNTIME_MIRROR_STRING_INL_H_
 
-#include "array.h"
-#include "class.h"
-#include "gc/heap-inl.h"
-#include "intern_table.h"
-#include "runtime.h"
 #include "string.h"
+
+#include "android-base/stringprintf.h"
+
+#include "array.h"
+#include "base/bit_utils.h"
+#include "base/globals.h"
+#include "base/utils.h"
+#include "class.h"
+#include "class_root.h"
+#include "common_throws.h"
+#include "dex/utf.h"
+#include "gc/heap-inl.h"
+#include "runtime.h"
 #include "thread.h"
-#include "utf.h"
-#include "utils.h"
 
 namespace art {
 namespace mirror {
 
-inline uint32_t String::ClassSize(size_t pointer_size) {
-  uint32_t vtable_entries = Object::kVTableLength + 52;
-  return Class::ComputeClassSize(true, vtable_entries, 0, 1, 0, 1, 2, pointer_size);
+inline uint32_t String::ClassSize(PointerSize pointer_size) {
+#ifdef USE_D8_DESUGAR
+  // Two lambdas in CharSequence:
+  //   lambda$chars$0$CharSequence
+  //   lambda$codePoints$1$CharSequence
+  // which were virtual functions in standalone desugar, becomes
+  // direct functions with D8 desugaring.
+  uint32_t vtable_entries = Object::kVTableLength + 54;
+#else
+  uint32_t vtable_entries = Object::kVTableLength + 56;
+#endif
+  return Class::ComputeClassSize(true, vtable_entries, 0, 0, 0, 1, 2, pointer_size);
 }
 
 // Sets string count in the allocation code path to ensure it is guarded by a CAS.
@@ -41,11 +55,12 @@ class SetStringCountVisitor {
   explicit SetStringCountVisitor(int32_t count) : count_(count) {
   }
 
-  void operator()(Object* obj, size_t usable_size ATTRIBUTE_UNUSED) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  void operator()(ObjPtr<Object> obj, size_t usable_size ATTRIBUTE_UNUSED) const
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     // Avoid AsString as object is not yet in live bitmap or allocation stack.
-    String* string = down_cast<String*>(obj);
+    ObjPtr<String> string = ObjPtr<String>::DownCast(obj);
     string->SetCount(count_);
+    DCHECK(!string->IsCompressed() || kUseStringCompression);
   }
 
  private:
@@ -60,15 +75,24 @@ class SetStringCountAndBytesVisitor {
       : count_(count), src_array_(src_array), offset_(offset), high_byte_(high_byte) {
   }
 
-  void operator()(Object* obj, size_t usable_size ATTRIBUTE_UNUSED) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  void operator()(ObjPtr<Object> obj, size_t usable_size ATTRIBUTE_UNUSED) const
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     // Avoid AsString as object is not yet in live bitmap or allocation stack.
-    String* string = down_cast<String*>(obj);
+    ObjPtr<String> string = ObjPtr<String>::DownCast(obj);
     string->SetCount(count_);
-    uint16_t* value = string->GetValue();
+    DCHECK(!string->IsCompressed() || kUseStringCompression);
+    int32_t length = String::GetLengthFromCount(count_);
     const uint8_t* const src = reinterpret_cast<uint8_t*>(src_array_->GetData()) + offset_;
-    for (int i = 0; i < count_; i++) {
-      value[i] = high_byte_ + (src[i] & 0xFF);
+    if (string->IsCompressed()) {
+      uint8_t* valueCompressed = string->GetValueCompressed();
+      for (int i = 0; i < length; i++) {
+        valueCompressed[i] = (src[i] & 0xFF);
+      }
+    } else {
+      uint16_t* value = string->GetValue();
+      for (int i = 0; i < length; i++) {
+        value[i] = high_byte_ + (src[i] & 0xFF);
+      }
     }
   }
 
@@ -87,13 +111,20 @@ class SetStringCountAndValueVisitorFromCharArray {
     count_(count), src_array_(src_array), offset_(offset) {
   }
 
-  void operator()(Object* obj, size_t usable_size ATTRIBUTE_UNUSED) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  void operator()(ObjPtr<Object> obj, size_t usable_size ATTRIBUTE_UNUSED) const
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     // Avoid AsString as object is not yet in live bitmap or allocation stack.
-    String* string = down_cast<String*>(obj);
+    ObjPtr<String> string = ObjPtr<String>::DownCast(obj);
     string->SetCount(count_);
     const uint16_t* const src = src_array_->GetData() + offset_;
-    memcpy(string->GetValue(), src, count_ * sizeof(uint16_t));
+    const int32_t length = String::GetLengthFromCount(count_);
+    if (kUseStringCompression && String::IsCompressed(count_)) {
+      for (int i = 0; i < length; ++i) {
+        string->GetValueCompressed()[i] = static_cast<uint8_t>(src[i]);
+      }
+    } else {
+      memcpy(string->GetValue(), src, length * sizeof(uint16_t));
+    }
   }
 
  private:
@@ -105,18 +136,32 @@ class SetStringCountAndValueVisitorFromCharArray {
 // Sets string count and value in the allocation code path to ensure it is guarded by a CAS.
 class SetStringCountAndValueVisitorFromString {
  public:
-  SetStringCountAndValueVisitorFromString(int32_t count, Handle<String> src_string,
+  SetStringCountAndValueVisitorFromString(int32_t count,
+                                          Handle<String> src_string,
                                           int32_t offset) :
     count_(count), src_string_(src_string), offset_(offset) {
   }
 
-  void operator()(Object* obj, size_t usable_size ATTRIBUTE_UNUSED) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  void operator()(ObjPtr<Object> obj, size_t usable_size ATTRIBUTE_UNUSED) const
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     // Avoid AsString as object is not yet in live bitmap or allocation stack.
-    String* string = down_cast<String*>(obj);
+    ObjPtr<String> string = ObjPtr<String>::DownCast(obj);
     string->SetCount(count_);
-    const uint16_t* const src = src_string_->GetValue() + offset_;
-    memcpy(string->GetValue(), src, count_ * sizeof(uint16_t));
+    const int32_t length = String::GetLengthFromCount(count_);
+    bool compressible = kUseStringCompression && String::IsCompressed(count_);
+    if (src_string_->IsCompressed()) {
+      const uint8_t* const src = src_string_->GetValueCompressed() + offset_;
+      memcpy(string->GetValueCompressed(), src, length * sizeof(uint8_t));
+    } else {
+      const uint16_t* const src = src_string_->GetValue() + offset_;
+      if (compressible) {
+        for (int i = 0; i < length; ++i) {
+          string->GetValueCompressed()[i] = static_cast<uint8_t>(src[i]);
+        }
+      } else {
+        memcpy(string->GetValue(), src, length * sizeof(uint16_t));
+      }
+    }
   }
 
  private:
@@ -125,70 +170,115 @@ class SetStringCountAndValueVisitorFromString {
   const int32_t offset_;
 };
 
-inline String* String::Intern() {
-  return Runtime::Current()->GetInternTable()->InternWeak(this);
-}
-
 inline uint16_t String::CharAt(int32_t index) {
-  int32_t count = GetField32(OFFSET_OF_OBJECT_MEMBER(String, count_));
+  int32_t count = GetLength();
   if (UNLIKELY((index < 0) || (index >= count))) {
-    Thread* self = Thread::Current();
-    self->ThrowNewExceptionF("Ljava/lang/StringIndexOutOfBoundsException;",
-                             "length=%i; index=%i", count, index);
+    ThrowStringIndexOutOfBoundsException(index, count);
     return 0;
   }
-  return GetValue()[index];
+  if (IsCompressed()) {
+    return GetValueCompressed()[index];
+  } else {
+    return GetValue()[index];
+  }
 }
 
-template<VerifyObjectFlags kVerifyFlags>
-inline size_t String::SizeOf() {
-  return sizeof(String) + (sizeof(uint16_t) * GetLength<kVerifyFlags>());
+template <typename MemoryType>
+int32_t String::FastIndexOf(MemoryType* chars, int32_t ch, int32_t start) {
+  const MemoryType* p = chars + start;
+  const MemoryType* end = chars + GetLength();
+  while (p < end) {
+    if (*p++ == ch) {
+      return (p - 1) - chars;
+    }
+  }
+  return -1;
 }
 
 template <bool kIsInstrumented, typename PreFenceVisitor>
-inline String* String::Alloc(Thread* self, int32_t utf16_length, gc::AllocatorType allocator_type,
+inline String* String::Alloc(Thread* self, int32_t utf16_length_with_flag,
+                             gc::AllocatorType allocator_type,
                              const PreFenceVisitor& pre_fence_visitor) {
-  size_t header_size = sizeof(String);
-  size_t data_size = sizeof(uint16_t) * utf16_length;
+  constexpr size_t header_size = sizeof(String);
+  const bool compressible = kUseStringCompression && String::IsCompressed(utf16_length_with_flag);
+  const size_t block_size = (compressible) ? sizeof(uint8_t) : sizeof(uint16_t);
+  size_t length = String::GetLengthFromCount(utf16_length_with_flag);
+  static_assert(sizeof(length) <= sizeof(size_t),
+                "static_cast<size_t>(utf16_length) must not lose bits.");
+  size_t data_size = block_size * length;
   size_t size = header_size + data_size;
-  Class* string_class = GetJavaLangString();
+  // String.equals() intrinsics assume zero-padding up to kObjectAlignment,
+  // so make sure the allocator clears the padding as well.
+  // http://b/23528461
+  size_t alloc_size = RoundUp(size, kObjectAlignment);
 
+  Runtime* runtime = Runtime::Current();
+  ObjPtr<Class> string_class = GetClassRoot<String>(runtime->GetClassLinker());
   // Check for overflow and throw OutOfMemoryError if this was an unreasonable request.
-  if (UNLIKELY(size < data_size)) {
-    self->ThrowOutOfMemoryError(StringPrintf("%s of length %d would overflow",
-                                             PrettyDescriptor(string_class).c_str(),
-                                             utf16_length).c_str());
+  // Do this by comparing with the maximum length that will _not_ cause an overflow.
+  const size_t overflow_length = (-header_size) / block_size;   // Unsigned arithmetic.
+  const size_t max_alloc_length = overflow_length - 1u;
+  static_assert(IsAligned<sizeof(uint16_t)>(kObjectAlignment),
+                "kObjectAlignment must be at least as big as Java char alignment");
+  const size_t max_length = RoundDown(max_alloc_length, kObjectAlignment / block_size);
+  if (UNLIKELY(length > max_length)) {
+    self->ThrowOutOfMemoryError(
+        android::base::StringPrintf("%s of length %d would overflow",
+                                    Class::PrettyDescriptor(string_class).c_str(),
+                                    static_cast<int>(length)).c_str());
     return nullptr;
   }
-  gc::Heap* heap = Runtime::Current()->GetHeap();
+
+  gc::Heap* heap = runtime->GetHeap();
   return down_cast<String*>(
-      heap->AllocObjectWithAllocator<kIsInstrumented, true>(self, string_class, size,
+      heap->AllocObjectWithAllocator<kIsInstrumented, true>(self, string_class, alloc_size,
                                                             allocator_type, pre_fence_visitor));
+}
+
+template <bool kIsInstrumented>
+inline String* String::AllocEmptyString(Thread* self, gc::AllocatorType allocator_type) {
+  const int32_t length_with_flag = String::GetFlaggedCount(0, /* compressible */ true);
+  SetStringCountVisitor visitor(length_with_flag);
+  return Alloc<kIsInstrumented>(self, length_with_flag, allocator_type, visitor);
 }
 
 template <bool kIsInstrumented>
 inline String* String::AllocFromByteArray(Thread* self, int32_t byte_length,
                                           Handle<ByteArray> array, int32_t offset,
                                           int32_t high_byte, gc::AllocatorType allocator_type) {
-  SetStringCountAndBytesVisitor visitor(byte_length, array, offset, high_byte << 8);
-  String* string = Alloc<kIsInstrumented>(self, byte_length, allocator_type, visitor);
+  const uint8_t* const src = reinterpret_cast<uint8_t*>(array->GetData()) + offset;
+  high_byte &= 0xff;  // Extract the relevant bits before determining `compressible`.
+  const bool compressible =
+      kUseStringCompression && String::AllASCII<uint8_t>(src, byte_length) && (high_byte == 0);
+  const int32_t length_with_flag = String::GetFlaggedCount(byte_length, compressible);
+  SetStringCountAndBytesVisitor visitor(length_with_flag, array, offset, high_byte << 8);
+  String* string = Alloc<kIsInstrumented>(self, length_with_flag, allocator_type, visitor);
   return string;
 }
 
 template <bool kIsInstrumented>
-inline String* String::AllocFromCharArray(Thread* self, int32_t array_length,
+inline String* String::AllocFromCharArray(Thread* self, int32_t count,
                                           Handle<CharArray> array, int32_t offset,
                                           gc::AllocatorType allocator_type) {
-  SetStringCountAndValueVisitorFromCharArray visitor(array_length, array, offset);
-  String* new_string = Alloc<kIsInstrumented>(self, array_length, allocator_type, visitor);
+  // It is a caller error to have a count less than the actual array's size.
+  DCHECK_GE(array->GetLength(), count);
+  const bool compressible = kUseStringCompression &&
+                            String::AllASCII<uint16_t>(array->GetData() + offset, count);
+  const int32_t length_with_flag = String::GetFlaggedCount(count, compressible);
+  SetStringCountAndValueVisitorFromCharArray visitor(length_with_flag, array, offset);
+  String* new_string = Alloc<kIsInstrumented>(self, length_with_flag, allocator_type, visitor);
   return new_string;
 }
 
 template <bool kIsInstrumented>
 inline String* String::AllocFromString(Thread* self, int32_t string_length, Handle<String> string,
                                        int32_t offset, gc::AllocatorType allocator_type) {
-  SetStringCountAndValueVisitorFromString visitor(string_length, string, offset);
-  String* new_string = Alloc<kIsInstrumented>(self, string_length, allocator_type, visitor);
+  const bool compressible = kUseStringCompression &&
+      ((string->IsCompressed()) ? true : String::AllASCII<uint16_t>(string->GetValue() + offset,
+                                                                    string_length));
+  const int32_t length_with_flag = String::GetFlaggedCount(string_length, compressible);
+  SetStringCountAndValueVisitorFromString visitor(length_with_flag, string, offset);
+  String* new_string = Alloc<kIsInstrumented>(self, length_with_flag, allocator_type, visitor);
   return new_string;
 }
 
@@ -197,9 +287,34 @@ inline int32_t String::GetHashCode() {
   if (UNLIKELY(result == 0)) {
     result = ComputeHashCode();
   }
-  DCHECK(result != 0 || ComputeUtf16Hash(GetValue(), GetLength()) == 0)
-      << ToModifiedUtf8() << " " << result;
+  if (kIsDebugBuild) {
+    if (IsCompressed()) {
+      DCHECK(result != 0 || ComputeUtf16Hash(GetValueCompressed(), GetLength()) == 0)
+          << ToModifiedUtf8() << " " << result;
+    } else {
+      DCHECK(result != 0 || ComputeUtf16Hash(GetValue(), GetLength()) == 0)
+          << ToModifiedUtf8() << " " << result;
+    }
+  }
   return result;
+}
+
+template<typename MemoryType>
+inline bool String::AllASCII(const MemoryType* chars, const int length) {
+  static_assert(std::is_unsigned<MemoryType>::value, "Expecting unsigned MemoryType");
+  for (int i = 0; i < length; ++i) {
+    if (!IsASCII(chars[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+inline bool String::DexFileStringAllASCII(const char* chars, const int length) {
+  // For strings from the dex file we just need to check that
+  // the terminating character is at the right position.
+  DCHECK_EQ(AllASCII(reinterpret_cast<const uint8_t*>(chars), length), chars[length] == 0);
+  return chars[length] == 0;
 }
 
 }  // namespace mirror

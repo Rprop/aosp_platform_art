@@ -17,15 +17,16 @@
 #ifndef ART_RUNTIME_ARCH_ARM_CONTEXT_ARM_H_
 #define ART_RUNTIME_ARCH_ARM_CONTEXT_ARM_H_
 
+#include <android-base/logging.h>
+
 #include "arch/context.h"
-#include "base/logging.h"
 #include "base/macros.h"
 #include "registers_arm.h"
 
 namespace art {
 namespace arm {
 
-class ArmContext : public Context {
+class ArmContext FINAL : public Context {
  public:
   ArmContext() {
     Reset();
@@ -35,7 +36,7 @@ class ArmContext : public Context {
 
   void Reset() OVERRIDE;
 
-  void FillCalleeSaves(const StackVisitor& fr) OVERRIDE SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void FillCalleeSaves(uint8_t* frame, const QuickMethodFrameInfo& fr) OVERRIDE;
 
   void SetSP(uintptr_t new_sp) OVERRIDE {
     SetGPR(SP, new_sp);
@@ -43,6 +44,10 @@ class ArmContext : public Context {
 
   void SetPC(uintptr_t new_pc) OVERRIDE {
     SetGPR(PC, new_pc);
+  }
+
+  void SetArg0(uintptr_t new_arg0_value) OVERRIDE {
+    SetGPR(R0, new_arg0_value);
   }
 
   bool IsAccessibleGPR(uint32_t reg) OVERRIDE {
@@ -84,7 +89,7 @@ class ArmContext : public Context {
   uintptr_t* gprs_[kNumberOfCoreRegisters];
   uint32_t* fprs_[kNumberOfSRegisters];
   // Hold values for sp and pc if they are not located within a stack frame.
-  uintptr_t sp_, pc_;
+  uintptr_t sp_, pc_, arg0_;
 };
 
 }  // namespace arm

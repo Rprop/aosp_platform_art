@@ -16,23 +16,28 @@
 
 #include "throwable.h"
 
+#include "android-base/stringprintf.h"
+
 #include "art_method-inl.h"
+#include "base/enums.h"
+#include "base/utils.h"
 #include "class-inl.h"
-#include "dex_file-inl.h"
+#include "class_root.h"
+#include "dex/dex_file-inl.h"
 #include "gc/accounting/card_table-inl.h"
 #include "object-inl.h"
-#include "object_array.h"
 #include "object_array-inl.h"
+#include "object_array.h"
 #include "stack_trace_element.h"
-#include "utils.h"
+#include "string.h"
 #include "well_known_classes.h"
 
 namespace art {
 namespace mirror {
 
-GcRoot<Class> Throwable::java_lang_Throwable_;
+using android::base::StringPrintf;
 
-void Throwable::SetDetailMessage(String* new_detail_message) {
+void Throwable::SetDetailMessage(ObjPtr<String> new_detail_message) {
   if (Runtime::Current()->IsActiveTransaction()) {
     SetFieldObject<true>(OFFSET_OF_OBJECT_MEMBER(Throwable, detail_message_), new_detail_message);
   } else {
@@ -41,7 +46,7 @@ void Throwable::SetDetailMessage(String* new_detail_message) {
   }
 }
 
-void Throwable::SetCause(Throwable* cause) {
+void Throwable::SetCause(ObjPtr<Throwable> cause) {
   CHECK(cause != nullptr);
   CHECK(cause != this);
   Throwable* current_cause = GetFieldObject<Throwable>(OFFSET_OF_OBJECT_MEMBER(Throwable, cause_));
@@ -53,12 +58,12 @@ void Throwable::SetCause(Throwable* cause) {
   }
 }
 
-void Throwable::SetStackState(Object* state) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+void Throwable::SetStackState(ObjPtr<Object> state) REQUIRES_SHARED(Locks::mutator_lock_) {
   CHECK(state != nullptr);
   if (Runtime::Current()->IsActiveTransaction()) {
-    SetFieldObjectVolatile<true>(OFFSET_OF_OBJECT_MEMBER(Throwable, stack_state_), state);
+    SetFieldObjectVolatile<true>(OFFSET_OF_OBJECT_MEMBER(Throwable, backtrace_), state);
   } else {
-    SetFieldObjectVolatile<false>(OFFSET_OF_OBJECT_MEMBER(Throwable, stack_state_), state);
+    SetFieldObjectVolatile<false>(OFFSET_OF_OBJECT_MEMBER(Throwable, backtrace_), state);
   }
 }
 
@@ -69,61 +74,64 @@ bool Throwable::IsCheckedException() {
   return !InstanceOf(WellKnownClasses::ToClass(WellKnownClasses::java_lang_RuntimeException));
 }
 
+bool Throwable::IsError() {
+  return InstanceOf(WellKnownClasses::ToClass(WellKnownClasses::java_lang_Error));
+}
+
 int32_t Throwable::GetStackDepth() {
-  Object* stack_state = GetStackState();
-  if (stack_state == nullptr) {
+  ObjPtr<Object> stack_state = GetStackState();
+  if (stack_state == nullptr || !stack_state->IsObjectArray()) {
     return -1;
   }
-  if (!stack_state->IsIntArray() && !stack_state->IsLongArray()) {
-    return -1;
-  }
-  mirror::PointerArray* method_trace = down_cast<mirror::PointerArray*>(stack_state->AsArray());
-  int32_t array_len = method_trace->GetLength();
-  // The format is [method pointers][pcs] so the depth is half the length (see method
-  // BuildInternalStackTraceVisitor::Init).
-  CHECK_EQ(array_len % 2, 0);
-  return array_len / 2;
+  ObjPtr<mirror::ObjectArray<Object>> const trace = stack_state->AsObjectArray<Object>();
+  const int32_t array_len = trace->GetLength();
+  DCHECK_GT(array_len, 0);
+  // See method BuildInternalStackTraceVisitor::Init for the format.
+  return array_len - 1;
 }
 
 std::string Throwable::Dump() {
-  std::string result(PrettyTypeOf(this));
+  std::string result(PrettyTypeOf());
   result += ": ";
-  String* msg = GetDetailMessage();
+  ObjPtr<String> msg = GetDetailMessage();
   if (msg != nullptr) {
     result += msg->ToModifiedUtf8();
   }
   result += "\n";
-  Object* stack_state = GetStackState();
+  ObjPtr<Object> stack_state = GetStackState();
   // check stack state isn't missing or corrupt
-  if (stack_state != nullptr &&
-      (stack_state->IsIntArray() || stack_state->IsLongArray())) {
+  if (stack_state != nullptr && stack_state->IsObjectArray()) {
+    ObjPtr<ObjectArray<Object>> object_array = stack_state->AsObjectArray<Object>();
     // Decode the internal stack trace into the depth and method trace
-    // Format is [method pointers][pcs]
-    auto* method_trace = down_cast<mirror::PointerArray*>(stack_state->AsArray());
-    auto array_len = method_trace->GetLength();
+    // See method BuildInternalStackTraceVisitor::Init for the format.
+    DCHECK_GT(object_array->GetLength(), 0);
+    ObjPtr<Object> methods_and_dex_pcs = object_array->Get(0);
+    DCHECK(methods_and_dex_pcs->IsIntArray() || methods_and_dex_pcs->IsLongArray());
+    ObjPtr<PointerArray> method_trace = ObjPtr<PointerArray>::DownCast(methods_and_dex_pcs);
+    const int32_t array_len = method_trace->GetLength();
     CHECK_EQ(array_len % 2, 0);
     const auto depth = array_len / 2;
     if (depth == 0) {
-      result += "(Throwable with empty stack trace)";
+      result += "(Throwable with empty stack trace)\n";
     } else {
-      auto ptr_size = Runtime::Current()->GetClassLinker()->GetImagePointerSize();
+      const PointerSize ptr_size = Runtime::Current()->GetClassLinker()->GetImagePointerSize();
       for (int32_t i = 0; i < depth; ++i) {
         ArtMethod* method = method_trace->GetElementPtrSize<ArtMethod*>(i, ptr_size);
         uintptr_t dex_pc = method_trace->GetElementPtrSize<uintptr_t>(i + depth, ptr_size);
         int32_t line_number = method->GetLineNumFromDexPC(dex_pc);
         const char* source_file = method->GetDeclaringClassSourceFile();
-        result += StringPrintf("  at %s (%s:%d)\n", PrettyMethod(method, true).c_str(),
+        result += StringPrintf("  at %s (%s:%d)\n", method->PrettyMethod(true).c_str(),
                                source_file, line_number);
       }
     }
   } else {
-    Object* stack_trace = GetStackTrace();
+    ObjPtr<Object> stack_trace = GetStackTrace();
     if (stack_trace != nullptr && stack_trace->IsObjectArray()) {
-      CHECK_EQ(stack_trace->GetClass()->GetComponentType(),
-               StackTraceElement::GetStackTraceElement());
-      auto* ste_array = down_cast<ObjectArray<StackTraceElement>*>(stack_trace);
+      CHECK_EQ(stack_trace->GetClass()->GetComponentType(), GetClassRoot<StackTraceElement>());
+      ObjPtr<ObjectArray<StackTraceElement>> ste_array =
+          ObjPtr<ObjectArray<StackTraceElement>>::DownCast(stack_trace);
       if (ste_array->GetLength() == 0) {
-        result += "(Throwable with empty stack trace)";
+        result += "(Throwable with empty stack trace)\n";
       } else {
         for (int32_t i = 0; i < ste_array->GetLength(); ++i) {
           StackTraceElement* ste = ste_array->Get(i);
@@ -138,10 +146,10 @@ std::string Throwable::Dump() {
         }
       }
     } else {
-      result += "(Throwable with no stack trace)";
+      result += "(Throwable with no stack trace)\n";
     }
   }
-  Throwable* cause = GetFieldObject<Throwable>(OFFSET_OF_OBJECT_MEMBER(Throwable, cause_));
+  ObjPtr<Throwable> cause = GetFieldObject<Throwable>(OFFSET_OF_OBJECT_MEMBER(Throwable, cause_));
   if (cause != nullptr && cause != this) {  // Constructor makes cause == this by default.
     result += "Caused by: ";
     result += cause->Dump();
@@ -149,19 +157,16 @@ std::string Throwable::Dump() {
   return result;
 }
 
-void Throwable::SetClass(Class* java_lang_Throwable) {
-  CHECK(java_lang_Throwable_.IsNull());
-  CHECK(java_lang_Throwable != nullptr);
-  java_lang_Throwable_ = GcRoot<Class>(java_lang_Throwable);
+Object* Throwable::GetStackState() {
+  return GetFieldObjectVolatile<Object>(OFFSET_OF_OBJECT_MEMBER(Throwable, backtrace_));
 }
 
-void Throwable::ResetClass() {
-  CHECK(!java_lang_Throwable_.IsNull());
-  java_lang_Throwable_ = GcRoot<Class>(nullptr);
+Object* Throwable::GetStackTrace() {
+  return GetFieldObjectVolatile<Object>(OFFSET_OF_OBJECT_MEMBER(Throwable, backtrace_));
 }
 
-void Throwable::VisitRoots(RootVisitor* visitor) {
-  java_lang_Throwable_.VisitRootIfNonNull(visitor, RootInfo(kRootStickyClass));
+String* Throwable::GetDetailMessage() {
+  return GetFieldObject<String>(OFFSET_OF_OBJECT_MEMBER(Throwable, detail_message_));
 }
 
 }  // namespace mirror

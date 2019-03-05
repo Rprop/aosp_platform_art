@@ -33,35 +33,35 @@ public class Main {
     static void testClassNewInstance() {
         // should succeed
         try {
-            Class c = Class.forName("LocalClass");
+            Class<?> c = Class.forName("LocalClass");
             Object obj = c.newInstance();
             System.out.println("LocalClass succeeded");
         } catch (Exception ex) {
-            System.err.println("LocalClass failed");
-            ex.printStackTrace();
+            System.out.println("LocalClass failed");
+            ex.printStackTrace(System.out);
         }
 
         // should fail
         try {
-            Class c = Class.forName("otherpackage.PackageAccess");
+            Class<?> c = Class.forName("otherpackage.PackageAccess");
             Object obj = c.newInstance();
-            System.err.println("ERROR: PackageAccess succeeded unexpectedly");
+            System.out.println("ERROR: PackageAccess succeeded unexpectedly");
         } catch (IllegalAccessException iae) {
             System.out.println("Got expected PackageAccess complaint");
         } catch (Exception ex) {
-            System.err.println("Got unexpected PackageAccess failure");
-            ex.printStackTrace();
+            System.out.println("Got unexpected PackageAccess failure");
+            ex.printStackTrace(System.out);
         }
 
         LocalClass3.main();
 
         try {
             MaybeAbstract ma = new MaybeAbstract();
-            System.err.println("ERROR: MaybeAbstract succeeded unexpectedly");
+            System.out.println("ERROR: MaybeAbstract succeeded unexpectedly");
         } catch (InstantiationError ie) {
             System.out.println("Got expected InstantationError");
         } catch (Exception ex) {
-            System.err.println("Got unexpected MaybeAbstract failure");
+            System.out.println("Got unexpected MaybeAbstract failure");
         }
     }
 
@@ -71,91 +71,99 @@ public class Main {
     static void testConstructorNewInstance() {
         // should fail -- getConstructor only returns public constructors
         try {
-            Class c = Class.forName("LocalClass");
-            Constructor cons = c.getConstructor(new Class[0] /*(Class[])null*/);
-            System.err.println("Cons LocalClass succeeded unexpectedly");
+            Class<?> c = Class.forName("LocalClass");
+            Constructor<?> cons = c.getConstructor();
+            System.out.println("Cons LocalClass succeeded unexpectedly");
         } catch (NoSuchMethodException nsme) {
             System.out.println("Cons LocalClass failed as expected");
         } catch (Exception ex) {
-            System.err.println("Cons LocalClass failed strangely");
-            ex.printStackTrace();
+            System.out.println("Cons LocalClass failed strangely");
+            ex.printStackTrace(System.out);
         }
 
         // should succeed
         try {
-            Class c = Class.forName("LocalClass2");
-            Constructor cons = c.getConstructor((Class[]) null);
+            Class<?> c = Class.forName("LocalClass2");
+            Constructor<?> cons = c.getConstructor();
             Object obj = cons.newInstance();
             System.out.println("Cons LocalClass2 succeeded");
         } catch (Exception ex) {
-            System.err.println("Cons LocalClass2 failed");
-            ex.printStackTrace();
+            System.out.println("Cons LocalClass2 failed");
+            ex.printStackTrace(System.out);
         }
 
         // should succeed
         try {
-            Class c = Class.forName("Main$InnerClass");
-            Constructor cons = c.getDeclaredConstructor(new Class<?>[]{Main.class});
+            Class<?> c = Class.forName("Main$InnerClass");
+            Constructor<?> cons = c.getDeclaredConstructor(Main.class);
             Object obj = cons.newInstance(new Main());
             System.out.println("Cons InnerClass succeeded");
         } catch (Exception ex) {
-            System.err.println("Cons InnerClass failed");
-            ex.printStackTrace();
+            System.out.println("Cons InnerClass failed");
+            ex.printStackTrace(System.out);
         }
 
         // should succeed
         try {
-            Class c = Class.forName("Main$StaticInnerClass");
-            Constructor cons = c.getDeclaredConstructor((Class[]) null);
+            Class<?> c = Class.forName("Main$StaticInnerClass");
+            Constructor<?> cons = c.getDeclaredConstructor();
             Object obj = cons.newInstance();
             System.out.println("Cons StaticInnerClass succeeded");
         } catch (Exception ex) {
-            System.err.println("Cons StaticInnerClass failed");
-            ex.printStackTrace();
+            System.out.println("Cons StaticInnerClass failed");
+            ex.printStackTrace(System.out);
         }
 
         // should fail
         try {
-            Class c = Class.forName("otherpackage.PackageAccess");
-            Constructor cons = c.getConstructor(new Class[0] /*(Class[])null*/);
-            System.err.println("ERROR: Cons PackageAccess succeeded unexpectedly");
+            Class<?> c = Class.forName("otherpackage.PackageAccess");
+            Constructor<?> cons = c.getConstructor();
+            System.out.println("ERROR: Cons PackageAccess succeeded unexpectedly");
         } catch (NoSuchMethodException nsme) {
             // constructor isn't public
             System.out.println("Cons got expected PackageAccess complaint");
         } catch (Exception ex) {
-            System.err.println("Cons got unexpected PackageAccess failure");
-            ex.printStackTrace();
+            System.out.println("Cons got unexpected PackageAccess failure");
+            ex.printStackTrace(System.out);
         }
 
         // should fail
         try {
-            Class c = Class.forName("MaybeAbstract");
-            Constructor cons = c.getConstructor(new Class[0] /*(Class[])null*/);
+            Class<?> c = Class.forName("MaybeAbstract");
+            Constructor<?> cons = c.getConstructor();
             Object obj = cons.newInstance();
-            System.err.println("ERROR: Cons MaybeAbstract succeeded unexpectedly");
+            System.out.println("ERROR: Cons MaybeAbstract succeeded unexpectedly");
         } catch (InstantiationException ie) {
             // note InstantiationException vs. InstantiationError
             System.out.println("Cons got expected InstantationException");
         } catch (Exception ex) {
-            System.err.println("Cons got unexpected MaybeAbstract failure");
-            ex.printStackTrace();
+            System.out.println("Cons got unexpected MaybeAbstract failure");
+            ex.printStackTrace(System.out);
         }
 
         // should fail
         try {
-            Class c = Class.forName("otherpackage.PackageAccess2");
-            Constructor cons = c.getConstructor((Class[]) null);
+            Class<?> c = Class.forName("otherpackage.PackageAccess2");
+            Constructor<?> cons = c.getConstructor();
             if (!FULL_ACCESS_CHECKS) { throw new IllegalAccessException(); }
             Object obj = cons.newInstance();
-            System.err.println("ERROR: Cons PackageAccess2 succeeded unexpectedly");
+            System.out.println("ERROR: Cons PackageAccess2 succeeded unexpectedly");
         } catch (IllegalAccessException iae) {
             // constructor is public, but class has package scope
             System.out.println("Cons got expected PackageAccess2 complaint");
         } catch (Exception ex) {
-            System.err.println("Cons got unexpected PackageAccess2 failure");
-            ex.printStackTrace();
+            System.out.println("Cons got unexpected PackageAccess2 failure");
+            ex.printStackTrace(System.out);
         }
 
+        // should succeed
+        try {
+            otherpackage.ConstructorAccess.newConstructorInstance();
+            System.out.println("Cons ConstructorAccess succeeded");
+        } catch (Exception ex) {
+            System.out.println("Cons ConstructorAccess failed");
+            ex.printStackTrace(System.out);
+        }
     }
 
     class InnerClass {
@@ -173,15 +181,14 @@ class LocalClass2 {
     public LocalClass2() {}
 }
 
-
 class LocalClass3 {
     public static void main() {
         try {
             CC.newInstance();
             System.out.println("LocalClass3 succeeded");
         } catch (Exception ex) {
-            System.err.println("Got unexpected LocalClass3 failure");
-            ex.printStackTrace();
+            System.out.println("Got unexpected LocalClass3 failure");
+            ex.printStackTrace(System.out);
         }
     }
 
@@ -190,10 +197,10 @@ class LocalClass3 {
 
         static Object newInstance() {
             try {
-                Class c = CC.class;
+                Class<?> c = CC.class;
                 return c.newInstance();
             } catch (Exception ex) {
-                ex.printStackTrace();
+                ex.printStackTrace(System.out);
                 return null;
             }
         }

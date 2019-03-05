@@ -17,22 +17,19 @@
 #include "art_field.h"
 
 #include "art_field-inl.h"
+#include "base/utils.h"
 #include "class_linker-inl.h"
+#include "dex/descriptors_names.h"
 #include "gc/accounting/card_table-inl.h"
 #include "handle_scope.h"
 #include "mirror/class-inl.h"
 #include "mirror/object-inl.h"
 #include "mirror/object_array-inl.h"
 #include "runtime.h"
-#include "scoped_thread_state_change.h"
-#include "utils.h"
+#include "scoped_thread_state_change-inl.h"
 #include "well_known_classes.h"
 
 namespace art {
-
-ArtField::ArtField() : access_flags_(0), field_dex_idx_(0), offset_(0) {
-  declaring_class_ = GcRoot<mirror::Class>(nullptr);
-}
 
 void ArtField::SetOffset(MemberOffset num_bytes) {
   DCHECK(GetDeclaringClass()->IsLoaded() || GetDeclaringClass()->IsErroneous());
@@ -47,44 +44,40 @@ void ArtField::SetOffset(MemberOffset num_bytes) {
   offset_ = num_bytes.Uint32Value();
 }
 
-ArtField* ArtField::FindInstanceFieldWithOffset(mirror::Class* klass, uint32_t field_offset) {
-  DCHECK(klass != nullptr);
-  auto* instance_fields = klass->GetIFields();
-  for (size_t i = 0, count = klass->NumInstanceFields(); i < count; ++i) {
-    if (instance_fields[i].GetOffset().Uint32Value() == field_offset) {
-      return &instance_fields[i];
-    }
-  }
-  // We did not find field in the class: look into superclass.
-  return (klass->GetSuperClass() != nullptr) ?
-      FindInstanceFieldWithOffset(klass->GetSuperClass(), field_offset) : nullptr;
-}
-
-ArtField* ArtField::FindStaticFieldWithOffset(mirror::Class* klass, uint32_t field_offset) {
-  DCHECK(klass != nullptr);
-  auto* static_fields = klass->GetSFields();
-  for (size_t i = 0, count = klass->NumStaticFields(); i < count; ++i) {
-    if (static_fields[i].GetOffset().Uint32Value() == field_offset) {
-      return &static_fields[i];
-    }
-  }
-  return nullptr;
-}
-
-mirror::Class* ArtField::ProxyFindSystemClass(const char* descriptor) {
+ObjPtr<mirror::Class> ArtField::ProxyFindSystemClass(const char* descriptor) {
   DCHECK(GetDeclaringClass()->IsProxyClass());
-  return Runtime::Current()->GetClassLinker()->FindSystemClass(Thread::Current(), descriptor);
+  ObjPtr<mirror::Class> klass = Runtime::Current()->GetClassLinker()->LookupClass(
+      Thread::Current(), descriptor, /* class_loader */ nullptr);
+  DCHECK(klass != nullptr);
+  return klass;
 }
 
-mirror::Class* ArtField::ResolveGetType(uint32_t type_idx) {
-  return Runtime::Current()->GetClassLinker()->ResolveType(type_idx, this);
+std::string ArtField::PrettyField(ArtField* f, bool with_type) {
+  if (f == nullptr) {
+    return "null";
+  }
+  return f->PrettyField(with_type);
 }
 
-mirror::String* ArtField::ResolveGetStringName(Thread* self, const DexFile& dex_file,
-                                               uint32_t string_idx, mirror::DexCache* dex_cache) {
-  StackHandleScope<1> hs(self);
-  return Runtime::Current()->GetClassLinker()->ResolveString(
-      dex_file, string_idx, hs.NewHandle(dex_cache));
+std::string ArtField::PrettyField(bool with_type) {
+  std::string result;
+  if (with_type) {
+    result += PrettyDescriptor(GetTypeDescriptor());
+    result += ' ';
+  }
+  std::string temp;
+  result += PrettyDescriptor(GetDeclaringClass()->GetDescriptor(&temp));
+  result += '.';
+  result += GetName();
+  return result;
+}
+
+void ArtField::GetAccessFlagsDCheck() {
+  CHECK(GetDeclaringClass()->IsLoaded() || GetDeclaringClass()->IsErroneous());
+}
+
+void ArtField::GetOffsetDCheck() {
+  CHECK(GetDeclaringClass()->IsResolved());
 }
 
 }  // namespace art

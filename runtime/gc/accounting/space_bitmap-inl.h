@@ -21,9 +21,10 @@
 
 #include <memory>
 
-#include "atomic.h"
+#include <android-base/logging.h>
+
+#include "base/atomic.h"
 #include "base/bit_utils.h"
-#include "base/logging.h"
 
 namespace art {
 namespace gc {
@@ -36,17 +37,17 @@ inline bool SpaceBitmap<kAlignment>::AtomicTestAndSet(const mirror::Object* obj)
   const uintptr_t offset = addr - heap_begin_;
   const size_t index = OffsetToIndex(offset);
   const uintptr_t mask = OffsetToMask(offset);
-  Atomic<uintptr_t>* atomic_entry = reinterpret_cast<Atomic<uintptr_t>*>(&bitmap_begin_[index]);
+  Atomic<uintptr_t>* atomic_entry = &bitmap_begin_[index];
   DCHECK_LT(index, bitmap_size_ / sizeof(intptr_t)) << " bitmap_size_ = " << bitmap_size_;
   uintptr_t old_word;
   do {
-    old_word = atomic_entry->LoadRelaxed();
+    old_word = atomic_entry->load(std::memory_order_relaxed);
     // Fast path: The bit is already set.
     if ((old_word & mask) != 0) {
       DCHECK(Test(obj));
       return true;
     }
-  } while (!atomic_entry->CompareExchangeWeakSequentiallyConsistent(old_word, old_word | mask));
+  } while (!atomic_entry->CompareAndSetWeakRelaxed(old_word, old_word | mask));
   DCHECK(Test(obj));
   return false;
 }
@@ -58,12 +59,15 @@ inline bool SpaceBitmap<kAlignment>::Test(const mirror::Object* obj) const {
   DCHECK(bitmap_begin_ != nullptr);
   DCHECK_GE(addr, heap_begin_);
   const uintptr_t offset = addr - heap_begin_;
-  return (bitmap_begin_[OffsetToIndex(offset)] & OffsetToMask(offset)) != 0;
+  size_t index = OffsetToIndex(offset);
+  return (bitmap_begin_[index].load(std::memory_order_relaxed) & OffsetToMask(offset)) != 0;
 }
 
-template<size_t kAlignment> template<typename Visitor>
-inline void SpaceBitmap<kAlignment>::VisitMarkedRange(uintptr_t visit_begin, uintptr_t visit_end,
-                                                      const Visitor& visitor) const {
+template<size_t kAlignment>
+template<typename Visitor>
+inline void SpaceBitmap<kAlignment>::VisitMarkedRange(uintptr_t visit_begin,
+                                                      uintptr_t visit_end,
+                                                      Visitor&& visitor) const {
   DCHECK_LE(visit_begin, visit_end);
 #if 0
   for (uintptr_t i = visit_begin; i < visit_end; i += kAlignment) {
@@ -116,9 +120,10 @@ inline void SpaceBitmap<kAlignment>::VisitMarkedRange(uintptr_t visit_begin, uin
 
     // Traverse the middle, full part.
     for (size_t i = index_start + 1; i < index_end; ++i) {
-      uintptr_t w = bitmap_begin_[i];
+      uintptr_t w = bitmap_begin_[i].load(std::memory_order_relaxed);
       if (w != 0) {
         const uintptr_t ptr_base = IndexToOffset(i) + heap_begin_;
+        // Iterate on the bits set in word `w`, from the least to the most significant bit.
         do {
           const size_t shift = CTZ(w);
           mirror::Object* obj = reinterpret_cast<mirror::Object*>(ptr_base + shift * kAlignment);
@@ -145,6 +150,7 @@ inline void SpaceBitmap<kAlignment>::VisitMarkedRange(uintptr_t visit_begin, uin
   right_edge &= ((static_cast<uintptr_t>(1) << bit_end) - 1);
   if (right_edge != 0) {
     const uintptr_t ptr_base = IndexToOffset(index_end) + heap_begin_;
+    // Iterate on the bits set in word `right_edge`, from the least to the most significant bit.
     do {
       const size_t shift = CTZ(right_edge);
       mirror::Object* obj = reinterpret_cast<mirror::Object*>(ptr_base + shift * kAlignment);
@@ -155,7 +161,29 @@ inline void SpaceBitmap<kAlignment>::VisitMarkedRange(uintptr_t visit_begin, uin
 #endif
 }
 
-template<size_t kAlignment> template<bool kSetBit>
+template<size_t kAlignment>
+template<typename Visitor>
+void SpaceBitmap<kAlignment>::Walk(Visitor&& visitor) {
+  CHECK(bitmap_begin_ != nullptr);
+
+  uintptr_t end = OffsetToIndex(HeapLimit() - heap_begin_ - 1);
+  Atomic<uintptr_t>* bitmap_begin = bitmap_begin_;
+  for (uintptr_t i = 0; i <= end; ++i) {
+    uintptr_t w = bitmap_begin[i].load(std::memory_order_relaxed);
+    if (w != 0) {
+      uintptr_t ptr_base = IndexToOffset(i) + heap_begin_;
+      do {
+        const size_t shift = CTZ(w);
+        mirror::Object* obj = reinterpret_cast<mirror::Object*>(ptr_base + shift * kAlignment);
+        visitor(obj);
+        w ^= (static_cast<uintptr_t>(1)) << shift;
+      } while (w != 0);
+    }
+  }
+}
+
+template<size_t kAlignment>
+template<bool kSetBit>
 inline bool SpaceBitmap<kAlignment>::Modify(const mirror::Object* obj) {
   uintptr_t addr = reinterpret_cast<uintptr_t>(obj);
   DCHECK_GE(addr, heap_begin_);
@@ -164,12 +192,19 @@ inline bool SpaceBitmap<kAlignment>::Modify(const mirror::Object* obj) {
   const size_t index = OffsetToIndex(offset);
   const uintptr_t mask = OffsetToMask(offset);
   DCHECK_LT(index, bitmap_size_ / sizeof(intptr_t)) << " bitmap_size_ = " << bitmap_size_;
-  uintptr_t* address = &bitmap_begin_[index];
-  uintptr_t old_word = *address;
+  Atomic<uintptr_t>* atomic_entry = &bitmap_begin_[index];
+  uintptr_t old_word = atomic_entry->load(std::memory_order_relaxed);
   if (kSetBit) {
-    *address = old_word | mask;
+    // Check the bit before setting the word incase we are trying to mark a read only bitmap
+    // like an image space bitmap. This bitmap is mapped as read only and will fault if we
+    // attempt to change any words. Since all of the objects are marked, this will never
+    // occur if we check before setting the bit. This also prevents dirty pages that would
+    // occur if the bitmap was read write and we did not check the bit.
+    if ((old_word & mask) == 0) {
+      atomic_entry->store(old_word | mask, std::memory_order_relaxed);
+    }
   } else {
-    *address = old_word & ~mask;
+    atomic_entry->store(old_word & ~mask, std::memory_order_relaxed);
   }
   DCHECK_EQ(Test(obj), kSetBit);
   return (old_word & mask) != 0;

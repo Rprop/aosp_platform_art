@@ -32,7 +32,7 @@ public class Main {
     public Main(ArrayList<Integer> stuff) {}
 
     void printMethodInfo(Method meth) {
-        Class[] params, exceptions;
+        Class<?>[] params, exceptions;
         int i;
 
         System.out.println("Method name is " + meth.getName());
@@ -62,7 +62,7 @@ public class Main {
     private void showStrings(Target instance)
         throws NoSuchFieldException, IllegalAccessException {
 
-        Class target = Target.class;
+        Class<?> target = Target.class;
         String one, two, three, four;
         Field field = null;
 
@@ -80,16 +80,16 @@ public class Main {
 
     public static void checkAccess() {
         try {
-            Class target = otherpackage.Other.class;
+            Class<?> target = otherpackage.Other.class;
             Object instance = new otherpackage.Other();
             Method meth;
 
-            meth = target.getMethod("publicMethod", (Class[]) null);
+            meth = target.getMethod("publicMethod");
             meth.invoke(instance);
 
             try {
-                meth = target.getMethod("packageMethod", (Class[]) null);
-                System.err.println("succeeded on package-scope method");
+                meth = target.getMethod("packageMethod");
+                System.out.println("succeeded on package-scope method");
             } catch (NoSuchMethodException nsme) {
                 // good
             }
@@ -97,11 +97,11 @@ public class Main {
 
             instance = otherpackage.Other.getInnerClassInstance();
             target = instance.getClass();
-            meth = target.getMethod("innerMethod", (Class[]) null);
+            meth = target.getMethod("innerMethod");
             try {
                 if (!FULL_ACCESS_CHECKS) { throw new IllegalAccessException(); }
                 meth.invoke(instance);
-                System.err.println("inner-method invoke unexpectedly worked");
+                System.out.println("inner-method invoke unexpectedly worked");
             } catch (IllegalAccessException iae) {
                 // good
             }
@@ -110,37 +110,36 @@ public class Main {
             try {
                 int x = field.getInt(instance);
                 if (!FULL_ACCESS_CHECKS) { throw new IllegalAccessException(); }
-                System.err.println("field get unexpectedly worked: " + x);
+                System.out.println("field get unexpectedly worked: " + x);
             } catch (IllegalAccessException iae) {
                 // good
             }
         } catch (Exception ex) {
             System.out.println("----- unexpected exception -----");
-            ex.printStackTrace();
+            ex.printStackTrace(System.out);
         }
     }
 
     public void run() {
-        Class target = Target.class;
+        Class<Target> target = Target.class;
         Method meth = null;
         Field field = null;
         boolean excep;
 
         try {
-            meth = target.getMethod("myMethod", new Class[] { int.class });
+            meth = target.getMethod("myMethod", int.class);
 
             if (meth.getDeclaringClass() != target)
                 throw new RuntimeException();
             printMethodInfo(meth);
 
-            meth = target.getMethod("myMethod", new Class[] { float.class });
+            meth = target.getMethod("myMethod", float.class);
             printMethodInfo(meth);
 
-            meth = target.getMethod("myNoargMethod", (Class[]) null);
+            meth = target.getMethod("myNoargMethod");
             printMethodInfo(meth);
 
-            meth = target.getMethod("myMethod",
-                new Class[] { String[].class, float.class, char.class });
+            meth = target.getMethod("myMethod", String[].class, float.class, char.class);
             printMethodInfo(meth);
 
             Target instance = new Target();
@@ -157,11 +156,11 @@ public class Main {
             System.out.println("Result of invoke: " + boxval.intValue());
 
             System.out.println("Calling no-arg void-return method");
-            meth = target.getMethod("myNoargMethod", (Class[]) null);
+            meth = target.getMethod("myNoargMethod");
             meth.invoke(instance, (Object[]) null);
 
             /* try invoking a method that throws an exception */
-            meth = target.getMethod("throwingMethod", (Class[]) null);
+            meth = target.getMethod("throwingMethod");
             try {
                 meth.invoke(instance, (Object[]) null);
                 System.out.println("GLITCH: didn't throw");
@@ -172,7 +171,7 @@ public class Main {
             }
             catch (Exception ex) {
                 System.out.println("GLITCH: invoke got wrong exception:");
-                ex.printStackTrace();
+                ex.printStackTrace(System.out);
             }
             System.out.println("");
 
@@ -233,10 +232,10 @@ public class Main {
             field.set(instance, null);
 
             /*
-             * Try getDeclaredField on a non-existant field.
+             * Try getDeclaredField on a non-existent field.
              */
             try {
-                field = target.getDeclaredField("nonExistant");
+                field = target.getDeclaredField("nonExistent");
                 System.out.println("ERROR: Expected NoSuchFieldException");
             } catch (NoSuchFieldException nsfe) {
                 String msg = nsfe.getMessage();
@@ -372,7 +371,7 @@ public class Main {
             Target targ;
             Object[] args;
 
-            cons = target.getConstructor(new Class[] { int.class,float.class });
+            cons = target.getConstructor(int.class, float.class);
             args = new Object[] { new Integer(7), new Float(3.3333) };
             System.out.println("cons modifiers=" + cons.getModifiers());
             targ = cons.newInstance(args);
@@ -401,54 +400,56 @@ public class Main {
 
         } catch (Exception ex) {
             System.out.println("----- unexpected exception -----");
-            ex.printStackTrace();
+            ex.printStackTrace(System.out);
         }
 
         System.out.println("ReflectTest done!");
     }
 
-    public static void checkType() {
+    public static void checkSwap() {
         Method m;
 
+        final Object[] objects = new Object[2];
         try {
-            m = Collections.class.getDeclaredMethod("checkType",
-                            Object.class, Class.class);
+            m = Collections.class.getDeclaredMethod("swap",
+                            Object[].class, int.class, int.class);
         } catch (NoSuchMethodException nsme) {
-            nsme.printStackTrace();
+            nsme.printStackTrace(System.out);
             return;
         }
         System.out.println(m + " accessible=" + m.isAccessible());
         m.setAccessible(true);
         System.out.println(m + " accessible=" + m.isAccessible());
         try {
-            m.invoke(null, new Object(), Object.class);
+            m.invoke(null, objects, 0, 1);
         } catch (IllegalAccessException iae) {
-            iae.printStackTrace();
+            iae.printStackTrace(System.out);
             return;
         } catch (InvocationTargetException ite) {
-            ite.printStackTrace();
+            ite.printStackTrace(System.out);
             return;
         }
 
         try {
             String s = "Should be ignored";
-            m.invoke(s, new Object(), Object.class);
+            m.invoke(s, objects, 0, 1);
         } catch (IllegalAccessException iae) {
-            iae.printStackTrace();
+            iae.printStackTrace(System.out);
             return;
         } catch (InvocationTargetException ite) {
-            ite.printStackTrace();
+            ite.printStackTrace(System.out);
             return;
         }
 
         try {
             System.out.println("checkType invoking null");
-            m.invoke(null, new Object(), int.class);
+            // Trigger an NPE at the target.
+            m.invoke(null, null, 0, 1);
             System.out.println("ERROR: should throw InvocationTargetException");
         } catch (InvocationTargetException ite) {
             System.out.println("checkType got expected exception");
         } catch (IllegalAccessException iae) {
-            iae.printStackTrace();
+            iae.printStackTrace(System.out);
             return;
         }
     }
@@ -456,7 +457,7 @@ public class Main {
     public static void checkClinitForFields() throws Exception {
       // Loading a class constant shouldn't run <clinit>.
       System.out.println("calling const-class FieldNoisyInitUser.class");
-      Class niuClass = FieldNoisyInitUser.class;
+      Class<?> niuClass = FieldNoisyInitUser.class;
       System.out.println("called const-class FieldNoisyInitUser.class");
 
       // Getting the declared fields doesn't run <clinit>.
@@ -478,14 +479,14 @@ public class Main {
     public static void checkClinitForMethods() throws Exception {
       // Loading a class constant shouldn't run <clinit>.
       System.out.println("calling const-class MethodNoisyInitUser.class");
-      Class niuClass = MethodNoisyInitUser.class;
+      Class<?> niuClass = MethodNoisyInitUser.class;
       System.out.println("called const-class MethodNoisyInitUser.class");
 
       // Getting the declared methods doesn't run <clinit>.
       Method[] methods = niuClass.getDeclaredMethods();
       System.out.println("got methods");
 
-      Method method = niuClass.getMethod("staticMethod", (Class[]) null);
+      Method method = niuClass.getMethod("staticMethod");
       System.out.println("got method");
       method.invoke(null);
       System.out.println("invoked method");
@@ -515,8 +516,7 @@ public class Main {
 
         Method method;
         try {
-            method = Main.class.getMethod("fancyMethod",
-                new Class[] { ArrayList.class });
+            method = Main.class.getMethod("fancyMethod", ArrayList.class);
         } catch (NoSuchMethodException nsme) {
             throw new RuntimeException(nsme);
         }
@@ -525,9 +525,9 @@ public class Main {
         System.out.println("generic method " + method.getName() + " params='"
             + stringifyTypeArray(parmTypes) + "' ret='" + ret + "'");
 
-        Constructor ctor;
+        Constructor<?> ctor;
         try {
-            ctor = Main.class.getConstructor(new Class[] { ArrayList.class });
+            ctor = Main.class.getConstructor( ArrayList.class);
         } catch (NoSuchMethodException nsme) {
             throw new RuntimeException(nsme);
         }
@@ -578,8 +578,8 @@ public class Main {
         }
         Method method1, method2;
         try {
-            method1 = Main.class.getMethod("fancyMethod", new Class[] { ArrayList.class });
-            method2 = Main.class.getMethod("fancyMethod", new Class[] { ArrayList.class });
+            method1 = Main.class.getMethod("fancyMethod", ArrayList.class);
+            method2 = Main.class.getMethod("fancyMethod", ArrayList.class);
         } catch (NoSuchMethodException nsme) {
             throw new RuntimeException(nsme);
         }
@@ -710,27 +710,27 @@ public class Main {
     private static void checkGetDeclaredConstructor() {
         try {
             Method.class.getDeclaredConstructor().setAccessible(true);
-            System.out.print("Didn't get an exception from Method.class.getDeclaredConstructor().setAccessible");
+            System.out.println("Didn't get an exception from Method.class.getDeclaredConstructor().setAccessible");
         } catch (SecurityException e) {
         } catch (NoSuchMethodException e) {
         } catch (Exception e) {
-            System.out.print(e);
+            System.out.println(e);
         }
         try {
             Field.class.getDeclaredConstructor().setAccessible(true);
-            System.out.print("Didn't get an exception from Field.class.getDeclaredConstructor().setAccessible");
+            System.out.println("Didn't get an exception from Field.class.getDeclaredConstructor().setAccessible");
         } catch (SecurityException e) {
         } catch (NoSuchMethodException e) {
         } catch (Exception e) {
-            System.out.print(e);
+            System.out.println(e);
         }
         try {
             Class.class.getDeclaredConstructor().setAccessible(true);
-            System.out.print("Didn't get an exception from Class.class.getDeclaredConstructor().setAccessible");
+            System.out.println("Didn't get an exception from Class.class.getDeclaredConstructor().setAccessible");
         } catch (SecurityException e) {
         } catch (NoSuchMethodException e) {
         } catch (Exception e) {
-            System.out.print(e);
+            System.out.println(e);
         }
     }
 
@@ -744,7 +744,7 @@ public class Main {
 
         checkGetDeclaredConstructor();
         checkAccess();
-        checkType();
+        checkSwap();
         checkClinitForFields();
         checkClinitForMethods();
         checkGeneric();
@@ -826,7 +826,7 @@ class FieldNoisyInit {
     static {
         System.out.println("FieldNoisyInit is initializing");
         //Throwable th = new Throwable();
-        //th.printStackTrace();
+        //th.printStackTrace(System.out);
     }
 }
 
@@ -842,7 +842,7 @@ class MethodNoisyInit {
     static {
         System.out.println("MethodNoisyInit is initializing");
         //Throwable th = new Throwable();
-        //th.printStackTrace();
+        //th.printStackTrace(System.out);
     }
 }
 

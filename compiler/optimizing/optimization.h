@@ -17,51 +17,137 @@
 #ifndef ART_COMPILER_OPTIMIZING_OPTIMIZATION_H_
 #define ART_COMPILER_OPTIMIZING_OPTIMIZATION_H_
 
+#include "base/arena_object.h"
 #include "nodes.h"
 #include "optimizing_compiler_stats.h"
 
 namespace art {
 
+class CodeGenerator;
+class CompilerDriver;
+class DexCompilationUnit;
+
 /**
  * Abstraction to implement an optimization pass.
  */
-class HOptimization : public ValueObject {
+class HOptimization : public ArenaObject<kArenaAllocOptimization> {
  public:
   HOptimization(HGraph* graph,
-                bool is_in_ssa_form,
                 const char* pass_name,
                 OptimizingCompilerStats* stats = nullptr)
       : graph_(graph),
         stats_(stats),
-        is_in_ssa_form_(is_in_ssa_form),
         pass_name_(pass_name) {}
 
   virtual ~HOptimization() {}
 
-  // Return the name of the pass.
+  // Return the name of the pass. Pass names for a single HOptimization should be of form
+  // <optimization_name> or <optimization_name>$<pass_name> for common <optimization_name> prefix.
+  // Example: 'instruction_simplifier', 'instruction_simplifier$after_bce',
+  // 'instruction_simplifier$before_codegen'.
   const char* GetPassName() const { return pass_name_; }
 
-  // Peform the analysis itself.
-  virtual void Run() = 0;
-
-  // Verify the graph; abort if it is not valid.
-  void Check();
+  // Perform the pass or analysis. Returns false if no optimizations occurred or no useful
+  // information was computed (this is best effort, returning true is always ok).
+  virtual bool Run() = 0;
 
  protected:
-  void MaybeRecordStat(MethodCompilationStat compilation_stat, size_t count = 1) const;
-
   HGraph* const graph_;
   // Used to record stats about the optimization.
   OptimizingCompilerStats* const stats_;
 
  private:
-  // Does the analyzed graph use the SSA form?
-  const bool is_in_ssa_form_;
   // Optimization pass name.
   const char* pass_name_;
 
   DISALLOW_COPY_AND_ASSIGN(HOptimization);
 };
+
+// Optimization passes that can be constructed by the helper method below. An enum
+// field is preferred over a string lookup at places where performance matters.
+// TODO: generate this table and lookup methods below automatically?
+enum class OptimizationPass {
+  kBoundsCheckElimination,
+  kCHAGuardOptimization,
+  kCodeSinking,
+  kConstantFolding,
+  kConstructorFenceRedundancyElimination,
+  kDeadCodeElimination,
+  kGlobalValueNumbering,
+  kInductionVarAnalysis,
+  kInliner,
+  kInstructionSimplifier,
+  kIntrinsicsRecognizer,
+  kInvariantCodeMotion,
+  kLoadStoreAnalysis,
+  kLoadStoreElimination,
+  kLoopOptimization,
+  kScheduling,
+  kSelectGenerator,
+  kSharpening,
+  kSideEffectsAnalysis,
+#ifdef ART_ENABLE_CODEGEN_arm
+  kInstructionSimplifierArm,
+#endif
+#ifdef ART_ENABLE_CODEGEN_arm64
+  kInstructionSimplifierArm64,
+#endif
+#ifdef ART_ENABLE_CODEGEN_mips
+  kPcRelativeFixupsMips,
+  kInstructionSimplifierMips,
+#endif
+#ifdef ART_ENABLE_CODEGEN_x86
+  kPcRelativeFixupsX86,
+#endif
+#if defined(ART_ENABLE_CODEGEN_x86) || defined(ART_ENABLE_CODEGEN_x86_64)
+  kX86MemoryOperandGeneration,
+#endif
+  kNone,
+  kLast = kNone
+};
+
+// Lookup name of optimization pass.
+const char* OptimizationPassName(OptimizationPass pass);
+
+// Lookup optimization pass by name.
+OptimizationPass OptimizationPassByName(const std::string& pass_name);
+
+// Optimization definition consisting of an optimization pass
+// an optional alternative name (nullptr denotes default), and
+// an optional pass dependence (kNone denotes no dependence).
+struct OptimizationDef {
+  OptimizationDef(OptimizationPass p, const char* pn, OptimizationPass d)
+      : pass(p), pass_name(pn), depends_on(d) {}
+  OptimizationPass pass;
+  const char* pass_name;
+  OptimizationPass depends_on;
+};
+
+// Helper method for optimization definition array entries.
+inline OptimizationDef OptDef(OptimizationPass pass,
+                              const char* pass_name = nullptr,
+                              OptimizationPass depends_on = OptimizationPass::kNone) {
+  return OptimizationDef(pass, pass_name, depends_on);
+}
+
+// Helper method to construct series of optimization passes.
+// The array should consist of the requested optimizations
+// and optional alternative names for repeated passes.
+// Example:
+//    { OptPass(kConstantFolding),
+//      OptPass(Inliner),
+//      OptPass(kConstantFolding, "constant_folding$after_inlining")
+//    }
+ArenaVector<HOptimization*> ConstructOptimizations(
+    const OptimizationDef definitions[],
+    size_t length,
+    ArenaAllocator* allocator,
+    HGraph* graph,
+    OptimizingCompilerStats* stats,
+    CodeGenerator* codegen,
+    CompilerDriver* driver,
+    const DexCompilationUnit& dex_compilation_unit,
+    VariableSizedHandleScope* handles);
 
 }  // namespace art
 

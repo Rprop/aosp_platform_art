@@ -3,6 +3,7 @@ import otherpackage.OtherPackageClass;
 import java.io.Serializable;
 import java.lang.reflect.AccessibleObject;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Executable;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -106,9 +107,14 @@ public class ClassAttrs {
         inner.showMe();
 
         ClassAttrs attrs = new ClassAttrs();
-
-        /* anonymous, not local, not member */
-        printClassAttrs((new OtherClass() { int i = 5; }).getClass());
+        try {
+            /* anonymous, not local, not member */
+            printClassAttrs(Class.forName("ClassAttrs$1")); // ClassAttrs$1.j
+        } catch (ClassNotFoundException e) {
+            System.out.println("FAILED: " + e);
+            e.printStackTrace(System.out);
+            throw new AssertionError(e);
+        }
 
         /* member, not anonymous, not local */
         printClassAttrs(MemberClass.class);
@@ -117,14 +123,13 @@ public class ClassAttrs {
         printClassAttrs(FancyClass.class);
 
         try {
-            Constructor cons;
-            cons = MemberClass.class.getConstructor(
-                    new Class[] { MemberClass.class });
+            Constructor<?> cons;
+            cons = MemberClass.class.getConstructor(MemberClass.class);
             System.out.println("constructor signature: "
                     + getSignatureAttribute(cons));
 
             Method meth;
-            meth = MemberClass.class.getMethod("foo", (Class[]) null);
+            meth = MemberClass.class.getMethod("foo");
             System.out.println("method signature: "
                     + getSignatureAttribute(meth));
 
@@ -133,12 +138,12 @@ public class ClassAttrs {
             System.out.println("field signature: "
                     + getSignatureAttribute(field));
         } catch (NoSuchMethodException nsme) {
-            System.err.println("FAILED: " + nsme);
+            System.out.println("FAILED: " + nsme);
         } catch (NoSuchFieldException nsfe) {
-            System.err.println("FAILED: " + nsfe);
+            System.out.println("FAILED: " + nsfe);
         } catch (RuntimeException re) {
-            System.err.println("FAILED: " + re);
-            re.printStackTrace();
+            System.out.println("FAILED: " + re);
+            re.printStackTrace(System.out);
         }
 
         test_isAssignableFrom();
@@ -221,16 +226,19 @@ public class ClassAttrs {
     public static String getSignatureAttribute(Object obj) {
         Method method;
         try {
-            Class c = Class.forName("libcore.reflect.AnnotationAccess");
-            method = c.getDeclaredMethod("getSignature", java.lang.reflect.AnnotatedElement.class);
+            Class<?> c = obj.getClass();
+            if (c == Method.class || c == Constructor.class) {
+              c = Executable.class;
+            }
+            method = c.getDeclaredMethod("getSignatureAttribute");
             method.setAccessible(true);
         } catch (Exception ex) {
-            ex.printStackTrace();
+            ex.printStackTrace(System.out);
             return "<unknown>";
         }
 
         try {
-            return (String) method.invoke(null, obj);
+            return (String) method.invoke(obj);
         } catch (IllegalAccessException ex) {
             throw new RuntimeException(ex);
         } catch (InvocationTargetException ex) {
@@ -259,9 +267,7 @@ public class ClassAttrs {
     /*
      * Dump a variety of class attributes.
      */
-    public static void printClassAttrs(Class clazz) {
-        Class clazz2;
-
+    public static <T> void printClassAttrs(Class<T> clazz) {
         System.out.println("***** " + clazz + ":");
 
         System.out.println("  name: "
@@ -317,7 +323,7 @@ public class ClassAttrs {
         System.out.println("  genericInterfaces: "
             + stringifyTypeArray(clazz.getGenericInterfaces()));
 
-        TypeVariable<Class<?>>[] typeParameters = clazz.getTypeParameters();
+        TypeVariable<Class<T>>[] typeParameters = clazz.getTypeParameters();
         System.out.println("  typeParameters: "
             + stringifyTypeArray(typeParameters));
     }

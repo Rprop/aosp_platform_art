@@ -16,11 +16,14 @@
 
 #include "transaction.h"
 
+#include <android-base/logging.h>
+
 #include "base/stl_util.h"
-#include "base/logging.h"
 #include "gc/accounting/card_table-inl.h"
+#include "gc_root-inl.h"
 #include "intern_table.h"
 #include "mirror/class-inl.h"
+#include "mirror/dex_cache-inl.h"
 #include "mirror/object-inl.h"
 #include "mirror/object_array-inl.h"
 
@@ -32,8 +35,16 @@ namespace art {
 static constexpr bool kEnableTransactionStats = false;
 
 Transaction::Transaction()
-  : log_lock_("transaction log lock", kTransactionLogLock), aborted_(false) {
+  : log_lock_("transaction log lock", kTransactionLogLock),
+    aborted_(false),
+    rolling_back_(false),
+    strict_(false) {
   CHECK(Runtime::Current()->IsAotCompiler());
+}
+
+Transaction::Transaction(bool strict, mirror::Class* root) : Transaction() {
+  strict_ = strict;
+  root_ = root;
 }
 
 Transaction::~Transaction() {
@@ -41,21 +52,23 @@ Transaction::~Transaction() {
     MutexLock mu(Thread::Current(), log_lock_);
     size_t objects_count = object_logs_.size();
     size_t field_values_count = 0;
-    for (auto it : object_logs_) {
+    for (const auto& it : object_logs_) {
       field_values_count += it.second.Size();
     }
     size_t array_count = array_logs_.size();
     size_t array_values_count = 0;
-    for (auto it : array_logs_) {
+    for (const auto& it : array_logs_) {
       array_values_count += it.second.Size();
     }
-    size_t string_count = intern_string_logs_.size();
+    size_t intern_string_count = intern_string_logs_.size();
+    size_t resolve_string_count = resolve_string_logs_.size();
     LOG(INFO) << "Transaction::~Transaction"
               << ": objects_count=" << objects_count
               << ", field_values_count=" << field_values_count
               << ", array_count=" << array_count
               << ", array_values_count=" << array_values_count
-              << ", string_count=" << string_count;
+              << ", intern_string_count=" << intern_string_count
+              << ", resolve_string_count=" << resolve_string_count;
   }
 }
 
@@ -93,29 +106,65 @@ bool Transaction::IsAborted() {
   return aborted_;
 }
 
+bool Transaction::IsRollingBack() {
+  return rolling_back_;
+}
+
+bool Transaction::IsStrict() {
+  MutexLock mu(Thread::Current(), log_lock_);
+  return strict_;
+}
+
 const std::string& Transaction::GetAbortMessage() {
   MutexLock mu(Thread::Current(), log_lock_);
   return abort_message_;
 }
 
-void Transaction::RecordWriteFieldBoolean(mirror::Object* obj, MemberOffset field_offset,
-                                          uint8_t value, bool is_volatile) {
+bool Transaction::WriteConstraint(mirror::Object* obj, ArtField* field) {
+  MutexLock mu(Thread::Current(), log_lock_);
+  if (strict_  // no constraint for boot image
+      && field->IsStatic()  // no constraint instance updating
+      && obj != root_) {  // modifying other classes' static field, fail
+    return true;
+  }
+  return false;
+}
+
+bool Transaction::ReadConstraint(mirror::Object* obj, ArtField* field) {
+  DCHECK(field->IsStatic());
+  DCHECK(obj->IsClass());
+  MutexLock mu(Thread::Current(), log_lock_);
+  if (!strict_ ||   // no constraint for boot image
+      obj == root_) {  // self-updating, pass
+    return false;
+  }
+  return true;
+}
+
+void Transaction::RecordWriteFieldBoolean(mirror::Object* obj,
+                                          MemberOffset field_offset,
+                                          uint8_t value,
+                                          bool is_volatile) {
   DCHECK(obj != nullptr);
   MutexLock mu(Thread::Current(), log_lock_);
   ObjectLog& object_log = object_logs_[obj];
   object_log.LogBooleanValue(field_offset, value, is_volatile);
 }
 
-void Transaction::RecordWriteFieldByte(mirror::Object* obj, MemberOffset field_offset,
-                                       int8_t value, bool is_volatile) {
+void Transaction::RecordWriteFieldByte(mirror::Object* obj,
+                                       MemberOffset field_offset,
+                                       int8_t value,
+                                       bool is_volatile) {
   DCHECK(obj != nullptr);
   MutexLock mu(Thread::Current(), log_lock_);
   ObjectLog& object_log = object_logs_[obj];
   object_log.LogByteValue(field_offset, value, is_volatile);
 }
 
-void Transaction::RecordWriteFieldChar(mirror::Object* obj, MemberOffset field_offset,
-                                       uint16_t value, bool is_volatile) {
+void Transaction::RecordWriteFieldChar(mirror::Object* obj,
+                                       MemberOffset field_offset,
+                                       uint16_t value,
+                                       bool is_volatile) {
   DCHECK(obj != nullptr);
   MutexLock mu(Thread::Current(), log_lock_);
   ObjectLog& object_log = object_logs_[obj];
@@ -123,8 +172,10 @@ void Transaction::RecordWriteFieldChar(mirror::Object* obj, MemberOffset field_o
 }
 
 
-void Transaction::RecordWriteFieldShort(mirror::Object* obj, MemberOffset field_offset,
-                                        int16_t value, bool is_volatile) {
+void Transaction::RecordWriteFieldShort(mirror::Object* obj,
+                                        MemberOffset field_offset,
+                                        int16_t value,
+                                        bool is_volatile) {
   DCHECK(obj != nullptr);
   MutexLock mu(Thread::Current(), log_lock_);
   ObjectLog& object_log = object_logs_[obj];
@@ -132,7 +183,9 @@ void Transaction::RecordWriteFieldShort(mirror::Object* obj, MemberOffset field_
 }
 
 
-void Transaction::RecordWriteField32(mirror::Object* obj, MemberOffset field_offset, uint32_t value,
+void Transaction::RecordWriteField32(mirror::Object* obj,
+                                     MemberOffset field_offset,
+                                     uint32_t value,
                                      bool is_volatile) {
   DCHECK(obj != nullptr);
   MutexLock mu(Thread::Current(), log_lock_);
@@ -140,7 +193,9 @@ void Transaction::RecordWriteField32(mirror::Object* obj, MemberOffset field_off
   object_log.Log32BitsValue(field_offset, value, is_volatile);
 }
 
-void Transaction::RecordWriteField64(mirror::Object* obj, MemberOffset field_offset, uint64_t value,
+void Transaction::RecordWriteField64(mirror::Object* obj,
+                                     MemberOffset field_offset,
+                                     uint64_t value,
                                      bool is_volatile) {
   DCHECK(obj != nullptr);
   MutexLock mu(Thread::Current(), log_lock_);
@@ -148,8 +203,10 @@ void Transaction::RecordWriteField64(mirror::Object* obj, MemberOffset field_off
   object_log.Log64BitsValue(field_offset, value, is_volatile);
 }
 
-void Transaction::RecordWriteFieldReference(mirror::Object* obj, MemberOffset field_offset,
-                                            mirror::Object* value, bool is_volatile) {
+void Transaction::RecordWriteFieldReference(mirror::Object* obj,
+                                            MemberOffset field_offset,
+                                            mirror::Object* value,
+                                            bool is_volatile) {
   DCHECK(obj != nullptr);
   MutexLock mu(Thread::Current(), log_lock_);
   ObjectLog& object_log = object_logs_[obj];
@@ -161,51 +218,66 @@ void Transaction::RecordWriteArray(mirror::Array* array, size_t index, uint64_t 
   DCHECK(array->IsArrayInstance());
   DCHECK(!array->IsObjectArray());
   MutexLock mu(Thread::Current(), log_lock_);
-  ArrayLog& array_log = array_logs_[array];
-  array_log.LogValue(index, value);
+  auto it = array_logs_.find(array);
+  if (it == array_logs_.end()) {
+    ArrayLog log;
+    it = array_logs_.emplace(array, std::move(log)).first;
+  }
+  it->second.LogValue(index, value);
 }
 
-void Transaction::RecordStrongStringInsertion(mirror::String* s) {
+void Transaction::RecordResolveString(ObjPtr<mirror::DexCache> dex_cache,
+                                      dex::StringIndex string_idx) {
+  DCHECK(dex_cache != nullptr);
+  DCHECK_LT(string_idx.index_, dex_cache->GetDexFile()->NumStringIds());
+  MutexLock mu(Thread::Current(), log_lock_);
+  resolve_string_logs_.emplace_back(dex_cache, string_idx);
+}
+
+void Transaction::RecordStrongStringInsertion(ObjPtr<mirror::String> s) {
   InternStringLog log(s, InternStringLog::kStrongString, InternStringLog::kInsert);
-  LogInternedString(log);
+  LogInternedString(std::move(log));
 }
 
-void Transaction::RecordWeakStringInsertion(mirror::String* s) {
+void Transaction::RecordWeakStringInsertion(ObjPtr<mirror::String> s) {
   InternStringLog log(s, InternStringLog::kWeakString, InternStringLog::kInsert);
-  LogInternedString(log);
+  LogInternedString(std::move(log));
 }
 
-void Transaction::RecordStrongStringRemoval(mirror::String* s) {
+void Transaction::RecordStrongStringRemoval(ObjPtr<mirror::String> s) {
   InternStringLog log(s, InternStringLog::kStrongString, InternStringLog::kRemove);
-  LogInternedString(log);
+  LogInternedString(std::move(log));
 }
 
-void Transaction::RecordWeakStringRemoval(mirror::String* s) {
+void Transaction::RecordWeakStringRemoval(ObjPtr<mirror::String> s) {
   InternStringLog log(s, InternStringLog::kWeakString, InternStringLog::kRemove);
-  LogInternedString(log);
+  LogInternedString(std::move(log));
 }
 
-void Transaction::LogInternedString(const InternStringLog& log) {
+void Transaction::LogInternedString(InternStringLog&& log) {
   Locks::intern_table_lock_->AssertExclusiveHeld(Thread::Current());
   MutexLock mu(Thread::Current(), log_lock_);
-  intern_string_logs_.push_front(log);
+  intern_string_logs_.push_front(std::move(log));
 }
 
 void Transaction::Rollback() {
-  CHECK(!Runtime::Current()->IsActiveTransaction());
   Thread* self = Thread::Current();
   self->AssertNoPendingException();
   MutexLock mu1(self, *Locks::intern_table_lock_);
   MutexLock mu2(self, log_lock_);
+  rolling_back_ = true;
+  CHECK(!Runtime::Current()->IsActiveTransaction());
   UndoObjectModifications();
   UndoArrayModifications();
   UndoInternStringTableModifications();
+  UndoResolveStringModifications();
+  rolling_back_ = false;
 }
 
 void Transaction::UndoObjectModifications() {
   // TODO we may not need to restore objects allocated during this transaction. Or we could directly
   // remove them from the heap.
-  for (auto it : object_logs_) {
+  for (const auto& it : object_logs_) {
     it.second.Undo(it.first);
   }
   object_logs_.clear();
@@ -214,7 +286,7 @@ void Transaction::UndoObjectModifications() {
 void Transaction::UndoArrayModifications() {
   // TODO we may not need to restore array allocated during this transaction. Or we could directly
   // remove them from the heap.
-  for (auto it : array_logs_) {
+  for (const auto& it : array_logs_) {
     it.second.Undo(it.first);
   }
   array_logs_.clear();
@@ -224,17 +296,26 @@ void Transaction::UndoInternStringTableModifications() {
   InternTable* const intern_table = Runtime::Current()->GetInternTable();
   // We want to undo each operation from the most recent to the oldest. List has been filled so the
   // most recent operation is at list begin so just have to iterate over it.
-  for (InternStringLog& string_log : intern_string_logs_) {
+  for (const InternStringLog& string_log : intern_string_logs_) {
     string_log.Undo(intern_table);
   }
   intern_string_logs_.clear();
 }
 
+void Transaction::UndoResolveStringModifications() {
+  for (ResolveStringLog& string_log : resolve_string_logs_) {
+    string_log.Undo();
+  }
+  resolve_string_logs_.clear();
+}
+
 void Transaction::VisitRoots(RootVisitor* visitor) {
   MutexLock mu(Thread::Current(), log_lock_);
+  visitor->VisitRoot(reinterpret_cast<mirror::Object**>(&root_), RootInfo(kRootUnknown));
   VisitObjectLogs(visitor);
   VisitArrayLogs(visitor);
-  VisitStringLogs(visitor);
+  VisitInternStringLogs(visitor);
+  VisitResolveStringLogs(visitor);
 }
 
 void Transaction::VisitObjectLogs(RootVisitor* visitor) {
@@ -243,7 +324,7 @@ void Transaction::VisitObjectLogs(RootVisitor* visitor) {
   std::list<ObjectPair> moving_roots;
 
   // Visit roots.
-  for (auto it : object_logs_) {
+  for (auto& it : object_logs_) {
     it.second.VisitRoots(visitor);
     mirror::Object* old_root = it.first;
     mirror::Object* new_root = old_root;
@@ -260,7 +341,7 @@ void Transaction::VisitObjectLogs(RootVisitor* visitor) {
     auto old_root_it = object_logs_.find(old_root);
     CHECK(old_root_it != object_logs_.end());
     CHECK(object_logs_.find(new_root) == object_logs_.end());
-    object_logs_.insert(std::make_pair(new_root, old_root_it->second));
+    object_logs_.emplace(new_root, std::move(old_root_it->second));
     object_logs_.erase(old_root_it);
   }
 }
@@ -270,7 +351,7 @@ void Transaction::VisitArrayLogs(RootVisitor* visitor) {
   typedef std::pair<mirror::Array*, mirror::Array*> ArrayPair;
   std::list<ArrayPair> moving_roots;
 
-  for (auto it : array_logs_) {
+  for (auto& it : array_logs_) {
     mirror::Array* old_root = it.first;
     CHECK(!old_root->IsObjectArray());
     mirror::Array* new_root = old_root;
@@ -287,13 +368,19 @@ void Transaction::VisitArrayLogs(RootVisitor* visitor) {
     auto old_root_it = array_logs_.find(old_root);
     CHECK(old_root_it != array_logs_.end());
     CHECK(array_logs_.find(new_root) == array_logs_.end());
-    array_logs_.insert(std::make_pair(new_root, old_root_it->second));
+    array_logs_.emplace(new_root, std::move(old_root_it->second));
     array_logs_.erase(old_root_it);
   }
 }
 
-void Transaction::VisitStringLogs(RootVisitor* visitor) {
+void Transaction::VisitInternStringLogs(RootVisitor* visitor) {
   for (InternStringLog& log : intern_string_logs_) {
+    log.VisitRoots(visitor);
+  }
+}
+
+void Transaction::VisitResolveStringLogs(RootVisitor* visitor) {
+  for (ResolveStringLog& log : resolve_string_logs_) {
     log.VisitRoots(visitor);
   }
 }
@@ -322,23 +409,27 @@ void Transaction::ObjectLog::Log64BitsValue(MemberOffset offset, uint64_t value,
   LogValue(ObjectLog::k64Bits, offset, value, is_volatile);
 }
 
-void Transaction::ObjectLog::LogReferenceValue(MemberOffset offset, mirror::Object* obj, bool is_volatile) {
+void Transaction::ObjectLog::LogReferenceValue(MemberOffset offset,
+                                               mirror::Object* obj,
+                                               bool is_volatile) {
   LogValue(ObjectLog::kReference, offset, reinterpret_cast<uintptr_t>(obj), is_volatile);
 }
 
 void Transaction::ObjectLog::LogValue(ObjectLog::FieldValueKind kind,
-                                      MemberOffset offset, uint64_t value, bool is_volatile) {
+                                      MemberOffset offset,
+                                      uint64_t value,
+                                      bool is_volatile) {
   auto it = field_values_.find(offset.Uint32Value());
   if (it == field_values_.end()) {
     ObjectLog::FieldValue field_value;
     field_value.value = value;
     field_value.is_volatile = is_volatile;
     field_value.kind = kind;
-    field_values_.insert(std::make_pair(offset.Uint32Value(), field_value));
+    field_values_.emplace(offset.Uint32Value(), std::move(field_value));
   }
 }
 
-void Transaction::ObjectLog::Undo(mirror::Object* obj) {
+void Transaction::ObjectLog::Undo(mirror::Object* obj) const {
   for (auto& it : field_values_) {
     // Garbage collector needs to access object's class and array's length. So we don't rollback
     // these values.
@@ -352,60 +443,71 @@ void Transaction::ObjectLog::Undo(mirror::Object* obj) {
       // Skip Array::length field.
       continue;
     }
-    FieldValue& field_value = it.second;
+    const FieldValue& field_value = it.second;
     UndoFieldWrite(obj, field_offset, field_value);
   }
 }
 
-void Transaction::ObjectLog::UndoFieldWrite(mirror::Object* obj, MemberOffset field_offset,
-                                            const FieldValue& field_value) {
+void Transaction::ObjectLog::UndoFieldWrite(mirror::Object* obj,
+                                            MemberOffset field_offset,
+                                            const FieldValue& field_value) const {
   // TODO We may want to abort a transaction while still being in transaction mode. In this case,
   // we'd need to disable the check.
-  constexpr bool kCheckTransaction = true;
+  constexpr bool kCheckTransaction = false;
   switch (field_value.kind) {
     case kBoolean:
       if (UNLIKELY(field_value.is_volatile)) {
-        obj->SetFieldBooleanVolatile<false, kCheckTransaction>(field_offset,
-                                                         static_cast<bool>(field_value.value));
+        obj->SetFieldBooleanVolatile<false, kCheckTransaction>(
+            field_offset,
+            static_cast<bool>(field_value.value));
       } else {
-        obj->SetFieldBoolean<false, kCheckTransaction>(field_offset,
-                                                 static_cast<bool>(field_value.value));
+        obj->SetFieldBoolean<false, kCheckTransaction>(
+            field_offset,
+            static_cast<bool>(field_value.value));
       }
       break;
     case kByte:
       if (UNLIKELY(field_value.is_volatile)) {
-        obj->SetFieldByteVolatile<false, kCheckTransaction>(field_offset,
-                                                         static_cast<int8_t>(field_value.value));
+        obj->SetFieldByteVolatile<false, kCheckTransaction>(
+            field_offset,
+            static_cast<int8_t>(field_value.value));
       } else {
-        obj->SetFieldByte<false, kCheckTransaction>(field_offset,
-                                                 static_cast<int8_t>(field_value.value));
+        obj->SetFieldByte<false, kCheckTransaction>(
+            field_offset,
+            static_cast<int8_t>(field_value.value));
       }
       break;
     case kChar:
       if (UNLIKELY(field_value.is_volatile)) {
-        obj->SetFieldCharVolatile<false, kCheckTransaction>(field_offset,
-                                                          static_cast<uint16_t>(field_value.value));
+        obj->SetFieldCharVolatile<false, kCheckTransaction>(
+            field_offset,
+            static_cast<uint16_t>(field_value.value));
       } else {
-        obj->SetFieldChar<false, kCheckTransaction>(field_offset,
-                                                  static_cast<uint16_t>(field_value.value));
+        obj->SetFieldChar<false, kCheckTransaction>(
+            field_offset,
+            static_cast<uint16_t>(field_value.value));
       }
       break;
     case kShort:
       if (UNLIKELY(field_value.is_volatile)) {
-        obj->SetFieldShortVolatile<false, kCheckTransaction>(field_offset,
-                                                          static_cast<int16_t>(field_value.value));
+        obj->SetFieldShortVolatile<false, kCheckTransaction>(
+            field_offset,
+            static_cast<int16_t>(field_value.value));
       } else {
-        obj->SetFieldShort<false, kCheckTransaction>(field_offset,
-                                                  static_cast<int16_t>(field_value.value));
+        obj->SetFieldShort<false, kCheckTransaction>(
+            field_offset,
+            static_cast<int16_t>(field_value.value));
       }
       break;
     case k32Bits:
       if (UNLIKELY(field_value.is_volatile)) {
-        obj->SetField32Volatile<false, kCheckTransaction>(field_offset,
-                                                          static_cast<uint32_t>(field_value.value));
+        obj->SetField32Volatile<false, kCheckTransaction>(
+            field_offset,
+            static_cast<uint32_t>(field_value.value));
       } else {
-        obj->SetField32<false, kCheckTransaction>(field_offset,
-                                                  static_cast<uint32_t>(field_value.value));
+        obj->SetField32<false, kCheckTransaction>(
+            field_offset,
+            static_cast<uint32_t>(field_value.value));
       }
       break;
     case k64Bits:
@@ -417,11 +519,13 @@ void Transaction::ObjectLog::UndoFieldWrite(mirror::Object* obj, MemberOffset fi
       break;
     case kReference:
       if (UNLIKELY(field_value.is_volatile)) {
-        obj->SetFieldObjectVolatile<false, kCheckTransaction>(field_offset,
-                                                              reinterpret_cast<mirror::Object*>(field_value.value));
+        obj->SetFieldObjectVolatile<false, kCheckTransaction>(
+            field_offset,
+            reinterpret_cast<mirror::Object*>(field_value.value));
       } else {
-        obj->SetFieldObject<false, kCheckTransaction>(field_offset,
-                                                      reinterpret_cast<mirror::Object*>(field_value.value));
+        obj->SetFieldObject<false, kCheckTransaction>(
+            field_offset,
+            reinterpret_cast<mirror::Object*>(field_value.value));
       }
       break;
     default:
@@ -431,7 +535,7 @@ void Transaction::ObjectLog::UndoFieldWrite(mirror::Object* obj, MemberOffset fi
 }
 
 void Transaction::ObjectLog::VisitRoots(RootVisitor* visitor) {
-  for (auto it : field_values_) {
+  for (auto& it : field_values_) {
     FieldValue& field_value = it.second;
     if (field_value.kind == ObjectLog::kReference) {
       visitor->VisitRootIfNonNull(reinterpret_cast<mirror::Object**>(&field_value.value),
@@ -440,16 +544,16 @@ void Transaction::ObjectLog::VisitRoots(RootVisitor* visitor) {
   }
 }
 
-void Transaction::InternStringLog::Undo(InternTable* intern_table) {
+void Transaction::InternStringLog::Undo(InternTable* intern_table) const {
   DCHECK(intern_table != nullptr);
   switch (string_op_) {
     case InternStringLog::kInsert: {
       switch (string_kind_) {
         case InternStringLog::kStrongString:
-          intern_table->RemoveStrongFromTransaction(str_);
+          intern_table->RemoveStrongFromTransaction(str_.Read());
           break;
         case InternStringLog::kWeakString:
-          intern_table->RemoveWeakFromTransaction(str_);
+          intern_table->RemoveWeakFromTransaction(str_.Read());
           break;
         default:
           LOG(FATAL) << "Unknown interned string kind";
@@ -460,10 +564,10 @@ void Transaction::InternStringLog::Undo(InternTable* intern_table) {
     case InternStringLog::kRemove: {
       switch (string_kind_) {
         case InternStringLog::kStrongString:
-          intern_table->InsertStrongFromTransaction(str_);
+          intern_table->InsertStrongFromTransaction(str_.Read());
           break;
         case InternStringLog::kWeakString:
-          intern_table->InsertWeakFromTransaction(str_);
+          intern_table->InsertWeakFromTransaction(str_.Read());
           break;
         default:
           LOG(FATAL) << "Unknown interned string kind";
@@ -478,7 +582,32 @@ void Transaction::InternStringLog::Undo(InternTable* intern_table) {
 }
 
 void Transaction::InternStringLog::VisitRoots(RootVisitor* visitor) {
-  visitor->VisitRoot(reinterpret_cast<mirror::Object**>(&str_), RootInfo(kRootInternedString));
+  str_.VisitRoot(visitor, RootInfo(kRootInternedString));
+}
+
+void Transaction::ResolveStringLog::Undo() const {
+  dex_cache_.Read()->ClearString(string_idx_);
+}
+
+Transaction::ResolveStringLog::ResolveStringLog(ObjPtr<mirror::DexCache> dex_cache,
+                                                dex::StringIndex string_idx)
+    : dex_cache_(dex_cache),
+      string_idx_(string_idx) {
+  DCHECK(dex_cache != nullptr);
+  DCHECK_LT(string_idx_.index_, dex_cache->GetDexFile()->NumStringIds());
+}
+
+void Transaction::ResolveStringLog::VisitRoots(RootVisitor* visitor) {
+  dex_cache_.VisitRoot(visitor, RootInfo(kRootVMInternal));
+}
+
+Transaction::InternStringLog::InternStringLog(ObjPtr<mirror::String> s,
+                                              StringKind kind,
+                                              StringOp op)
+    : str_(s),
+      string_kind_(kind),
+      string_op_(op) {
+  DCHECK(s != nullptr);
 }
 
 void Transaction::ArrayLog::LogValue(size_t index, uint64_t value) {
@@ -488,7 +617,7 @@ void Transaction::ArrayLog::LogValue(size_t index, uint64_t value) {
   }
 }
 
-void Transaction::ArrayLog::Undo(mirror::Array* array) {
+void Transaction::ArrayLog::Undo(mirror::Array* array) const {
   DCHECK(array != nullptr);
   DCHECK(array->IsArrayInstance());
   Primitive::Type type = array->GetClass()->GetComponentType()->GetPrimitiveType();
@@ -497,34 +626,45 @@ void Transaction::ArrayLog::Undo(mirror::Array* array) {
   }
 }
 
-void Transaction::ArrayLog::UndoArrayWrite(mirror::Array* array, Primitive::Type array_type,
-                                           size_t index, uint64_t value) {
+void Transaction::ArrayLog::UndoArrayWrite(mirror::Array* array,
+                                           Primitive::Type array_type,
+                                           size_t index,
+                                           uint64_t value) const {
   // TODO We may want to abort a transaction while still being in transaction mode. In this case,
   // we'd need to disable the check.
+  constexpr bool kCheckTransaction = false;
   switch (array_type) {
     case Primitive::kPrimBoolean:
-      array->AsBooleanArray()->SetWithoutChecks<false>(index, static_cast<uint8_t>(value));
+      array->AsBooleanArray()->SetWithoutChecks<false, kCheckTransaction>(
+          index, static_cast<uint8_t>(value));
       break;
     case Primitive::kPrimByte:
-      array->AsByteArray()->SetWithoutChecks<false>(index, static_cast<int8_t>(value));
+      array->AsByteArray()->SetWithoutChecks<false, kCheckTransaction>(
+          index, static_cast<int8_t>(value));
       break;
     case Primitive::kPrimChar:
-      array->AsCharArray()->SetWithoutChecks<false>(index, static_cast<uint16_t>(value));
+      array->AsCharArray()->SetWithoutChecks<false, kCheckTransaction>(
+          index, static_cast<uint16_t>(value));
       break;
     case Primitive::kPrimShort:
-      array->AsShortArray()->SetWithoutChecks<false>(index, static_cast<int16_t>(value));
+      array->AsShortArray()->SetWithoutChecks<false, kCheckTransaction>(
+          index, static_cast<int16_t>(value));
       break;
     case Primitive::kPrimInt:
-      array->AsIntArray()->SetWithoutChecks<false>(index, static_cast<int32_t>(value));
+      array->AsIntArray()->SetWithoutChecks<false, kCheckTransaction>(
+          index, static_cast<int32_t>(value));
       break;
     case Primitive::kPrimFloat:
-      array->AsFloatArray()->SetWithoutChecks<false>(index, static_cast<float>(value));
+      array->AsFloatArray()->SetWithoutChecks<false, kCheckTransaction>(
+          index, static_cast<float>(value));
       break;
     case Primitive::kPrimLong:
-      array->AsLongArray()->SetWithoutChecks<false>(index, static_cast<int64_t>(value));
+      array->AsLongArray()->SetWithoutChecks<false, kCheckTransaction>(
+          index, static_cast<int64_t>(value));
       break;
     case Primitive::kPrimDouble:
-      array->AsDoubleArray()->SetWithoutChecks<false>(index, static_cast<double>(value));
+      array->AsDoubleArray()->SetWithoutChecks<false, kCheckTransaction>(
+          index, static_cast<double>(value));
       break;
     case Primitive::kPrimNot:
       LOG(FATAL) << "ObjectArray should be treated as Object";

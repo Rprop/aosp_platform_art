@@ -20,12 +20,13 @@
 #include <stdint.h>
 
 #include "base/macros.h"
+#include "obj_ptr.h"
 
 namespace art {
 
 namespace mirror {
-  class Class;
-  class Object;
+class Class;
+class Object;
 }  // namespace mirror
 
 // How we want to sanity check the heap's correctness.
@@ -47,15 +48,27 @@ enum VerifyObjectFlags {
   kVerifyAll = kVerifyThis | kVerifyReads | kVerifyWrites,
 };
 
-static constexpr bool kVerifyStack = kIsDebugBuild;
 static constexpr VerifyObjectFlags kDefaultVerifyFlags = kVerifyNone;
 static constexpr VerifyObjectMode kVerifyObjectSupport =
     kDefaultVerifyFlags != 0 ? kVerifyObjectModeFast : kVerifyObjectModeDisabled;
 
-ALWAYS_INLINE void VerifyObject(mirror::Object* obj) NO_THREAD_SAFETY_ANALYSIS;
+// Implements the actual object checks.
+void VerifyObjectImpl(ObjPtr<mirror::Object> obj) NO_THREAD_SAFETY_ANALYSIS;
+
+// Is a front to optimize out any calls if no verification is enabled.
+ALWAYS_INLINE
+static inline void VerifyObject(ObjPtr<mirror::Object> obj) NO_THREAD_SAFETY_ANALYSIS {
+  if (kVerifyObjectSupport > kVerifyObjectModeDisabled && obj != nullptr) {
+    VerifyObjectImpl(obj);
+  }
+}
+
+inline constexpr VerifyObjectFlags RemoveThisFlags(VerifyObjectFlags flags) {
+  return static_cast<VerifyObjectFlags>(flags & ~kVerifyThis);
+}
 
 // Check that c.getClass() == c.getClass().getClass().
-ALWAYS_INLINE bool VerifyClassClass(mirror::Class* c) NO_THREAD_SAFETY_ANALYSIS;
+ALWAYS_INLINE bool VerifyClassClass(ObjPtr<mirror::Class> c) NO_THREAD_SAFETY_ANALYSIS;
 
 }  // namespace art
 

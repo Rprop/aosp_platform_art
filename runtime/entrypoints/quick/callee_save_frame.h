@@ -18,88 +18,78 @@
 #define ART_RUNTIME_ENTRYPOINTS_QUICK_CALLEE_SAVE_FRAME_H_
 
 #include "arch/instruction_set.h"
+#include "base/callee_save_type.h"
+#include "base/enums.h"
 #include "base/mutex.h"
-#include "runtime.h"
+#include "quick/quick_method_frame_info.h"
 #include "thread-inl.h"
 
 // Specific frame size code is in architecture-specific files. We include this to compile-time
 // specialize the code.
-#include "arch/arm/quick_method_frame_info_arm.h"
-#include "arch/arm64/quick_method_frame_info_arm64.h"
-#include "arch/mips/quick_method_frame_info_mips.h"
-#include "arch/mips64/quick_method_frame_info_mips64.h"
-#include "arch/x86/quick_method_frame_info_x86.h"
-#include "arch/x86_64/quick_method_frame_info_x86_64.h"
+#include "arch/arm/callee_save_frame_arm.h"
+#include "arch/arm64/callee_save_frame_arm64.h"
+#include "arch/mips/callee_save_frame_mips.h"
+#include "arch/mips64/callee_save_frame_mips64.h"
+#include "arch/x86/callee_save_frame_x86.h"
+#include "arch/x86_64/callee_save_frame_x86_64.h"
 
 namespace art {
 class ArtMethod;
 
 class ScopedQuickEntrypointChecks {
  public:
-  explicit ScopedQuickEntrypointChecks(Thread *self) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
-      : self_(self) {
-    if (kIsDebugBuild) {
+  explicit ScopedQuickEntrypointChecks(Thread *self,
+                                       bool entry_check = kIsDebugBuild,
+                                       bool exit_check = kIsDebugBuild)
+      REQUIRES_SHARED(Locks::mutator_lock_) : self_(self), exit_check_(exit_check) {
+    if (entry_check) {
       TestsOnEntry();
     }
   }
 
-  explicit ScopedQuickEntrypointChecks() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
-      : self_(kIsDebugBuild ? Thread::Current() : nullptr) {
-    if (kIsDebugBuild) {
-      TestsOnEntry();
-    }
-  }
-
-  ~ScopedQuickEntrypointChecks() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    if (kIsDebugBuild) {
+  ~ScopedQuickEntrypointChecks() REQUIRES_SHARED(Locks::mutator_lock_) {
+    if (exit_check_) {
       TestsOnExit();
     }
   }
 
  private:
-  void TestsOnEntry() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  void TestsOnEntry() REQUIRES_SHARED(Locks::mutator_lock_) {
     Locks::mutator_lock_->AssertSharedHeld(self_);
     self_->VerifyStack();
   }
 
-  void TestsOnExit() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  void TestsOnExit() REQUIRES_SHARED(Locks::mutator_lock_) {
     Locks::mutator_lock_->AssertSharedHeld(self_);
     self_->VerifyStack();
   }
 
   Thread* const self_;
+  bool exit_check_;
 };
 
-static constexpr size_t GetCalleeSaveFrameSize(InstructionSet isa, Runtime::CalleeSaveType type) {
-  // constexpr must be a return statement.
-  return (isa == kArm || isa == kThumb2) ? arm::ArmCalleeSaveFrameSize(type) :
-         isa == kArm64 ? arm64::Arm64CalleeSaveFrameSize(type) :
-         isa == kMips ? mips::MipsCalleeSaveFrameSize(type) :
-         isa == kMips64 ? mips64::Mips64CalleeSaveFrameSize(type) :
-         isa == kX86 ? x86::X86CalleeSaveFrameSize(type) :
-         isa == kX86_64 ? x86_64::X86_64CalleeSaveFrameSize(type) :
-         isa == kNone ? (LOG(FATAL) << "kNone has no frame size", 0) :
-         (LOG(FATAL) << "Unknown instruction set" << isa, 0);
-}
+namespace detail {
 
-// Note: this specialized statement is sanity-checked in the quick-trampoline gtest.
-static constexpr size_t GetConstExprPointerSize(InstructionSet isa) {
-  // constexpr must be a return statement.
-  return (isa == kArm || isa == kThumb2) ? kArmPointerSize :
-         isa == kArm64 ? kArm64PointerSize :
-         isa == kMips ? kMipsPointerSize :
-         isa == kMips64 ? kMips64PointerSize :
-         isa == kX86 ? kX86PointerSize :
-         isa == kX86_64 ? kX86_64PointerSize :
-         isa == kNone ? (LOG(FATAL) << "kNone has no pointer size", 0) :
-         (LOG(FATAL) << "Unknown instruction set" << isa, 0);
-}
+template <InstructionSet>
+struct CSFSelector;  // No definition for unspecialized callee save frame selector.
 
-// Note: this specialized statement is sanity-checked in the quick-trampoline gtest.
-static constexpr size_t GetCalleeSaveReturnPcOffset(InstructionSet isa,
-                                                    Runtime::CalleeSaveType type) {
-  return GetCalleeSaveFrameSize(isa, type) - GetConstExprPointerSize(isa);
-}
+// Note: kThumb2 is never the kRuntimeISA.
+template <>
+struct CSFSelector<InstructionSet::kArm> { using type = arm::ArmCalleeSaveFrame; };
+template <>
+struct CSFSelector<InstructionSet::kArm64> { using type = arm64::Arm64CalleeSaveFrame; };
+template <>
+struct CSFSelector<InstructionSet::kMips> { using type = mips::MipsCalleeSaveFrame; };
+template <>
+struct CSFSelector<InstructionSet::kMips64> { using type = mips64::Mips64CalleeSaveFrame; };
+template <>
+struct CSFSelector<InstructionSet::kX86> { using type = x86::X86CalleeSaveFrame; };
+template <>
+struct CSFSelector<InstructionSet::kX86_64> { using type = x86_64::X86_64CalleeSaveFrame; };
+
+}  // namespace detail
+
+using RuntimeCalleeSaveFrame = detail::CSFSelector<kRuntimeISA>::type;
 
 }  // namespace art
 

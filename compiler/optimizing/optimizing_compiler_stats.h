@@ -17,120 +17,171 @@
 #ifndef ART_COMPILER_OPTIMIZING_OPTIMIZING_COMPILER_STATS_H_
 #define ART_COMPILER_OPTIMIZING_OPTIMIZING_COMPILER_STATS_H_
 
-#include <sstream>
+#include <atomic>
+#include <iomanip>
 #include <string>
+#include <type_traits>
 
-#include "atomic.h"
+#include "base/atomic.h"
+#include "base/globals.h"
+#include "base/logging.h"  // For VLOG_IS_ON.
 
 namespace art {
 
-enum MethodCompilationStat {
-  kAttemptCompilation = 0,
-  kCompiledBaseline,
-  kCompiledOptimized,
-  kCompiledQuick,
+enum class MethodCompilationStat {
+  kAttemptBytecodeCompilation = 0,
+  kAttemptIntrinsicCompilation,
+  kCompiledNativeStub,
+  kCompiledIntrinsic,
+  kCompiledBytecode,
+  kCHAInline,
   kInlinedInvoke,
+  kReplacedInvokeWithSimplePattern,
   kInstructionSimplifications,
-  kNotCompiledBranchOutsideMethodCode,
-  kNotCompiledCannotBuildSSA,
-  kNotCompiledCantAccesType,
-  kNotCompiledClassNotVerified,
+  kInstructionSimplificationsArch,
+  kUnresolvedMethod,
+  kUnresolvedField,
+  kUnresolvedFieldNotAFastAccess,
+  kRemovedCheckedCast,
+  kRemovedDeadInstruction,
+  kRemovedNullCheck,
+  kNotCompiledSkipped,
+  kNotCompiledInvalidBytecode,
+  kNotCompiledThrowCatchLoop,
+  kNotCompiledAmbiguousArrayOp,
   kNotCompiledHugeMethod,
   kNotCompiledLargeMethodNoBranches,
   kNotCompiledMalformedOpcode,
   kNotCompiledNoCodegen,
-  kNotCompiledNonSequentialRegPair,
   kNotCompiledPathological,
   kNotCompiledSpaceFilter,
   kNotCompiledUnhandledInstruction,
-  kNotCompiledUnresolvedField,
-  kNotCompiledUnresolvedMethod,
   kNotCompiledUnsupportedIsa,
+  kNotCompiledVerificationError,
   kNotCompiledVerifyAtRuntime,
-  kNotOptimizedDisabled,
-  kNotOptimizedRegisterAllocator,
-  kNotOptimizedTryCatch,
-  kRemovedCheckedCast,
-  kRemovedDeadInstruction,
-  kRemovedNullCheck,
+  kInlinedMonomorphicCall,
+  kInlinedPolymorphicCall,
+  kMonomorphicCall,
+  kPolymorphicCall,
+  kMegamorphicCall,
+  kBooleanSimplified,
+  kIntrinsicRecognized,
+  kLoopInvariantMoved,
+  kLoopVectorized,
+  kLoopVectorizedIdiom,
+  kSelectGenerated,
+  kRemovedInstanceOf,
+  kInlinedInvokeVirtualOrInterface,
+  kImplicitNullCheckGenerated,
+  kExplicitNullCheckGenerated,
+  kSimplifyIf,
+  kSimplifyThrowingInvoke,
+  kInstructionSunk,
+  kNotInlinedUnresolvedEntrypoint,
+  kNotInlinedDexCache,
+  kNotInlinedStackMaps,
+  kNotInlinedEnvironmentBudget,
+  kNotInlinedInstructionBudget,
+  kNotInlinedLoopWithoutExit,
+  kNotInlinedIrreducibleLoop,
+  kNotInlinedAlwaysThrows,
+  kNotInlinedInfiniteLoop,
+  kNotInlinedTryCatch,
+  kNotInlinedRegisterAllocator,
+  kNotInlinedCannotBuild,
+  kNotInlinedNotVerified,
+  kNotInlinedCodeItem,
+  kNotInlinedWont,
+  kNotInlinedRecursiveBudget,
+  kNotInlinedProxy,
+  kConstructorFenceGeneratedNew,
+  kConstructorFenceGeneratedFinal,
+  kConstructorFenceRemovedLSE,
+  kConstructorFenceRemovedPFRA,
+  kConstructorFenceRemovedCFRE,
+  kBitstringTypeCheck,
+  kJitOutOfMemoryForCommit,
   kLastStat
 };
+std::ostream& operator<<(std::ostream& os, const MethodCompilationStat& rhs);
 
 class OptimizingCompilerStats {
  public:
-  OptimizingCompilerStats() {}
+  OptimizingCompilerStats() {
+    // The std::atomic<> default constructor leaves values uninitialized, so initialize them now.
+    Reset();
+  }
 
-  void RecordStat(MethodCompilationStat stat, size_t count = 1) {
-    compile_stats_[stat] += count;
+  void RecordStat(MethodCompilationStat stat, uint32_t count = 1) {
+    size_t stat_index = static_cast<size_t>(stat);
+    DCHECK_LT(stat_index, arraysize(compile_stats_));
+    compile_stats_[stat_index] += count;
+  }
+
+  uint32_t GetStat(MethodCompilationStat stat) const {
+    size_t stat_index = static_cast<size_t>(stat);
+    DCHECK_LT(stat_index, arraysize(compile_stats_));
+    return compile_stats_[stat_index];
   }
 
   void Log() const {
-    if (compile_stats_[kAttemptCompilation] == 0) {
+    uint32_t compiled_intrinsics = GetStat(MethodCompilationStat::kCompiledIntrinsic);
+    uint32_t compiled_native_stubs = GetStat(MethodCompilationStat::kCompiledNativeStub);
+    uint32_t bytecode_attempts =
+        GetStat(MethodCompilationStat::kAttemptBytecodeCompilation);
+    if (compiled_intrinsics == 0u && compiled_native_stubs == 0u && bytecode_attempts == 0u) {
       LOG(INFO) << "Did not compile any method.";
     } else {
-      size_t unoptimized_percent =
-          compile_stats_[kCompiledBaseline] * 100 / compile_stats_[kAttemptCompilation];
-      size_t optimized_percent =
-          compile_stats_[kCompiledOptimized] * 100 / compile_stats_[kAttemptCompilation];
-      size_t quick_percent =
-          compile_stats_[kCompiledQuick] * 100 / compile_stats_[kAttemptCompilation];
-      std::ostringstream oss;
-      oss << "Attempted compilation of " << compile_stats_[kAttemptCompilation] << " methods: ";
+      uint32_t compiled_bytecode_methods =
+          GetStat(MethodCompilationStat::kCompiledBytecode);
+      // Successful intrinsic compilation preempts other compilation attempts but failed intrinsic
+      // compilation shall still count towards bytecode or native stub compilation attempts.
+      uint32_t num_compilation_attempts =
+          compiled_intrinsics + compiled_native_stubs + bytecode_attempts;
+      uint32_t num_successful_compilations =
+          compiled_intrinsics + compiled_native_stubs + compiled_bytecode_methods;
+      float compiled_percent = num_successful_compilations * 100.0f / num_compilation_attempts;
+      LOG(INFO) << "Attempted compilation of "
+          << num_compilation_attempts << " methods: " << std::fixed << std::setprecision(2)
+          << compiled_percent << "% (" << num_successful_compilations << ") compiled.";
 
-      oss << unoptimized_percent << "% (" << compile_stats_[kCompiledBaseline] << ") unoptimized, ";
-      oss << optimized_percent << "% (" << compile_stats_[kCompiledOptimized] << ") optimized, ";
-      oss << quick_percent << "% (" << compile_stats_[kCompiledQuick] << ") quick.";
-
-      LOG(INFO) << oss.str();
-
-      for (int i = 0; i < kLastStat; i++) {
+      for (size_t i = 0; i < arraysize(compile_stats_); ++i) {
         if (compile_stats_[i] != 0) {
-          LOG(INFO) << PrintMethodCompilationStat(i) << ": " << compile_stats_[i];
+          LOG(INFO) << "OptStat#" << static_cast<MethodCompilationStat>(i) << ": "
+              << compile_stats_[i];
         }
       }
     }
   }
 
- private:
-  std::string PrintMethodCompilationStat(int stat) const {
-    switch (stat) {
-      case kAttemptCompilation : return "kAttemptCompilation";
-      case kCompiledBaseline : return "kCompiledBaseline";
-      case kCompiledOptimized : return "kCompiledOptimized";
-      case kCompiledQuick : return "kCompiledQuick";
-      case kInlinedInvoke : return "kInlinedInvoke";
-      case kInstructionSimplifications: return "kInstructionSimplifications";
-      case kNotCompiledBranchOutsideMethodCode: return "kNotCompiledBranchOutsideMethodCode";
-      case kNotCompiledCannotBuildSSA : return "kNotCompiledCannotBuildSSA";
-      case kNotCompiledCantAccesType : return "kNotCompiledCantAccesType";
-      case kNotCompiledClassNotVerified : return "kNotCompiledClassNotVerified";
-      case kNotCompiledHugeMethod : return "kNotCompiledHugeMethod";
-      case kNotCompiledLargeMethodNoBranches : return "kNotCompiledLargeMethodNoBranches";
-      case kNotCompiledMalformedOpcode : return "kNotCompiledMalformedOpcode";
-      case kNotCompiledNoCodegen : return "kNotCompiledNoCodegen";
-      case kNotCompiledNonSequentialRegPair : return "kNotCompiledNonSequentialRegPair";
-      case kNotCompiledPathological : return "kNotCompiledPathological";
-      case kNotCompiledSpaceFilter : return "kNotCompiledSpaceFilter";
-      case kNotCompiledUnhandledInstruction : return "kNotCompiledUnhandledInstruction";
-      case kNotCompiledUnresolvedField : return "kNotCompiledUnresolvedField";
-      case kNotCompiledUnresolvedMethod : return "kNotCompiledUnresolvedMethod";
-      case kNotCompiledUnsupportedIsa : return "kNotCompiledUnsupportedIsa";
-      case kNotCompiledVerifyAtRuntime : return "kNotCompiledVerifyAtRuntime";
-      case kNotOptimizedDisabled : return "kNotOptimizedDisabled";
-      case kNotOptimizedRegisterAllocator : return "kNotOptimizedRegisterAllocator";
-      case kNotOptimizedTryCatch : return "kNotOptimizedTryCatch";
-      case kRemovedCheckedCast: return "kRemovedCheckedCast";
-      case kRemovedDeadInstruction: return "kRemovedDeadInstruction";
-      case kRemovedNullCheck: return "kRemovedNullCheck";
-      default: LOG(FATAL) << "invalid stat";
+  void AddTo(OptimizingCompilerStats* other_stats) {
+    for (size_t i = 0; i != arraysize(compile_stats_); ++i) {
+      uint32_t count = compile_stats_[i];
+      if (count != 0) {
+        other_stats->RecordStat(static_cast<MethodCompilationStat>(i), count);
+      }
     }
-    return "";
   }
 
-  AtomicInteger compile_stats_[kLastStat];
+  void Reset() {
+    for (std::atomic<uint32_t>& stat : compile_stats_) {
+      stat = 0u;
+    }
+  }
+
+ private:
+  std::atomic<uint32_t> compile_stats_[static_cast<size_t>(MethodCompilationStat::kLastStat)];
 
   DISALLOW_COPY_AND_ASSIGN(OptimizingCompilerStats);
 };
+
+inline void MaybeRecordStat(OptimizingCompilerStats* compiler_stats,
+                            MethodCompilationStat stat,
+                            uint32_t count = 1) {
+  if (compiler_stats != nullptr) {
+    compiler_stats->RecordStat(stat, count);
+  }
+}
 
 }  // namespace art
 

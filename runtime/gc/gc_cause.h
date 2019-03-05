@@ -17,13 +17,15 @@
 #ifndef ART_RUNTIME_GC_GC_CAUSE_H_
 #define ART_RUNTIME_GC_GC_CAUSE_H_
 
-#include <ostream>
+#include <iosfwd>
 
 namespace art {
 namespace gc {
 
 // What caused the GC?
 enum GcCause {
+  // Invalid GC cause used as a placeholder.
+  kGcCauseNone,
   // GC triggered by a failed allocation. Thread doing allocation is blocked waiting for GC before
   // retrying allocation.
   kGcCauseForAlloc,
@@ -31,7 +33,8 @@ enum GcCause {
   kGcCauseBackground,
   // An explicit System.gc() call.
   kGcCauseExplicit,
-  // GC triggered for a native allocation.
+  // GC triggered for a native allocation when NativeAllocationGcWatermark is exceeded.
+  // (This may be a blocking GC depending on whether we run a non-concurrent collector).
   kGcCauseForNativeAlloc,
   // GC triggered for a collector transition.
   kGcCauseCollectorTransition,
@@ -39,8 +42,26 @@ enum GcCause {
   kGcCauseDisableMovingGc,
   // Not a real GC cause, used when we trim the heap.
   kGcCauseTrim,
+  // Not a real GC cause, used to implement exclusion between GC and instrumentation.
+  kGcCauseInstrumentation,
+  // Not a real GC cause, used to add or remove app image spaces.
+  kGcCauseAddRemoveAppImageSpace,
+  // Not a real GC cause, used to implement exclusion between GC and debugger.
+  kGcCauseDebugger,
   // GC triggered for background transition when both foreground and background collector are CMS.
   kGcCauseHomogeneousSpaceCompact,
+  // Class linker cause, used to guard filling art methods with special values.
+  kGcCauseClassLinker,
+  // Not a real GC cause, used to implement exclusion between code cache metadata and GC.
+  kGcCauseJitCodeCache,
+  // Not a real GC cause, used to add or remove system-weak holders.
+  kGcCauseAddRemoveSystemWeakHolder,
+  // Not a real GC cause, used to prevent hprof running in the middle of GC.
+  kGcCauseHprof,
+  // Not a real GC cause, used to prevent GetObjectsAllocated running in the middle of GC.
+  kGcCauseGetObjectsAllocated,
+  // GC cause for the profile saver.
+  kGcCauseProfileSaver,
 };
 
 const char* PrettyCause(GcCause cause);

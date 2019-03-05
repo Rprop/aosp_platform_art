@@ -14,10 +14,12 @@
  * limitations under the License.
  */
 
+#include "thread.h"
+
 #include <signal.h>
 
-#include "thread.h"
-#include "utils.h"
+#include "base/logging.h"  // For VLOG.
+#include "base/utils.h"
 
 namespace art {
 
@@ -44,7 +46,7 @@ static constexpr int kHostAltSigStackSize =
 
 void Thread::SetUpAlternateSignalStack() {
   // Create and set an alternate signal stack.
-#ifdef HAVE_ANDROID_OS
+#ifdef ART_TARGET_ANDROID
   LOG(FATAL) << "Invalid use of alternate signal stack on Android";
 #endif
   stack_t ss;

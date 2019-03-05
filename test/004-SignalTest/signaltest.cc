@@ -18,13 +18,14 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/ucontext.h>
 #include <unistd.h>
 
 #include "base/macros.h"
 
 static int signal_count;
-static const int kMaxSignal = 2;
+static const int kMaxSignal = 1;
 
 #if defined(__i386__) || defined(__x86_64__)
 #if defined(__APPLE__)
@@ -47,6 +48,17 @@ static const int kMaxSignal = 2;
 #endif
 #endif
 
+#define BLOCKED_SIGNAL SIGUSR1
+#define UNBLOCKED_SIGNAL SIGUSR2
+
+static void blocked_signal(int sig ATTRIBUTE_UNUSED) {
+  printf("blocked signal received\n");
+}
+
+static void unblocked_signal(int sig ATTRIBUTE_UNUSED) {
+  printf("unblocked signal received\n");
+}
+
 static void signalhandler(int sig ATTRIBUTE_UNUSED, siginfo_t* info ATTRIBUTE_UNUSED,
                           void* context) {
   printf("signal caught\n");
@@ -54,6 +66,16 @@ static void signalhandler(int sig ATTRIBUTE_UNUSED, siginfo_t* info ATTRIBUTE_UN
   if (signal_count > kMaxSignal) {
      abort();
   }
+
+  raise(UNBLOCKED_SIGNAL);
+  raise(BLOCKED_SIGNAL);
+  printf("unblocking blocked signal\n");
+
+  sigset_t mask;
+  sigemptyset(&mask);
+  sigaddset(&mask, BLOCKED_SIGNAL);
+  sigprocmask(SIG_UNBLOCK, &mask, nullptr);
+
 #if defined(__arm__)
   struct ucontext *uc = reinterpret_cast<struct ucontext*>(context);
   struct sigcontext *sc = reinterpret_cast<struct sigcontext*>(&uc->uc_mcontext);
@@ -62,26 +84,59 @@ static void signalhandler(int sig ATTRIBUTE_UNUSED, siginfo_t* info ATTRIBUTE_UN
   struct ucontext *uc = reinterpret_cast<struct ucontext*>(context);
   struct sigcontext *sc = reinterpret_cast<struct sigcontext*>(&uc->uc_mcontext);
   sc->pc += 4;          // Skip instruction causing segv.
-#elif defined(__i386__) || defined(__x86_64__)
+#elif defined(__i386__)
   struct ucontext *uc = reinterpret_cast<struct ucontext*>(context);
   uc->CTX_EIP += 3;
+#elif defined(__x86_64__)
+  struct ucontext *uc = reinterpret_cast<struct ucontext*>(context);
+  uc->CTX_EIP += 2;
 #else
   UNUSED(context);
 #endif
+
+  printf("signal handler done\n");
 }
 
 static struct sigaction oldaction;
 
+bool compare_sigaction(const struct sigaction* lhs, const struct sigaction* rhs) {
+  // bionic's definition of `struct sigaction` has internal padding bytes, so we can't just do a
+  // naive memcmp of the entire struct.
+#if defined(SA_RESTORER)
+  if (lhs->sa_restorer != rhs->sa_restorer) {
+    return false;
+  }
+#endif
+  return memcmp(&lhs->sa_mask, &rhs->sa_mask, sizeof(lhs->sa_mask)) == 0 &&
+         lhs->sa_sigaction == rhs->sa_sigaction &&
+         lhs->sa_flags == rhs->sa_flags;
+}
+
 extern "C" JNIEXPORT void JNICALL Java_Main_initSignalTest(JNIEnv*, jclass) {
   struct sigaction action;
   action.sa_sigaction = signalhandler;
-  sigemptyset(&action.sa_mask);
+  sigfillset(&action.sa_mask);
+  sigdelset(&action.sa_mask, UNBLOCKED_SIGNAL);
   action.sa_flags = SA_SIGINFO | SA_ONSTACK;
 #if !defined(__APPLE__) && !defined(__mips__)
   action.sa_restorer = nullptr;
 #endif
 
   sigaction(SIGSEGV, &action, &oldaction);
+  struct sigaction check;
+  sigaction(SIGSEGV, nullptr, &check);
+  if (!compare_sigaction(&check, &action)) {
+    printf("sigaction returned different value\n");
+    printf("action.sa_mask = %p, check.sa_mask = %p\n",
+           *reinterpret_cast<void**>(&action.sa_mask),
+           *reinterpret_cast<void**>(&check.sa_mask));
+    printf("action.sa_sigaction = %p, check.sa_sigaction = %p\n",
+           action.sa_sigaction, check.sa_sigaction);
+    printf("action.sa_flags = %x, check.sa_flags = %x\n",
+           action.sa_flags, check.sa_flags);
+  }
+  signal(BLOCKED_SIGNAL, blocked_signal);
+  signal(UNBLOCKED_SIGNAL, unblocked_signal);
 }
 
 extern "C" JNIEXPORT void JNICALL Java_Main_terminateSignalTest(JNIEnv*, jclass) {
@@ -93,13 +148,22 @@ extern "C" JNIEXPORT void JNICALL Java_Main_terminateSignalTest(JNIEnv*, jclass)
 char *go_away_compiler = nullptr;
 
 extern "C" JNIEXPORT jint JNICALL Java_Main_testSignal(JNIEnv*, jclass) {
-#if defined(__arm__) || defined(__i386__) || defined(__x86_64__) || defined(__aarch64__)
+  // Unblock UNBLOCKED_SIGNAL.
+  sigset_t mask;
+  memset(&mask, 0, sizeof(mask));
+  sigaddset(&mask, UNBLOCKED_SIGNAL);
+  sigprocmask(SIG_UNBLOCK, &mask, nullptr);
+
+#if defined(__arm__) || defined(__i386__) || defined(__aarch64__)
   // On supported architectures we cause a real SEGV.
   *go_away_compiler = 'a';
+#elif defined(__x86_64__)
+  // Cause a SEGV using an instruction known to be 2 bytes long to account for hardcoded jump
+  // in the signal handler
+  asm volatile("movl $0, %%eax;" "movb %%ah, (%%rax);" : : : "%eax");
 #else
   // On other architectures we simulate SEGV.
   kill(getpid(), SIGSEGV);
 #endif
   return 1234;
 }
-

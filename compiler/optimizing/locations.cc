@@ -16,33 +16,44 @@
 
 #include "locations.h"
 
+#include <type_traits>
+
+#include "code_generator.h"
 #include "nodes.h"
 
 namespace art {
 
+// Verify that Location is trivially copyable.
+static_assert(std::is_trivially_copyable<Location>::value, "Location should be trivially copyable");
+
 LocationSummary::LocationSummary(HInstruction* instruction,
                                  CallKind call_kind,
-                                 bool intrinsified)
-    : inputs_(instruction->GetBlock()->GetGraph()->GetArena(), instruction->InputCount()),
-      temps_(instruction->GetBlock()->GetGraph()->GetArena(), 0),
-      output_overlaps_(Location::kOutputOverlap),
+                                 bool intrinsified,
+                                 ArenaAllocator* allocator)
+    : inputs_(instruction->InputCount(), allocator->Adapter(kArenaAllocLocationSummary)),
+      temps_(allocator->Adapter(kArenaAllocLocationSummary)),
       call_kind_(call_kind),
+      intrinsified_(intrinsified),
+      has_custom_slow_path_calling_convention_(false),
+      output_overlaps_(Location::kOutputOverlap),
       stack_mask_(nullptr),
       register_mask_(0),
-      live_registers_(),
-      intrinsified_(intrinsified) {
-  inputs_.SetSize(instruction->InputCount());
-  for (size_t i = 0; i < instruction->InputCount(); ++i) {
-    inputs_.Put(i, Location());
-  }
+      live_registers_(RegisterSet::Empty()),
+      custom_slow_path_caller_saves_(RegisterSet::Empty()) {
   instruction->SetLocations(this);
 
   if (NeedsSafepoint()) {
-    ArenaAllocator* arena = instruction->GetBlock()->GetGraph()->GetArena();
-    stack_mask_ = new (arena) ArenaBitVector(arena, 0, true);
+    stack_mask_ = ArenaBitVector::Create(allocator, 0, true, kArenaAllocLocationSummary);
   }
 }
 
+LocationSummary::LocationSummary(HInstruction* instruction,
+                                 CallKind call_kind,
+                                 bool intrinsified)
+    : LocationSummary(instruction,
+                      call_kind,
+                      intrinsified,
+                      instruction->GetBlock()->GetGraph()->GetAllocator()) {}
 
 Location Location::RegisterOrConstant(HInstruction* instruction) {
   return instruction->IsConstant()
@@ -50,23 +61,38 @@ Location Location::RegisterOrConstant(HInstruction* instruction) {
       : Location::RequiresRegister();
 }
 
-Location Location::RegisterOrInt32LongConstant(HInstruction* instruction) {
-  if (!instruction->IsConstant() || !instruction->AsConstant()->IsLongConstant()) {
-    return Location::RequiresRegister();
+Location Location::RegisterOrInt32Constant(HInstruction* instruction) {
+  HConstant* constant = instruction->AsConstant();
+  if (constant != nullptr) {
+    int64_t value = CodeGenerator::GetInt64ValueOf(constant);
+    if (IsInt<32>(value)) {
+      return Location::ConstantLocation(constant);
+    }
   }
+  return Location::RequiresRegister();
+}
 
-  // Does the long constant fit in a 32 bit int?
-  int64_t value = instruction->AsConstant()->AsLongConstant()->GetValue();
-
-  return IsInt<32>(value)
-      ? Location::ConstantLocation(instruction->AsConstant())
-      : Location::RequiresRegister();
+Location Location::FpuRegisterOrInt32Constant(HInstruction* instruction) {
+  HConstant* constant = instruction->AsConstant();
+  if (constant != nullptr) {
+    int64_t value = CodeGenerator::GetInt64ValueOf(constant);
+    if (IsInt<32>(value)) {
+      return Location::ConstantLocation(constant);
+    }
+  }
+  return Location::RequiresFpuRegister();
 }
 
 Location Location::ByteRegisterOrConstant(int reg, HInstruction* instruction) {
   return instruction->IsConstant()
       ? Location::ConstantLocation(instruction->AsConstant())
       : Location::RegisterLocation(reg);
+}
+
+Location Location::FpuRegisterOrConstant(HInstruction* instruction) {
+  return instruction->IsConstant()
+      ? Location::ConstantLocation(instruction->AsConstant())
+      : Location::RequiresFpuRegister();
 }
 
 std::ostream& operator<<(std::ostream& os, const Location& location) {

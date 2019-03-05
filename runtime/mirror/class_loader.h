@@ -17,13 +17,20 @@
 #ifndef ART_RUNTIME_MIRROR_CLASS_LOADER_H_
 #define ART_RUNTIME_MIRROR_CLASS_LOADER_H_
 
+#include "base/mutex.h"
+#include "obj_ptr.h"
 #include "object.h"
+#include "object_reference.h"
 
 namespace art {
 
 struct ClassLoaderOffsets;
+class ClassTable;
+class LinearAlloc;
 
 namespace mirror {
+
+class Class;
 
 // C++ mirror of java.lang.ClassLoader
 class MANAGED ClassLoader : public Object {
@@ -32,17 +39,53 @@ class MANAGED ClassLoader : public Object {
   static constexpr uint32_t InstanceSize() {
     return sizeof(ClassLoader);
   }
-  ClassLoader* GetParent() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+
+  ClassLoader* GetParent() REQUIRES_SHARED(Locks::mutator_lock_) {
     return GetFieldObject<ClassLoader>(OFFSET_OF_OBJECT_MEMBER(ClassLoader, parent_));
   }
 
+  ClassTable* GetClassTable() REQUIRES_SHARED(Locks::mutator_lock_) {
+    return reinterpret_cast<ClassTable*>(
+        GetField64(OFFSET_OF_OBJECT_MEMBER(ClassLoader, class_table_)));
+  }
+
+  void SetClassTable(ClassTable* class_table) REQUIRES_SHARED(Locks::mutator_lock_) {
+    SetField64<false>(OFFSET_OF_OBJECT_MEMBER(ClassLoader, class_table_),
+                      reinterpret_cast<uint64_t>(class_table));
+  }
+
+  LinearAlloc* GetAllocator() REQUIRES_SHARED(Locks::mutator_lock_) {
+    return reinterpret_cast<LinearAlloc*>(
+        GetField64(OFFSET_OF_OBJECT_MEMBER(ClassLoader, allocator_)));
+  }
+
+  void SetAllocator(LinearAlloc* allocator) REQUIRES_SHARED(Locks::mutator_lock_) {
+    SetField64<false>(OFFSET_OF_OBJECT_MEMBER(ClassLoader, allocator_),
+                      reinterpret_cast<uint64_t>(allocator));
+  }
+
  private:
+  // Visit instance fields of the class loader as well as its associated classes.
+  // Null class loader is handled by ClassLinker::VisitClassRoots.
+  template <bool kVisitClasses,
+            VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags,
+            ReadBarrierOption kReadBarrierOption = kWithReadBarrier,
+            typename Visitor>
+  void VisitReferences(ObjPtr<Class> klass, const Visitor& visitor)
+      REQUIRES_SHARED(Locks::mutator_lock_)
+      REQUIRES(!Locks::classlinker_classes_lock_);
+
   // Field order required by test "ValidateFieldOrderOfJavaCppUnionClasses".
   HeapReference<Object> packages_;
   HeapReference<ClassLoader> parent_;
   HeapReference<Object> proxyCache_;
+  // Native pointer to class table, need to zero this out when image writing.
+  uint32_t padding_ ATTRIBUTE_UNUSED;
+  uint64_t allocator_;
+  uint64_t class_table_;
 
   friend struct art::ClassLoaderOffsets;  // for verifying offset information
+  friend class Object;  // For VisitReferences
   DISALLOW_IMPLICIT_CONSTRUCTORS(ClassLoader);
 };
 

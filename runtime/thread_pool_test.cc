@@ -18,8 +18,9 @@
 
 #include <string>
 
-#include "atomic.h"
+#include "base/atomic.h"
 #include "common_runtime_test.h"
+#include "scoped_thread_state_change-inl.h"
 #include "thread-inl.h"
 
 namespace art {
@@ -70,7 +71,7 @@ TEST_F(ThreadPoolTest, CheckRun) {
   // Wait for tasks to complete.
   thread_pool.Wait(self, true, false);
   // Make sure that we finished all the work.
-  EXPECT_EQ(num_tasks, count.LoadSequentiallyConsistent());
+  EXPECT_EQ(num_tasks, count.load(std::memory_order_seq_cst));
 }
 
 TEST_F(ThreadPoolTest, StopStart) {
@@ -83,7 +84,7 @@ TEST_F(ThreadPoolTest, StopStart) {
   }
   usleep(200);
   // Check that no threads started prematurely.
-  EXPECT_EQ(0, count.LoadSequentiallyConsistent());
+  EXPECT_EQ(0, count.load(std::memory_order_seq_cst));
   // Signal the threads to start processing tasks.
   thread_pool.StartWorkers(self);
   usleep(200);
@@ -92,10 +93,33 @@ TEST_F(ThreadPoolTest, StopStart) {
   thread_pool.AddTask(self, new CountTask(&bad_count));
   usleep(200);
   // Ensure that the task added after the workers were stopped doesn't get run.
-  EXPECT_EQ(0, bad_count.LoadSequentiallyConsistent());
+  EXPECT_EQ(0, bad_count.load(std::memory_order_seq_cst));
   // Allow tasks to finish up and delete themselves.
   thread_pool.StartWorkers(self);
   thread_pool.Wait(self, false, false);
+}
+
+TEST_F(ThreadPoolTest, StopWait) {
+  Thread* self = Thread::Current();
+  ThreadPool thread_pool("Thread pool test thread pool", num_threads);
+
+  AtomicInteger count(0);
+  static const int32_t num_tasks = num_threads * 100;
+  for (int32_t i = 0; i < num_tasks; ++i) {
+    thread_pool.AddTask(self, new CountTask(&count));
+  }
+
+  // Signal the threads to start processing tasks.
+  thread_pool.StartWorkers(self);
+  usleep(200);
+  thread_pool.StopWorkers(self);
+
+  thread_pool.Wait(self, false, false);  // We should not deadlock here.
+
+  // Drain the task list. Note: we have to restart here, as no tasks will be finished when
+  // the pool is stopped.
+  thread_pool.StartWorkers(self);
+  thread_pool.Wait(self, /* do_work */ true, false);
 }
 
 class TreeTask : public Task {
@@ -133,7 +157,58 @@ TEST_F(ThreadPoolTest, RecursiveTest) {
   thread_pool.AddTask(self, new TreeTask(&thread_pool, &count, depth));
   thread_pool.StartWorkers(self);
   thread_pool.Wait(self, true, false);
-  EXPECT_EQ((1 << depth) - 1, count.LoadSequentiallyConsistent());
+  EXPECT_EQ((1 << depth) - 1, count.load(std::memory_order_seq_cst));
+}
+
+class PeerTask : public Task {
+ public:
+  PeerTask() {}
+
+  void Run(Thread* self) {
+    ScopedObjectAccess soa(self);
+    CHECK(self->GetPeer() != nullptr);
+  }
+
+  void Finalize() {
+    delete this;
+  }
+};
+
+class NoPeerTask : public Task {
+ public:
+  NoPeerTask() {}
+
+  void Run(Thread* self) {
+    ScopedObjectAccess soa(self);
+    CHECK(self->GetPeer() == nullptr);
+  }
+
+  void Finalize() {
+    delete this;
+  }
+};
+
+// Tests for create_peer functionality.
+TEST_F(ThreadPoolTest, PeerTest) {
+  Thread* self = Thread::Current();
+  {
+    ThreadPool thread_pool("Thread pool test thread pool", 1);
+    thread_pool.AddTask(self, new NoPeerTask());
+    thread_pool.StartWorkers(self);
+    thread_pool.Wait(self, false, false);
+  }
+
+  {
+    // To create peers, the runtime needs to be started.
+    self->TransitionFromSuspendedToRunnable();
+    bool started = runtime_->Start();
+    ASSERT_TRUE(started);
+
+    ThreadPool thread_pool("Thread pool test thread pool", 1, true);
+    thread_pool.AddTask(self, new PeerTask());
+    thread_pool.StartWorkers(self);
+    thread_pool.Wait(self, false, false);
+  }
 }
 
 }  // namespace art

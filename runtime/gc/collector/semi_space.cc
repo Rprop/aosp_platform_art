@@ -22,7 +22,7 @@
 #include <sstream>
 #include <vector>
 
-#include "base/logging.h"
+#include "base/logging.h"  // For VLOG.
 #include "base/macros.h"
 #include "base/mutex-inl.h"
 #include "base/timing_logger.h"
@@ -32,21 +32,23 @@
 #include "gc/accounting/space_bitmap-inl.h"
 #include "gc/heap.h"
 #include "gc/reference_processor.h"
-#include "gc/space/bump_pointer_space.h"
 #include "gc/space/bump_pointer_space-inl.h"
+#include "gc/space/bump_pointer_space.h"
 #include "gc/space/image_space.h"
 #include "gc/space/large_object_space.h"
 #include "gc/space/space-inl.h"
 #include "indirect_reference_table.h"
 #include "intern_table.h"
-#include "jni_internal.h"
+#include "jni/jni_internal.h"
 #include "mark_sweep-inl.h"
-#include "monitor.h"
-#include "mirror/reference-inl.h"
 #include "mirror/object-inl.h"
+#include "mirror/object-refvisitor-inl.h"
+#include "mirror/reference-inl.h"
+#include "monitor.h"
 #include "runtime.h"
 #include "thread-inl.h"
 #include "thread_list.h"
+#include "write_barrier-inl.h"
 
 using ::art::mirror::Object;
 
@@ -66,8 +68,9 @@ void SemiSpace::BindBitmaps() {
   for (const auto& space : GetHeap()->GetContinuousSpaces()) {
     if (space->GetGcRetentionPolicy() == space::kGcRetentionPolicyNeverCollect ||
         space->GetGcRetentionPolicy() == space::kGcRetentionPolicyFullCollect) {
-      CHECK(immune_region_.AddContinuousSpace(space)) << "Failed to add space " << *space;
+      immune_spaces_.AddSpace(space);
     } else if (space->GetLiveBitmap() != nullptr) {
+      // TODO: We can probably also add this space to the immune region.
       if (space == to_space_ || collect_from_space_only_) {
         if (collect_from_space_only_) {
           // Bind the bitmaps of the main free list space and the non-moving space we are doing a
@@ -88,15 +91,25 @@ void SemiSpace::BindBitmaps() {
 
 SemiSpace::SemiSpace(Heap* heap, bool generational, const std::string& name_prefix)
     : GarbageCollector(heap,
-                       name_prefix + (name_prefix.empty() ? "" : " ") + "marksweep + semispace"),
+                       name_prefix + (name_prefix.empty() ? "" : " ") + "semispace"),
+      mark_stack_(nullptr),
+      is_large_object_space_immune_(false),
       to_space_(nullptr),
+      to_space_live_bitmap_(nullptr),
       from_space_(nullptr),
+      mark_bitmap_(nullptr),
+      self_(nullptr),
       generational_(generational),
       last_gc_to_space_end_(nullptr),
       bytes_promoted_(0),
       bytes_promoted_since_last_whole_heap_collection_(0),
       large_object_bytes_allocated_at_last_whole_heap_collection_(0),
       collect_from_space_only_(generational),
+      promo_dest_space_(nullptr),
+      fallback_space_(nullptr),
+      bytes_moved_(0U),
+      objects_moved_(0U),
+      saved_bytes_(0U),
       collector_name_(name_),
       swap_semi_spaces_(true) {
 }
@@ -134,7 +147,7 @@ void SemiSpace::InitializePhase() {
   TimingLogger::ScopedTiming t(__FUNCTION__, GetTimings());
   mark_stack_ = heap_->GetMarkStack();
   DCHECK(mark_stack_ != nullptr);
-  immune_region_.Reset();
+  immune_spaces_.Reset();
   is_large_object_space_immune_ = false;
   saved_bytes_ = 0;
   bytes_moved_ = 0;
@@ -157,8 +170,7 @@ void SemiSpace::InitializePhase() {
 void SemiSpace::ProcessReferences(Thread* self) {
   WriterMutexLock mu(self, *Locks::heap_bitmap_lock_);
   GetHeap()->GetReferenceProcessor()->ProcessReferences(
-      false, GetTimings(), GetCurrentIteration()->GetClearSoftReferences(),
-      &HeapReferenceMarkedCallback, &MarkObjectCallback, &ProcessMarkStackCallback, this);
+      false, GetTimings(), GetCurrentIteration()->GetClearSoftReferences(), this);
 }
 
 void SemiSpace::MarkingPhase() {
@@ -217,7 +229,7 @@ void SemiSpace::MarkingPhase() {
   BindBitmaps();
   // Process dirty cards and add dirty cards to mod-union tables.
   heap_->ProcessCards(GetTimings(), kUseRememberedSet && generational_, false, true);
-  // Clear the whole card table since we can not Get any additional dirty cards during the
+  // Clear the whole card table since we cannot get any additional dirty cards during the
   // paused GC. This saves memory but only works for pause the world collectors.
   t.NewTiming("ClearCardTable");
   heap_->GetCardTable()->ClearCardTable();
@@ -227,7 +239,7 @@ void SemiSpace::MarkingPhase() {
     TimingLogger::ScopedTiming t2("RevokeAllThreadLocalAllocationStacks", GetTimings());
     heap_->RevokeAllThreadLocalAllocationStacks(self_);
   }
-  heap_->SwapStacks(self_);
+  heap_->SwapStacks();
   {
     WriterMutexLock mu(self_, *Locks::heap_bitmap_lock_);
     MarkRoots();
@@ -239,6 +251,7 @@ void SemiSpace::MarkingPhase() {
     ReaderMutexLock mu(self_, *Locks::heap_bitmap_lock_);
     SweepSystemWeaks();
   }
+  Runtime::Current()->GetClassLinker()->CleanupClassLoaders();
   // Revoke buffers before measuring how many objects were moved since the TLABs need to be revoked
   // before they are properly counted.
   RevokeAllThreadLocalBuffers();
@@ -254,16 +267,20 @@ void SemiSpace::MarkingPhase() {
   RecordFree(ObjectBytePair(from_objects - to_objects, from_bytes - to_bytes));
   // Clear and protect the from space.
   from_space_->Clear();
-  if (kProtectFromSpace && !from_space_->IsRosAllocSpace()) {
-    // Protect with PROT_NONE.
-    VLOG(heap) << "Protecting from_space_ : " << *from_space_;
-    from_space_->GetMemMap()->Protect(PROT_NONE);
-  } else {
-    // If RosAllocSpace, we'll leave it as PROT_READ here so the
-    // rosaloc verification can read the metadata magic number and
-    // protect it with PROT_NONE later in FinishPhase().
-    VLOG(heap) << "Protecting from_space_ with PROT_READ : " << *from_space_;
-    from_space_->GetMemMap()->Protect(PROT_READ);
+  // b/31172841. Temporarily disable the from-space protection with host debug build
+  // due to some protection issue in the build server.
+  if (kProtectFromSpace && !(kIsDebugBuild && !kIsTargetBuild)) {
+    if (!from_space_->IsRosAllocSpace()) {
+      // Protect with PROT_NONE.
+      VLOG(heap) << "Protecting from_space_ : " << *from_space_;
+      from_space_->GetMemMap()->Protect(PROT_NONE);
+    } else {
+      // If RosAllocSpace, we'll leave it as PROT_READ here so the
+      // rosaloc verification can read the metadata magic number and
+      // protect it with PROT_NONE later in FinishPhase().
+      VLOG(heap) << "Protecting from_space_ with PROT_READ : " << *from_space_;
+      from_space_->GetMemMap()->Protect(PROT_READ);
+    }
   }
   heap_->PreSweepingGcVerification(this);
   if (swap_semi_spaces_) {
@@ -271,53 +288,46 @@ void SemiSpace::MarkingPhase() {
   }
 }
 
-class SemiSpaceScanObjectVisitor {
- public:
-  explicit SemiSpaceScanObjectVisitor(SemiSpace* ss) : semi_space_(ss) {}
-  void operator()(Object* obj) const EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_,
-                                                              Locks::heap_bitmap_lock_) {
-    DCHECK(obj != nullptr);
-    semi_space_->ScanObject(obj);
-  }
- private:
-  SemiSpace* const semi_space_;
-};
-
 // Used to verify that there's no references to the from-space.
-class SemiSpaceVerifyNoFromSpaceReferencesVisitor {
+class SemiSpace::VerifyNoFromSpaceReferencesVisitor {
  public:
-  explicit SemiSpaceVerifyNoFromSpaceReferencesVisitor(space::ContinuousMemMapAllocSpace* from_space) :
-      from_space_(from_space) {}
+  explicit VerifyNoFromSpaceReferencesVisitor(space::ContinuousMemMapAllocSpace* from_space)
+      : from_space_(from_space) {}
 
   void operator()(Object* obj, MemberOffset offset, bool /* is_static */) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) ALWAYS_INLINE {
+      REQUIRES_SHARED(Locks::mutator_lock_) ALWAYS_INLINE {
     mirror::Object* ref = obj->GetFieldObject<mirror::Object>(offset);
     if (from_space_->HasAddress(ref)) {
-      Runtime::Current()->GetHeap()->DumpObject(LOG(INFO), obj);
       LOG(FATAL) << ref << " found in from space";
     }
   }
+
+  // TODO: Remove NO_THREAD_SAFETY_ANALYSIS when clang better understands visitors.
+  void VisitRootIfNonNull(mirror::CompressedReference<mirror::Object>* root) const
+      NO_THREAD_SAFETY_ANALYSIS {
+    if (!root->IsNull()) {
+      VisitRoot(root);
+    }
+  }
+
+  void VisitRoot(mirror::CompressedReference<mirror::Object>* root) const
+      NO_THREAD_SAFETY_ANALYSIS {
+    if (kIsDebugBuild) {
+      Locks::mutator_lock_->AssertExclusiveHeld(Thread::Current());
+      Locks::heap_bitmap_lock_->AssertExclusiveHeld(Thread::Current());
+    }
+    CHECK(!from_space_->HasAddress(root->AsMirrorPtr()));
+  }
+
  private:
-  space::ContinuousMemMapAllocSpace* from_space_;
+  space::ContinuousMemMapAllocSpace* const from_space_;
 };
 
 void SemiSpace::VerifyNoFromSpaceReferences(Object* obj) {
   DCHECK(!from_space_->HasAddress(obj)) << "Scanning object " << obj << " in from space";
-  SemiSpaceVerifyNoFromSpaceReferencesVisitor visitor(from_space_);
-  obj->VisitReferences<kMovingClasses>(visitor, VoidFunctor());
+  VerifyNoFromSpaceReferencesVisitor visitor(from_space_);
+  obj->VisitReferences(visitor, VoidFunctor());
 }
-
-class SemiSpaceVerifyNoFromSpaceReferencesObjectVisitor {
- public:
-  explicit SemiSpaceVerifyNoFromSpaceReferencesObjectVisitor(SemiSpace* ss) : semi_space_(ss) {}
-  void operator()(Object* obj) const
-      SHARED_LOCKS_REQUIRED(Locks::heap_bitmap_lock_, Locks::mutator_lock_) {
-    DCHECK(obj != nullptr);
-    semi_space_->VerifyNoFromSpaceReferences(obj);
-  }
- private:
-  SemiSpace* const semi_space_;
-};
 
 void SemiSpace::MarkReachableObjects() {
   TimingLogger::ScopedTiming t(__FUNCTION__, GetTimings());
@@ -336,41 +346,51 @@ void SemiSpace::MarkReachableObjects() {
           space->IsZygoteSpace() ? "UpdateAndMarkZygoteModUnionTable" :
                                    "UpdateAndMarkImageModUnionTable",
                                    GetTimings());
-      table->UpdateAndMarkReferences(MarkHeapReferenceCallback, this);
+      table->UpdateAndMarkReferences(this);
       DCHECK(GetHeap()->FindRememberedSetFromSpace(space) == nullptr);
-    } else if (collect_from_space_only_ && space->GetLiveBitmap() != nullptr) {
-      // If the space has no mod union table (the non-moving space and main spaces when the bump
-      // pointer space only collection is enabled,) then we need to scan its live bitmap or dirty
-      // cards as roots (including the objects on the live stack which have just marked in the live
-      // bitmap above in MarkAllocStackAsLive().)
-      DCHECK(space == heap_->GetNonMovingSpace() || space == heap_->GetPrimaryFreeListSpace())
-          << "Space " << space->GetName() << " "
-          << "generational_=" << generational_ << " "
-          << "collect_from_space_only_=" << collect_from_space_only_;
+    } else if ((space->IsImageSpace() || collect_from_space_only_) &&
+               space->GetLiveBitmap() != nullptr) {
+      // If the space has no mod union table (the non-moving space, app image spaces, main spaces
+      // when the bump pointer space only collection is enabled,) then we need to scan its live
+      // bitmap or dirty cards as roots (including the objects on the live stack which have just
+      // marked in the live bitmap above in MarkAllocStackAsLive().)
       accounting::RememberedSet* rem_set = GetHeap()->FindRememberedSetFromSpace(space);
-      CHECK_EQ(rem_set != nullptr, kUseRememberedSet);
+      if (!space->IsImageSpace()) {
+        DCHECK(space == heap_->GetNonMovingSpace() || space == heap_->GetPrimaryFreeListSpace())
+            << "Space " << space->GetName() << " "
+            << "generational_=" << generational_ << " "
+            << "collect_from_space_only_=" << collect_from_space_only_;
+        // App images currently do not have remembered sets.
+        DCHECK_EQ(kUseRememberedSet, rem_set != nullptr);
+      } else {
+        DCHECK(rem_set == nullptr);
+      }
       if (rem_set != nullptr) {
         TimingLogger::ScopedTiming t2("UpdateAndMarkRememberedSet", GetTimings());
-        rem_set->UpdateAndMarkReferences(MarkHeapReferenceCallback, DelayReferenceReferentCallback,
-                                         from_space_, this);
-        if (kIsDebugBuild) {
-          // Verify that there are no from-space references that
-          // remain in the space, that is, the remembered set (and the
-          // card table) didn't miss any from-space references in the
-          // space.
-          accounting::ContinuousSpaceBitmap* live_bitmap = space->GetLiveBitmap();
-          SemiSpaceVerifyNoFromSpaceReferencesObjectVisitor visitor(this);
-          live_bitmap->VisitMarkedRange(reinterpret_cast<uintptr_t>(space->Begin()),
-                                        reinterpret_cast<uintptr_t>(space->End()),
-                                        visitor);
-        }
+        rem_set->UpdateAndMarkReferences(from_space_, this);
       } else {
         TimingLogger::ScopedTiming t2("VisitLiveBits", GetTimings());
         accounting::ContinuousSpaceBitmap* live_bitmap = space->GetLiveBitmap();
-        SemiSpaceScanObjectVisitor visitor(this);
         live_bitmap->VisitMarkedRange(reinterpret_cast<uintptr_t>(space->Begin()),
                                       reinterpret_cast<uintptr_t>(space->End()),
-                                      visitor);
+                                      [this](mirror::Object* obj)
+           REQUIRES(Locks::mutator_lock_, Locks::heap_bitmap_lock_) {
+          ScanObject(obj);
+        });
+      }
+      if (kIsDebugBuild) {
+        // Verify that there are no from-space references that
+        // remain in the space, that is, the remembered set (and the
+        // card table) didn't miss any from-space references in the
+        // space.
+        accounting::ContinuousSpaceBitmap* live_bitmap = space->GetLiveBitmap();
+        live_bitmap->VisitMarkedRange(reinterpret_cast<uintptr_t>(space->Begin()),
+                                      reinterpret_cast<uintptr_t>(space->End()),
+                                      [this](Object* obj)
+            REQUIRES_SHARED(Locks::heap_bitmap_lock_, Locks::mutator_lock_) {
+          DCHECK(obj != nullptr);
+          VerifyNoFromSpaceReferences(obj);
+        });
       }
     }
   }
@@ -390,10 +410,13 @@ void SemiSpace::MarkReachableObjects() {
     // classes (primitive array classes) that could move though they
     // don't contain any other references.
     accounting::LargeObjectBitmap* large_live_bitmap = los->GetLiveBitmap();
-    SemiSpaceScanObjectVisitor visitor(this);
-    large_live_bitmap->VisitMarkedRange(reinterpret_cast<uintptr_t>(los->Begin()),
-                                        reinterpret_cast<uintptr_t>(los->End()),
-                                        visitor);
+    std::pair<uint8_t*, uint8_t*> range = los->GetBeginEndAtomic();
+    large_live_bitmap->VisitMarkedRange(reinterpret_cast<uintptr_t>(range.first),
+                                        reinterpret_cast<uintptr_t>(range.second),
+                                        [this](mirror::Object* obj)
+        REQUIRES(Locks::mutator_lock_, Locks::heap_bitmap_lock_) {
+      ScanObject(obj);
+    });
   }
   // Recursively process the mark stack.
   ProcessMarkStack();
@@ -509,7 +532,7 @@ mirror::Object* SemiSpace::MarkNonForwardedObject(mirror::Object* obj) {
       // Dirty the card at the destionation as it may contain
       // references (including the class pointer) to the bump pointer
       // space.
-      GetHeap()->WriteBarrierEveryFieldOf(forward_address);
+      WriteBarrier::ForEveryFieldWrite(forward_address);
       // Handle the bitmaps marking.
       accounting::ContinuousSpaceBitmap* live_bitmap = promo_dest_space_->GetLiveBitmap();
       DCHECK(live_bitmap != nullptr);
@@ -568,13 +591,9 @@ mirror::Object* SemiSpace::MarkNonForwardedObject(mirror::Object* obj) {
   // references.
   saved_bytes_ +=
       CopyAvoidingDirtyingPages(reinterpret_cast<void*>(forward_address), obj, object_size);
-  if (kUseBakerOrBrooksReadBarrier) {
-    obj->AssertReadBarrierPointer();
-    if (kUseBrooksReadBarrier) {
-      DCHECK_EQ(forward_address->GetReadBarrierPointer(), obj);
-      forward_address->SetReadBarrierPointer(forward_address);
-    }
-    forward_address->AssertReadBarrierPointer();
+  if (kUseBakerReadBarrier) {
+    obj->AssertReadBarrierState();
+    forward_address->AssertReadBarrierState();
   }
   DCHECK(to_space_->HasAddress(forward_address) ||
          fallback_space_->HasAddress(forward_address) ||
@@ -583,24 +602,15 @@ mirror::Object* SemiSpace::MarkNonForwardedObject(mirror::Object* obj) {
   return forward_address;
 }
 
-void SemiSpace::ProcessMarkStackCallback(void* arg) {
-  reinterpret_cast<SemiSpace*>(arg)->ProcessMarkStack();
-}
-
-mirror::Object* SemiSpace::MarkObjectCallback(mirror::Object* root, void* arg) {
+mirror::Object* SemiSpace::MarkObject(mirror::Object* root) {
   auto ref = StackReference<mirror::Object>::FromMirrorPtr(root);
-  reinterpret_cast<SemiSpace*>(arg)->MarkObject(&ref);
+  MarkObjectIfNotInToSpace(&ref);
   return ref.AsMirrorPtr();
 }
 
-void SemiSpace::MarkHeapReferenceCallback(mirror::HeapReference<mirror::Object>* obj_ptr,
-                                          void* arg) {
-  reinterpret_cast<SemiSpace*>(arg)->MarkObject(obj_ptr);
-}
-
-void SemiSpace::DelayReferenceReferentCallback(mirror::Class* klass, mirror::Reference* ref,
-                                               void* arg) {
-  reinterpret_cast<SemiSpace*>(arg)->DelayReferenceReferent(klass, ref);
+void SemiSpace::MarkHeapReference(mirror::HeapReference<mirror::Object>* obj_ptr,
+                                  bool do_atomic_update ATTRIBUTE_UNUSED) {
+  MarkObject(obj_ptr);
 }
 
 void SemiSpace::VisitRoots(mirror::Object*** roots, size_t count,
@@ -608,7 +618,9 @@ void SemiSpace::VisitRoots(mirror::Object*** roots, size_t count,
   for (size_t i = 0; i < count; ++i) {
     auto* root = roots[i];
     auto ref = StackReference<mirror::Object>::FromMirrorPtr(*root);
-    MarkObject(&ref);
+    // The root can be in the to-space since we may visit the declaring class of an ArtMethod
+    // multiple times if it is on the call stack.
+    MarkObjectIfNotInToSpace(&ref);
     if (*root != ref.AsMirrorPtr()) {
       *root = ref.AsMirrorPtr();
     }
@@ -618,7 +630,7 @@ void SemiSpace::VisitRoots(mirror::Object*** roots, size_t count,
 void SemiSpace::VisitRoots(mirror::CompressedReference<mirror::Object>** roots, size_t count,
                            const RootInfo& info ATTRIBUTE_UNUSED) {
   for (size_t i = 0; i < count; ++i) {
-    MarkObject(roots[i]);
+    MarkObjectIfNotInToSpace(roots[i]);
   }
 }
 
@@ -628,29 +640,9 @@ void SemiSpace::MarkRoots() {
   Runtime::Current()->VisitRoots(this);
 }
 
-bool SemiSpace::HeapReferenceMarkedCallback(mirror::HeapReference<mirror::Object>* object,
-                                            void* arg) {
-  mirror::Object* obj = object->AsMirrorPtr();
-  mirror::Object* new_obj =
-      reinterpret_cast<SemiSpace*>(arg)->GetMarkedForwardAddress(obj);
-  if (new_obj == nullptr) {
-    return false;
-  }
-  if (new_obj != obj) {
-    // Write barrier is not necessary since it still points to the same object, just at a different
-    // address.
-    object->Assign(new_obj);
-  }
-  return true;
-}
-
-mirror::Object* SemiSpace::MarkedForwardingAddressCallback(mirror::Object* object, void* arg) {
-  return reinterpret_cast<SemiSpace*>(arg)->GetMarkedForwardAddress(object);
-}
-
 void SemiSpace::SweepSystemWeaks() {
   TimingLogger::ScopedTiming t(__FUNCTION__, GetTimings());
-  Runtime::Current()->SweepSystemWeaks(MarkedForwardingAddressCallback, this);
+  Runtime::Current()->SweepSystemWeaks(this);
 }
 
 bool SemiSpace::ShouldSweepSpace(space::ContinuousSpace* space) const {
@@ -687,26 +679,43 @@ void SemiSpace::SweepLargeObjects(bool swap_bitmaps) {
 
 // Process the "referent" field in a java.lang.ref.Reference.  If the referent has not yet been
 // marked, put it on the appropriate list in the heap for later processing.
-void SemiSpace::DelayReferenceReferent(mirror::Class* klass, mirror::Reference* reference) {
-  heap_->GetReferenceProcessor()->DelayReferenceReferent(klass, reference,
-                                                         &HeapReferenceMarkedCallback, this);
+void SemiSpace::DelayReferenceReferent(ObjPtr<mirror::Class> klass,
+                                       ObjPtr<mirror::Reference> reference) {
+  heap_->GetReferenceProcessor()->DelayReferenceReferent(klass, reference, this);
 }
 
-class SemiSpaceMarkObjectVisitor {
+class SemiSpace::MarkObjectVisitor {
  public:
-  explicit SemiSpaceMarkObjectVisitor(SemiSpace* collector) : collector_(collector) {
-  }
+  explicit MarkObjectVisitor(SemiSpace* collector) : collector_(collector) {}
 
-  void operator()(Object* obj, MemberOffset offset, bool /* is_static */) const ALWAYS_INLINE
-      EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_, Locks::heap_bitmap_lock_) {
+  void operator()(ObjPtr<Object> obj, MemberOffset offset, bool /* is_static */) const ALWAYS_INLINE
+      REQUIRES(Locks::mutator_lock_, Locks::heap_bitmap_lock_) {
     // Object was already verified when we scanned it.
     collector_->MarkObject(obj->GetFieldObjectReferenceAddr<kVerifyNone>(offset));
   }
 
-  void operator()(mirror::Class* klass, mirror::Reference* ref) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
-      EXCLUSIVE_LOCKS_REQUIRED(Locks::heap_bitmap_lock_) {
+  void operator()(ObjPtr<mirror::Class> klass, ObjPtr<mirror::Reference> ref) const
+      REQUIRES(Locks::mutator_lock_, Locks::heap_bitmap_lock_) {
     collector_->DelayReferenceReferent(klass, ref);
+  }
+
+  // TODO: Remove NO_THREAD_SAFETY_ANALYSIS when clang better understands visitors.
+  void VisitRootIfNonNull(mirror::CompressedReference<mirror::Object>* root) const
+      NO_THREAD_SAFETY_ANALYSIS {
+    if (!root->IsNull()) {
+      VisitRoot(root);
+    }
+  }
+
+  void VisitRoot(mirror::CompressedReference<mirror::Object>* root) const
+      NO_THREAD_SAFETY_ANALYSIS {
+    if (kIsDebugBuild) {
+      Locks::mutator_lock_->AssertExclusiveHeld(Thread::Current());
+      Locks::heap_bitmap_lock_->AssertExclusiveHeld(Thread::Current());
+    }
+    // We may visit the same root multiple times, so avoid marking things in the to-space since
+    // this is not handled by the GC.
+    collector_->MarkObjectIfNotInToSpace(root);
   }
 
  private:
@@ -716,8 +725,10 @@ class SemiSpaceMarkObjectVisitor {
 // Visit all of the references of an object and update.
 void SemiSpace::ScanObject(Object* obj) {
   DCHECK(!from_space_->HasAddress(obj)) << "Scanning object " << obj << " in from space";
-  SemiSpaceMarkObjectVisitor visitor(this);
-  obj->VisitReferences<kMovingClasses>(visitor, visitor);
+  MarkObjectVisitor visitor(this);
+  // Turn off read barrier. ZygoteCompactingCollector doesn't use it (even in the CC build.)
+  obj->VisitReferences</*kVisitNativeRoots*/true, kDefaultVerifyFlags, kWithoutReadBarrier>(
+      visitor, visitor);
 }
 
 // Scan anything that's on the mark stack.
@@ -746,17 +757,36 @@ void SemiSpace::ProcessMarkStack() {
   }
 }
 
-inline Object* SemiSpace::GetMarkedForwardAddress(mirror::Object* obj) const
-    SHARED_LOCKS_REQUIRED(Locks::heap_bitmap_lock_) {
+mirror::Object* SemiSpace::IsMarked(mirror::Object* obj) {
   // All immune objects are assumed marked.
   if (from_space_->HasAddress(obj)) {
     // Returns either the forwarding address or null.
     return GetForwardingAddressInFromSpace(obj);
-  } else if (collect_from_space_only_ || immune_region_.ContainsObject(obj) ||
+  } else if (collect_from_space_only_ ||
+             immune_spaces_.IsInImmuneRegion(obj) ||
              to_space_->HasAddress(obj)) {
     return obj;  // Already forwarded, must be marked.
   }
   return mark_bitmap_->Test(obj) ? obj : nullptr;
+}
+
+bool SemiSpace::IsNullOrMarkedHeapReference(mirror::HeapReference<mirror::Object>* object,
+                                            // SemiSpace does the GC in a pause. No CAS needed.
+                                            bool do_atomic_update ATTRIBUTE_UNUSED) {
+  mirror::Object* obj = object->AsMirrorPtr();
+  if (obj == nullptr) {
+    return true;
+  }
+  mirror::Object* new_obj = IsMarked(obj);
+  if (new_obj == nullptr) {
+    return false;
+  }
+  if (new_obj != obj) {
+    // Write barrier is not necessary since it still points to the same object, just at a different
+    // address.
+    object->Assign(new_obj);
+  }
+  return true;
 }
 
 void SemiSpace::SetToSpace(space::ContinuousMemMapAllocSpace* to_space) {
@@ -771,9 +801,13 @@ void SemiSpace::SetFromSpace(space::ContinuousMemMapAllocSpace* from_space) {
 
 void SemiSpace::FinishPhase() {
   TimingLogger::ScopedTiming t(__FUNCTION__, GetTimings());
-  if (kProtectFromSpace && from_space_->IsRosAllocSpace()) {
-    VLOG(heap) << "Protecting from_space_ with PROT_NONE : " << *from_space_;
-    from_space_->GetMemMap()->Protect(PROT_NONE);
+  // b/31172841. Temporarily disable the from-space protection with host debug build
+  // due to some protection issue in the build server.
+  if (kProtectFromSpace && !(kIsDebugBuild && !kIsTargetBuild)) {
+    if (from_space_->IsRosAllocSpace()) {
+      VLOG(heap) << "Protecting from_space_ with PROT_NONE : " << *from_space_;
+      from_space_->GetMemMap()->Protect(PROT_NONE);
+    }
   }
   // Null the "to" and "from" spaces since compacting from one to the other isn't valid until
   // further action is done by the heap.

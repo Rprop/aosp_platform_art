@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-#include <memory>
 #include <setjmp.h>
+
+#include <memory>
 
 #include "base/macros.h"
 #include "common_runtime_test.h"
@@ -37,7 +38,7 @@ namespace art {
 // name.
 #define EXPECT_OFFSET_DIFF(first_type, first_field, second_type, second_field, diff, name) \
   CHECKED(OFFSETOF_MEMBER(second_type, second_field) \
-          - OFFSETOF_MEMBER(first_type, first_field) == diff, name)
+          - OFFSETOF_MEMBER(first_type, first_field) == (diff), name)
 
 // Helper macro for when the fields are from the same type.
 #define EXPECT_OFFSET_DIFFNP(type, first_field, second_field, diff) \
@@ -45,15 +46,16 @@ namespace art {
                      type ## _ ## first_field ## _ ## second_field)
 
 // Helper macro for when the fields are from the same type and in the same member of said type.
+// NOLINT, do not add parentheses around 'prefix'.
 #define EXPECT_OFFSET_DIFFP(type, prefix, first_field, second_field, diff) \
-  EXPECT_OFFSET_DIFF(type, prefix . first_field, type, prefix . second_field, diff, \
+  EXPECT_OFFSET_DIFF(type, prefix . first_field, type, prefix . second_field, diff, /* NOLINT */ \
                      type ## _ ## prefix ## _ ## first_field ## _ ## second_field)
 
 // Macro to check whether two fields have at least an expected difference in offsets.  The error is
 // named name.
 #define EXPECT_OFFSET_DIFF_GT(first_type, first_field, second_type, second_field, diff, name) \
   CHECKED(OFFSETOF_MEMBER(second_type, second_field) \
-          - OFFSETOF_MEMBER(first_type, first_field) >= diff, name)
+          - OFFSETOF_MEMBER(first_type, first_field) >= (diff), name)
 
 // Helper macro for when the fields are from the same type.
 #define EXPECT_OFFSET_DIFF_GT3(type, first_field, second_field, diff, name) \
@@ -72,15 +74,12 @@ class EntrypointsOrderTest : public CommonRuntimeTest {
     EXPECT_OFFSET_DIFFP(Thread, tls32_, throwing_OutOfMemoryError, no_thread_suspension, 4);
     EXPECT_OFFSET_DIFFP(Thread, tls32_, no_thread_suspension, thread_exit_check_count, 4);
     EXPECT_OFFSET_DIFFP(Thread, tls32_, thread_exit_check_count, handling_signal_, 4);
-    EXPECT_OFFSET_DIFFP(Thread, tls32_, handling_signal_,
-                        deoptimization_return_value_is_reference, 4);
 
     // TODO: Better connection. Take alignment into account.
     EXPECT_OFFSET_DIFF_GT3(Thread, tls32_.thread_exit_check_count, tls64_.trace_clock_base, 4,
                            thread_tls32_to_tls64);
 
-    EXPECT_OFFSET_DIFFP(Thread, tls64_, trace_clock_base, deoptimization_return_value, 8);
-    EXPECT_OFFSET_DIFFP(Thread, tls64_, deoptimization_return_value, stats, 8);
+    EXPECT_OFFSET_DIFFP(Thread, tls64_, trace_clock_base, stats, 8);
 
     // TODO: Better connection. Take alignment into account.
     EXPECT_OFFSET_DIFF_GT3(Thread, tls64_.stats, tlsPtr_.card_table, 8, thread_tls64_to_tlsptr);
@@ -96,8 +95,8 @@ class EntrypointsOrderTest : public CommonRuntimeTest {
     EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, opeer, jpeer, sizeof(void*));
     EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, jpeer, stack_begin, sizeof(void*));
     EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, stack_begin, stack_size, sizeof(void*));
-    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, stack_size, stack_trace_sample, sizeof(void*));
-    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, stack_trace_sample, wait_next, sizeof(void*));
+    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, stack_size, deps_or_stack_trace_sample, sizeof(void*));
+    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, deps_or_stack_trace_sample, wait_next, sizeof(void*));
     EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, wait_next, monitor_enter_object, sizeof(void*));
     EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, monitor_enter_object, top_handle_scope, sizeof(void*));
     EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, top_handle_scope, class_loader_override, sizeof(void*));
@@ -108,42 +107,41 @@ class EntrypointsOrderTest : public CommonRuntimeTest {
     EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, single_step_control, stacked_shadow_frame_record,
                         sizeof(void*));
     EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, stacked_shadow_frame_record,
-                        deoptimization_return_value_stack, sizeof(void*));
-    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, deoptimization_return_value_stack, name, sizeof(void*));
+                        deoptimization_context_stack, sizeof(void*));
+    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, deoptimization_context_stack,
+                        frame_id_to_shadow_frame, sizeof(void*));
+    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, frame_id_to_shadow_frame, name, sizeof(void*));
     EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, name, pthread_self, sizeof(void*));
     EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, pthread_self, last_no_thread_suspension_cause,
                         sizeof(void*));
-    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, last_no_thread_suspension_cause, checkpoint_functions,
+    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, last_no_thread_suspension_cause, checkpoint_function,
                         sizeof(void*));
-    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, checkpoint_functions, interpreter_entrypoints,
-                        sizeof(void*) * 3);
-
-    // Skip across the entrypoints structures.
-
+    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, checkpoint_function, active_suspend_barriers,
+                        sizeof(void*));
+    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, active_suspend_barriers, thread_local_start,
+                        sizeof(Thread::tls_ptr_sized_values::active_suspend_barriers));
     EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, thread_local_start, thread_local_pos, sizeof(void*));
     EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, thread_local_pos, thread_local_end, sizeof(void*));
-    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, thread_local_end, thread_local_objects, sizeof(void*));
-    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, thread_local_objects, rosalloc_runs, sizeof(void*));
+    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, thread_local_end, thread_local_limit, sizeof(void*));
+    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, thread_local_limit, thread_local_objects, sizeof(void*));
+    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, thread_local_objects, jni_entrypoints, sizeof(size_t));
+
+    // Skip across the entrypoints structures.
+    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, mterp_current_ibase, mterp_default_ibase, sizeof(void*));
+    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, mterp_default_ibase, mterp_alt_ibase, sizeof(void*));
+    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, mterp_alt_ibase, rosalloc_runs, sizeof(void*));
     EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, rosalloc_runs, thread_local_alloc_stack_top,
-                        sizeof(void*) * kNumRosAllocThreadLocalSizeBrackets);
+                        sizeof(void*) * kNumRosAllocThreadLocalSizeBracketsInThread);
     EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, thread_local_alloc_stack_top, thread_local_alloc_stack_end,
                         sizeof(void*));
     EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, thread_local_alloc_stack_end, held_mutexes, sizeof(void*));
-    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, held_mutexes, nested_signal_state,
+    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, held_mutexes, flip_function,
                         sizeof(void*) * kLockLevelCount);
-    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, nested_signal_state, flip_function, sizeof(void*));
     EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, flip_function, method_verifier, sizeof(void*));
-    EXPECT_OFFSET_DIFF(Thread, tlsPtr_.method_verifier, Thread, wait_mutex_, sizeof(void*),
+    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, method_verifier, thread_local_mark_stack, sizeof(void*));
+    EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, thread_local_mark_stack, async_exception, sizeof(void*));
+    EXPECT_OFFSET_DIFF(Thread, tlsPtr_.async_exception, Thread, wait_mutex_, sizeof(void*),
                        thread_tlsptr_end);
-  }
-
-  void CheckInterpreterEntryPoints() {
-    CHECKED(OFFSETOF_MEMBER(InterpreterEntryPoints, pInterpreterToInterpreterBridge) == 0,
-            InterpreterEntryPoints_start_with_i2i);
-    EXPECT_OFFSET_DIFFNP(InterpreterEntryPoints, pInterpreterToInterpreterBridge,
-                         pInterpreterToCompiledCodeBridge, sizeof(void*));
-    CHECKED(OFFSETOF_MEMBER(InterpreterEntryPoints, pInterpreterToCompiledCodeBridge)
-            + sizeof(void*) == sizeof(InterpreterEntryPoints), InterpreterEntryPoints_all);
   }
 
   void CheckJniEntryPoints() {
@@ -154,36 +152,42 @@ class EntrypointsOrderTest : public CommonRuntimeTest {
   }
 
   void CheckQuickEntryPoints() {
-    CHECKED(OFFSETOF_MEMBER(QuickEntryPoints, pAllocArray) == 0,
-                QuickEntryPoints_start_with_allocarray);
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAllocArray, pAllocArrayResolved, sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAllocArrayResolved, pAllocArrayWithAccessCheck,
+    CHECKED(OFFSETOF_MEMBER(QuickEntryPoints, pAllocArrayResolved) == 0,
+            QuickEntryPoints_start_with_allocarray_resoved);
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAllocArrayResolved, pAllocArrayResolved8,
                          sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAllocArrayWithAccessCheck, pAllocObject, sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAllocObject, pAllocObjectResolved, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAllocArrayResolved8, pAllocArrayResolved16,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAllocArrayResolved16, pAllocArrayResolved32,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAllocArrayResolved32, pAllocArrayResolved64,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAllocArrayResolved64, pAllocObjectResolved,
+                         sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAllocObjectResolved, pAllocObjectInitialized,
                          sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAllocObjectInitialized, pAllocObjectWithAccessCheck,
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAllocObjectInitialized, pAllocObjectWithChecks,
                          sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAllocObjectWithAccessCheck, pCheckAndAllocArray,
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAllocObjectWithChecks, pAllocStringObject,
                          sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pCheckAndAllocArray, pCheckAndAllocArrayWithAccessCheck,
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAllocStringObject, pAllocStringFromBytes,
                          sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pCheckAndAllocArrayWithAccessCheck,
-                         pAllocStringFromBytes, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAllocStringFromBytes, pAllocStringFromChars,
                          sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAllocStringFromChars, pAllocStringFromString,
                          sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAllocStringFromString, pInstanceofNonTrivial,
                          sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pInstanceofNonTrivial, pCheckCast, sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pCheckCast, pInitializeStaticStorage, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pInstanceofNonTrivial, pCheckInstanceOf, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pCheckInstanceOf, pInitializeStaticStorage,
+                         sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pInitializeStaticStorage, pInitializeTypeAndVerifyAccess,
                          sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pInitializeTypeAndVerifyAccess, pInitializeType,
                          sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pInitializeType, pResolveString, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pInitializeType, pResolveMethodHandle, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pResolveMethodHandle, pResolveMethodType, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pResolveMethodType, pResolveString, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pResolveString, pSet8Instance, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pSet8Instance, pSet8Static, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pSet8Static, pSet16Instance, sizeof(void*));
@@ -208,21 +212,21 @@ class EntrypointsOrderTest : public CommonRuntimeTest {
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pGet64Instance, pGet64Static, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pGet64Static, pGetObjInstance, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pGetObjInstance, pGetObjStatic, sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pGetObjStatic, pAputObjectWithNullAndBoundCheck,
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pGetObjStatic, pAputObject, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAputObject, pJniMethodStart, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pJniMethodStart, pJniMethodFastStart,
                          sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAputObjectWithNullAndBoundCheck,
-                         pAputObjectWithBoundCheck, sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAputObjectWithBoundCheck, pAputObject, sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAputObject, pHandleFillArrayData, sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pHandleFillArrayData, pJniMethodStart, sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pJniMethodStart, pJniMethodStartSynchronized,
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pJniMethodFastStart, pJniMethodStartSynchronized,
                          sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pJniMethodStartSynchronized, pJniMethodEnd,
                          sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pJniMethodEnd, pJniMethodEndSynchronized, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pJniMethodEnd, pJniMethodFastEnd, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pJniMethodFastEnd, pJniMethodEndSynchronized, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pJniMethodEndSynchronized, pJniMethodEndWithReference,
                          sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pJniMethodEndWithReference,
+                         pJniMethodFastEndWithReference, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pJniMethodFastEndWithReference,
                          pJniMethodEndWithReferenceSynchronized, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pJniMethodEndWithReferenceSynchronized,
                          pQuickGenericJniTrampoline, sizeof(void*));
@@ -232,7 +236,25 @@ class EntrypointsOrderTest : public CommonRuntimeTest {
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pCmpgDouble, pCmpgFloat, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pCmpgFloat, pCmplDouble, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pCmplDouble, pCmplFloat, sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pCmplFloat, pFmod, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pCmplFloat, pCos, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pCos, pSin, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pSin, pAcos, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAcos, pAsin, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAsin, pAtan, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAtan, pAtan2, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pAtan2, pPow, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pPow, pCbrt, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pCbrt, pCosh, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pCosh, pExp, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pExp, pExpm1, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pExpm1, pHypot, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pHypot, pLog, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pLog, pLog10, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pLog10, pNextAfter, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pNextAfter, pSinh, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pSinh, pTan, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pTan, pTanh, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pTanh, pFmod, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pFmod, pL2d, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pL2d, pFmodf, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pFmodf, pL2f, sizeof(void*));
@@ -266,15 +288,17 @@ class EntrypointsOrderTest : public CommonRuntimeTest {
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pInvokeSuperTrampolineWithAccessCheck,
                          pInvokeVirtualTrampolineWithAccessCheck, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pInvokeVirtualTrampolineWithAccessCheck,
-                         pTestSuspend, sizeof(void*));
+                         pInvokePolymorphic, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pInvokePolymorphic, pInvokeCustom, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pInvokeCustom, pTestSuspend, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pTestSuspend, pDeliverException, sizeof(void*));
 
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pDeliverException, pThrowArrayBounds, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pThrowArrayBounds, pThrowDivZero, sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pThrowDivZero, pThrowNoSuchMethod, sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pThrowNoSuchMethod, pThrowNullPointer, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pThrowDivZero, pThrowNullPointer, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pThrowNullPointer, pThrowStackOverflow, sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pThrowStackOverflow, pDeoptimize, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pThrowStackOverflow, pThrowStringBounds, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pThrowStringBounds, pDeoptimize, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pDeoptimize, pA64Load, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pA64Load, pA64Store, sizeof(void*));
 
@@ -310,18 +334,76 @@ class EntrypointsOrderTest : public CommonRuntimeTest {
                          sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pNewStringFromStringBuilder, pReadBarrierJni,
                          sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierJni, pReadBarrierMarkReg00, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg00, pReadBarrierMarkReg01,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg01, pReadBarrierMarkReg02,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg02, pReadBarrierMarkReg03,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg03, pReadBarrierMarkReg04,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg04, pReadBarrierMarkReg05,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg05, pReadBarrierMarkReg06,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg06, pReadBarrierMarkReg07,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg07, pReadBarrierMarkReg08,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg08, pReadBarrierMarkReg09,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg09, pReadBarrierMarkReg10,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg10, pReadBarrierMarkReg11,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg11, pReadBarrierMarkReg12,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg12, pReadBarrierMarkReg13,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg13, pReadBarrierMarkReg14,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg14, pReadBarrierMarkReg15,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg15, pReadBarrierMarkReg16,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg16, pReadBarrierMarkReg17,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg17, pReadBarrierMarkReg18,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg18, pReadBarrierMarkReg19,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg19, pReadBarrierMarkReg20,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg20, pReadBarrierMarkReg21,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg21, pReadBarrierMarkReg22,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg22, pReadBarrierMarkReg23,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg23, pReadBarrierMarkReg24,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg24, pReadBarrierMarkReg25,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg25, pReadBarrierMarkReg26,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg26, pReadBarrierMarkReg27,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg27, pReadBarrierMarkReg28,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg28, pReadBarrierMarkReg29,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierMarkReg29, pReadBarrierSlow, sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pReadBarrierSlow, pReadBarrierForRootSlow,
+                         sizeof(void*));
 
-    CHECKED(OFFSETOF_MEMBER(QuickEntryPoints, pReadBarrierJni)
+    CHECKED(OFFSETOF_MEMBER(QuickEntryPoints, pReadBarrierForRootSlow)
             + sizeof(void*) == sizeof(QuickEntryPoints), QuickEntryPoints_all);
   }
 };
 
 TEST_F(EntrypointsOrderTest, ThreadOffsets) {
   CheckThreadOffsets();
-}
-
-TEST_F(EntrypointsOrderTest, InterpreterEntryPoints) {
-  CheckInterpreterEntryPoints();
 }
 
 TEST_F(EntrypointsOrderTest, JniEntryPoints) {

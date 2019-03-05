@@ -17,96 +17,83 @@
 #ifndef ART_COMPILER_DRIVER_COMPILER_OPTIONS_H_
 #define ART_COMPILER_DRIVER_COMPILER_OPTIONS_H_
 
+#include <memory>
 #include <ostream>
 #include <string>
 #include <vector>
 
+#include "base/globals.h"
+#include "base/hash_set.h"
 #include "base/macros.h"
-#include "globals.h"
+#include "base/utils.h"
+#include "compiler_filter.h"
+#include "optimizing/register_allocator.h"
 
 namespace art {
 
-class PassManagerOptions;
+namespace jit {
+class JitCompiler;
+}  // namespace jit
+
+namespace verifier {
+class VerifierDepsTest;
+}  // namespace verifier
+
+class DexFile;
+enum class InstructionSet;
+class InstructionSetFeatures;
 
 class CompilerOptions FINAL {
  public:
-  enum CompilerFilter {
-    kVerifyNone,          // Skip verification and compile nothing except JNI stubs.
-    kInterpretOnly,       // Verify, and compile only JNI stubs.
-    kVerifyAtRuntime,     // Only compile JNI stubs and verify at runtime.
-    kSpace,               // Maximize space savings.
-    kBalanced,            // Try to get the best performance return on compilation investment.
-    kSpeed,               // Maximize runtime performance.
-    kEverything,          // Force compilation of everything capable of being compiled.
-    kTime,                // Compile methods, but minimize compilation time.
-  };
-
   // Guide heuristics to determine whether to compile method if profile data not available.
-  static const CompilerFilter kDefaultCompilerFilter = kSpeed;
   static const size_t kDefaultHugeMethodThreshold = 10000;
   static const size_t kDefaultLargeMethodThreshold = 600;
   static const size_t kDefaultSmallMethodThreshold = 60;
   static const size_t kDefaultTinyMethodThreshold = 20;
   static const size_t kDefaultNumDexMethodsThreshold = 900;
   static constexpr double kDefaultTopKProfileThreshold = 90.0;
-  static const bool kDefaultGenerateDebugInfo = kIsDebugBuild;
-  static const bool kDefaultIncludePatchInformation = false;
-  static const size_t kDefaultInlineDepthLimit = 5;
-  static const size_t kDefaultInlineMaxCodeUnits = 100;
-
-  // Default inlining settings when the space filter is used.
-  static constexpr size_t kSpaceFilterInlineDepthLimit = 5;
-  static constexpr size_t kSpaceFilterInlineMaxCodeUnits = 10;
+  static const bool kDefaultGenerateDebugInfo = false;
+  static const bool kDefaultGenerateMiniDebugInfo = false;
+  static const size_t kDefaultInlineMaxCodeUnits = 32;
+  static constexpr size_t kUnsetInlineMaxCodeUnits = -1;
 
   CompilerOptions();
   ~CompilerOptions();
 
-  CompilerOptions(CompilerFilter compiler_filter,
-                  size_t huge_method_threshold,
-                  size_t large_method_threshold,
-                  size_t small_method_threshold,
-                  size_t tiny_method_threshold,
-                  size_t num_dex_methods_threshold,
-                  size_t inline_depth_limit,
-                  size_t inline_max_code_units,
-                  bool include_patch_information,
-                  double top_k_profile_threshold,
-                  bool debuggable,
-                  bool generate_debug_info,
-                  bool implicit_null_checks,
-                  bool implicit_so_checks,
-                  bool implicit_suspend_checks,
-                  bool compile_pic,
-                  const std::vector<std::string>* verbose_methods,
-                  PassManagerOptions* pass_manager_options,
-                  std::ostream* init_failure_output,
-                  bool abort_on_hard_verifier_failure);
-
-  CompilerFilter GetCompilerFilter() const {
+  CompilerFilter::Filter GetCompilerFilter() const {
     return compiler_filter_;
   }
 
-  void SetCompilerFilter(CompilerFilter compiler_filter) {
+  void SetCompilerFilter(CompilerFilter::Filter compiler_filter) {
     compiler_filter_ = compiler_filter;
   }
 
-  bool VerifyAtRuntime() const {
-    return compiler_filter_ == CompilerOptions::kVerifyAtRuntime;
+  bool IsAotCompilationEnabled() const {
+    return CompilerFilter::IsAotCompilationEnabled(compiler_filter_);
   }
 
-  bool IsCompilationEnabled() const {
-    return compiler_filter_ != CompilerOptions::kVerifyNone &&
-        compiler_filter_ != CompilerOptions::kInterpretOnly &&
-        compiler_filter_ != CompilerOptions::kVerifyAtRuntime;
+  bool IsJniCompilationEnabled() const {
+    return CompilerFilter::IsJniCompilationEnabled(compiler_filter_);
+  }
+
+  bool IsQuickeningCompilationEnabled() const {
+    return CompilerFilter::IsQuickeningCompilationEnabled(compiler_filter_);
   }
 
   bool IsVerificationEnabled() const {
-    return compiler_filter_ != CompilerOptions::kVerifyNone &&
-        compiler_filter_ != CompilerOptions::kVerifyAtRuntime;
+    return CompilerFilter::IsVerificationEnabled(compiler_filter_);
   }
 
-  bool NeverVerify() const {
-    return compiler_filter_ == CompilerOptions::kVerifyNone;
+  bool AssumeClassesAreVerified() const {
+    return compiler_filter_ == CompilerFilter::kAssumeVerified;
+  }
+
+  bool VerifyAtRuntime() const {
+    return compiler_filter_ == CompilerFilter::kExtract;
+  }
+
+  bool IsAnyCompilationEnabled() const {
+    return CompilerFilter::IsAnyCompilationEnabled(compiler_filter_);
   }
 
   size_t GetHugeMethodThreshold() const {
@@ -145,12 +132,11 @@ class CompilerOptions FINAL {
     return num_dex_methods_threshold_;
   }
 
-  size_t GetInlineDepthLimit() const {
-    return inline_depth_limit_;
-  }
-
   size_t GetInlineMaxCodeUnits() const {
     return inline_max_code_units_;
+  }
+  void SetInlineMaxCodeUnits(size_t units) {
+    inline_max_code_units_ = units;
   }
 
   double GetTopKProfileThreshold() const {
@@ -161,8 +147,33 @@ class CompilerOptions FINAL {
     return debuggable_;
   }
 
+  void SetDebuggable(bool value) {
+    debuggable_ = value;
+  }
+
+  bool GetNativeDebuggable() const {
+    return GetDebuggable() && GetGenerateDebugInfo();
+  }
+
+  // This flag controls whether the compiler collects debugging information.
+  // The other flags control how the information is written to disk.
+  bool GenerateAnyDebugInfo() const {
+    return GetGenerateDebugInfo() || GetGenerateMiniDebugInfo();
+  }
+
   bool GetGenerateDebugInfo() const {
     return generate_debug_info_;
+  }
+
+  bool GetGenerateMiniDebugInfo() const {
+    return generate_mini_debug_info_;
+  }
+
+  // Should run-time checks be emitted in debug mode?
+  bool EmitRunTimeChecksInDebugMode() const;
+
+  bool GetGenerateBuildId() const {
+    return generate_build_id_;
   }
 
   bool GetImplicitNullChecks() const {
@@ -177,8 +188,25 @@ class CompilerOptions FINAL {
     return implicit_suspend_checks_;
   }
 
-  bool GetIncludePatchInformation() const {
-    return include_patch_information_;
+  // Are we compiling a boot image?
+  bool IsBootImage() const {
+    return boot_image_;
+  }
+
+  // Are we compiling a core image (small boot image only used for ART testing)?
+  bool IsCoreImage() const {
+    // Ensure that `core_image_` => `boot_image_`.
+    DCHECK(!core_image_ || boot_image_);
+    return core_image_;
+  }
+
+  // Are we compiling an app image?
+  bool IsAppImage() const {
+    return app_image_;
+  }
+
+  void DisableAppImage() {
+    app_image_ = false;
   }
 
   // Should the code be compiled as position independent?
@@ -187,11 +215,11 @@ class CompilerOptions FINAL {
   }
 
   bool HasVerboseMethods() const {
-    return verbose_methods_ != nullptr && !verbose_methods_->empty();
+    return !verbose_methods_.empty();
   }
 
   bool IsVerboseMethod(const std::string& pretty_method) const {
-    for (const std::string& cur_method : *verbose_methods_) {
+    for (const std::string& cur_method : verbose_methods_) {
       if (pretty_method.find(cur_method) != std::string::npos) {
         return true;
       }
@@ -200,51 +228,186 @@ class CompilerOptions FINAL {
   }
 
   std::ostream* GetInitFailureOutput() const {
-    return init_failure_output_;
-  }
-
-  const PassManagerOptions* GetPassManagerOptions() const {
-    return pass_manager_options_.get();
+    return init_failure_output_.get();
   }
 
   bool AbortOnHardVerifierFailure() const {
     return abort_on_hard_verifier_failure_;
   }
+  bool AbortOnSoftVerifierFailure() const {
+    return abort_on_soft_verifier_failure_;
+  }
+
+  InstructionSet GetInstructionSet() const {
+    return instruction_set_;
+  }
+
+  const InstructionSetFeatures* GetInstructionSetFeatures() const {
+    return instruction_set_features_.get();
+  }
+
+
+  const std::vector<const DexFile*>& GetNoInlineFromDexFile() const {
+    return no_inline_from_;
+  }
+
+  const std::vector<const DexFile*>& GetDexFilesForOatFile() const {
+    return dex_files_for_oat_file_;
+  }
+
+  const HashSet<std::string>& GetImageClasses() const {
+    return image_classes_;
+  }
+
+  bool IsImageClass(const char* descriptor) const;
+
+  bool ParseCompilerOptions(const std::vector<std::string>& options,
+                            bool ignore_unrecognized,
+                            std::string* error_msg);
+
+  void SetNonPic() {
+    compile_pic_ = false;
+  }
+
+  const std::string& GetDumpCfgFileName() const {
+    return dump_cfg_file_name_;
+  }
+
+  bool GetDumpCfgAppend() const {
+    return dump_cfg_append_;
+  }
+
+  bool IsForceDeterminism() const {
+    return force_determinism_;
+  }
+
+  bool DeduplicateCode() const {
+    return deduplicate_code_;
+  }
+
+  RegisterAllocator::Strategy GetRegisterAllocationStrategy() const {
+    return register_allocation_strategy_;
+  }
+
+  const std::vector<std::string>* GetPassesToRun() const {
+    return passes_to_run_;
+  }
+
+  bool GetDumpTimings() const {
+    return dump_timings_;
+  }
+
+  bool GetDumpPassTimings() const {
+    return dump_pass_timings_;
+  }
+
+  bool GetDumpStats() const {
+    return dump_stats_;
+  }
+
+  bool CountHotnessInCompiledCode() const {
+    return count_hotness_in_compiled_code_;
+  }
 
  private:
-  CompilerFilter compiler_filter_;
-  const size_t huge_method_threshold_;
-  const size_t large_method_threshold_;
-  const size_t small_method_threshold_;
-  const size_t tiny_method_threshold_;
-  const size_t num_dex_methods_threshold_;
-  const size_t inline_depth_limit_;
-  const size_t inline_max_code_units_;
-  const bool include_patch_information_;
+  bool ParseDumpInitFailures(const std::string& option, std::string* error_msg);
+  void ParseDumpCfgPasses(const StringPiece& option, UsageFn Usage);
+  void ParseInlineMaxCodeUnits(const StringPiece& option, UsageFn Usage);
+  void ParseNumDexMethods(const StringPiece& option, UsageFn Usage);
+  void ParseTinyMethodMax(const StringPiece& option, UsageFn Usage);
+  void ParseSmallMethodMax(const StringPiece& option, UsageFn Usage);
+  void ParseLargeMethodMax(const StringPiece& option, UsageFn Usage);
+  void ParseHugeMethodMax(const StringPiece& option, UsageFn Usage);
+  bool ParseRegisterAllocationStrategy(const std::string& option, std::string* error_msg);
+
+  CompilerFilter::Filter compiler_filter_;
+  size_t huge_method_threshold_;
+  size_t large_method_threshold_;
+  size_t small_method_threshold_;
+  size_t tiny_method_threshold_;
+  size_t num_dex_methods_threshold_;
+  size_t inline_max_code_units_;
+
+  InstructionSet instruction_set_;
+  std::unique_ptr<const InstructionSetFeatures> instruction_set_features_;
+
+  // Dex files from which we should not inline code. Does not own the dex files.
+  // This is usually a very short list (i.e. a single dex file), so we
+  // prefer vector<> over a lookup-oriented container, such as set<>.
+  std::vector<const DexFile*> no_inline_from_;
+
+  // List of dex files associated with the oat file, empty for JIT.
+  std::vector<const DexFile*> dex_files_for_oat_file_;
+
+  // Image classes, specifies the classes that will be included in the image if creating an image.
+  // Must not be empty for real boot image, only for tests pretending to compile boot image.
+  HashSet<std::string> image_classes_;
+
+  bool boot_image_;
+  bool core_image_;
+  bool app_image_;
+  bool debuggable_;
+  bool generate_debug_info_;
+  bool generate_mini_debug_info_;
+  bool generate_build_id_;
+  bool implicit_null_checks_;
+  bool implicit_so_checks_;
+  bool implicit_suspend_checks_;
+  bool compile_pic_;
+  bool dump_timings_;
+  bool dump_pass_timings_;
+  bool dump_stats_;
+
   // When using a profile file only the top K% of the profiled samples will be compiled.
-  const double top_k_profile_threshold_;
-  const bool debuggable_;
-  const bool generate_debug_info_;
-  const bool implicit_null_checks_;
-  const bool implicit_so_checks_;
-  const bool implicit_suspend_checks_;
-  const bool compile_pic_;
+  double top_k_profile_threshold_;
 
   // Vector of methods to have verbose output enabled for.
-  const std::vector<std::string>* const verbose_methods_;
-
-  std::unique_ptr<PassManagerOptions> pass_manager_options_;
+  std::vector<std::string> verbose_methods_;
 
   // Abort compilation with an error if we find a class that fails verification with a hard
   // failure.
-  const bool abort_on_hard_verifier_failure_;
+  bool abort_on_hard_verifier_failure_;
+  // Same for soft failures.
+  bool abort_on_soft_verifier_failure_;
 
   // Log initialization of initialization failures to this stream if not null.
-  std::ostream* const init_failure_output_;
+  std::unique_ptr<std::ostream> init_failure_output_;
+
+  std::string dump_cfg_file_name_;
+  bool dump_cfg_append_;
+
+  // Whether the compiler should trade performance for determinism to guarantee exactly reproducible
+  // outcomes.
+  bool force_determinism_;
+
+  // Whether code should be deduplicated.
+  bool deduplicate_code_;
+
+  // Whether compiled code should increment the hotness count of ArtMethod. Note that the increments
+  // won't be atomic for performance reasons, so we accept races, just like in interpreter.
+  bool count_hotness_in_compiled_code_;
+
+  RegisterAllocator::Strategy register_allocation_strategy_;
+
+  // If not null, specifies optimization passes which will be run instead of defaults.
+  // Note that passes_to_run_ is not checked for correctness and providing an incorrect
+  // list of passes can lead to unexpected compiler behaviour. This is caused by dependencies
+  // between passes. Failing to satisfy them can for example lead to compiler crashes.
+  // Passing pass names which are not recognized by the compiler will result in
+  // compiler-dependant behavior.
+  const std::vector<std::string>* passes_to_run_;
+
+  friend class Dex2Oat;
+  friend class DexToDexDecompilerTest;
+  friend class CommonCompilerTest;
+  friend class jit::JitCompiler;
+  friend class verifier::VerifierDepsTest;
+
+  template <class Base>
+  friend bool ReadCompilerOptions(Base& map, CompilerOptions* options, std::string* error_msg);
 
   DISALLOW_COPY_AND_ASSIGN(CompilerOptions);
 };
-std::ostream& operator<<(std::ostream& os, const CompilerOptions::CompilerFilter& rhs);
 
 }  // namespace art
 

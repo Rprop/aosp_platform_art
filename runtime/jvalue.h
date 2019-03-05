@@ -18,25 +18,32 @@
 #define ART_RUNTIME_JVALUE_H_
 
 #include "base/macros.h"
+#include "base/mutex.h"
 
 #include <stdint.h>
+
+#include "obj_ptr.h"
 
 namespace art {
 namespace mirror {
 class Object;
 }  // namespace mirror
 
-union PACKED(4) JValue {
+union PACKED(alignof(mirror::Object*)) JValue {
   // We default initialize JValue instances to all-zeros.
   JValue() : j(0) {}
 
+  template<typename T> ALWAYS_INLINE static JValue FromPrimitive(T v);
+
   int8_t GetB() const { return b; }
   void SetB(int8_t new_b) {
-    i = ((static_cast<int32_t>(new_b) << 24) >> 24);  // Sign-extend.
+    j = ((static_cast<int64_t>(new_b) << 56) >> 56);  // Sign-extend to 64 bits.
   }
 
   uint16_t GetC() const { return c; }
-  void SetC(uint16_t new_c) { c = new_c; }
+  void SetC(uint16_t new_c) {
+    j = static_cast<int64_t>(new_c);  // Zero-extend to 64 bits.
+  }
 
   double GetD() const { return d; }
   void SetD(double new_d) { d = new_d; }
@@ -45,21 +52,28 @@ union PACKED(4) JValue {
   void SetF(float new_f) { f = new_f; }
 
   int32_t GetI() const { return i; }
-  void SetI(int32_t new_i) { i = new_i; }
+  void SetI(int32_t new_i) {
+    j = ((static_cast<int64_t>(new_i) << 32) >> 32);  // Sign-extend to 64 bits.
+  }
 
   int64_t GetJ() const { return j; }
   void SetJ(int64_t new_j) { j = new_j; }
 
-  mirror::Object* GetL() const { return l; }
-  void SetL(mirror::Object* new_l) { l = new_l; }
+  mirror::Object* GetL() const REQUIRES_SHARED(Locks::mutator_lock_) {
+    return l;
+  }
+  ALWAYS_INLINE
+  void SetL(ObjPtr<mirror::Object> new_l) REQUIRES_SHARED(Locks::mutator_lock_);
 
   int16_t GetS() const { return s; }
   void SetS(int16_t new_s) {
-    i = ((static_cast<int32_t>(new_s) << 16) >> 16);  // Sign-extend.
+    j = ((static_cast<int64_t>(new_s) << 48) >> 48);  // Sign-extend to 64 bits.
   }
 
   uint8_t GetZ() const { return z; }
-  void SetZ(uint8_t new_z) { z = new_z; }
+  void SetZ(uint8_t new_z) {
+    j = static_cast<int64_t>(new_z);  // Zero-extend to 64 bits.
+  }
 
   mirror::Object** GetGCRoot() { return &l; }
 

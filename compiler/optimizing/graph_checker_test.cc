@@ -17,76 +17,63 @@
 #include "graph_checker.h"
 #include "optimizing_unit_test.h"
 
-#include "gtest/gtest.h"
-
 namespace art {
+
+class GraphCheckerTest : public OptimizingUnitTest {
+ protected:
+  HGraph* CreateSimpleCFG();
+  void TestCode(const std::vector<uint16_t>& data);
+};
 
 /**
  * Create a simple control-flow graph composed of two blocks:
  *
  *   BasicBlock 0, succ: 1
- *     0: Goto 1
+ *     0: ReturnVoid 1
  *   BasicBlock 1, pred: 0
  *     1: Exit
  */
-HGraph* CreateSimpleCFG(ArenaAllocator* allocator) {
-  HGraph* graph = CreateGraph(allocator);
-  HBasicBlock* entry_block = new (allocator) HBasicBlock(graph);
-  entry_block->AddInstruction(new (allocator) HGoto());
+HGraph* GraphCheckerTest::CreateSimpleCFG() {
+  HGraph* graph = CreateGraph();
+  HBasicBlock* entry_block = new (GetAllocator()) HBasicBlock(graph);
+  entry_block->AddInstruction(new (GetAllocator()) HReturnVoid());
   graph->AddBlock(entry_block);
   graph->SetEntryBlock(entry_block);
-  HBasicBlock* exit_block = new (allocator) HBasicBlock(graph);
-  exit_block->AddInstruction(new (allocator) HExit());
+  HBasicBlock* exit_block = new (GetAllocator()) HBasicBlock(graph);
+  exit_block->AddInstruction(new (GetAllocator()) HExit());
   graph->AddBlock(exit_block);
   graph->SetExitBlock(exit_block);
   entry_block->AddSuccessor(exit_block);
+  graph->BuildDominatorTree();
   return graph;
 }
 
-
-static void TestCode(const uint16_t* data) {
-  ArenaPool pool;
-  ArenaAllocator allocator(&pool);
-  HGraph* graph = CreateCFG(&allocator, data);
+void GraphCheckerTest::TestCode(const std::vector<uint16_t>& data) {
+  HGraph* graph = CreateCFG(data);
   ASSERT_NE(graph, nullptr);
 
-  GraphChecker graph_checker(&allocator, graph);
+  GraphChecker graph_checker(graph);
   graph_checker.Run();
   ASSERT_TRUE(graph_checker.IsValid());
 }
 
-static void TestCodeSSA(const uint16_t* data) {
-  ArenaPool pool;
-  ArenaAllocator allocator(&pool);
-  HGraph* graph = CreateCFG(&allocator, data);
-  ASSERT_NE(graph, nullptr);
-
-  graph->BuildDominatorTree();
-  graph->TransformToSsa();
-
-  SSAChecker ssa_checker(&allocator, graph);
-  ssa_checker.Run();
-  ASSERT_TRUE(ssa_checker.IsValid());
-}
-
-
-TEST(GraphChecker, ReturnVoid) {
-  const uint16_t data[] = ZERO_REGISTER_CODE_ITEM(
+TEST_F(GraphCheckerTest, ReturnVoid) {
+  const std::vector<uint16_t> data = ZERO_REGISTER_CODE_ITEM(
       Instruction::RETURN_VOID);
 
   TestCode(data);
 }
 
-TEST(GraphChecker, CFG1) {
-  const uint16_t data[] = ZERO_REGISTER_CODE_ITEM(
+TEST_F(GraphCheckerTest, CFG1) {
+  const std::vector<uint16_t> data = ZERO_REGISTER_CODE_ITEM(
       Instruction::GOTO | 0x100,
       Instruction::RETURN_VOID);
 
   TestCode(data);
 }
 
-TEST(GraphChecker, CFG2) {
-  const uint16_t data[] = ONE_REGISTER_CODE_ITEM(
+TEST_F(GraphCheckerTest, CFG2) {
+  const std::vector<uint16_t> data = ONE_REGISTER_CODE_ITEM(
     Instruction::CONST_4 | 0 | 0,
     Instruction::IF_EQ, 3,
     Instruction::GOTO | 0x100,
@@ -95,8 +82,8 @@ TEST(GraphChecker, CFG2) {
   TestCode(data);
 }
 
-TEST(GraphChecker, CFG3) {
-  const uint16_t data[] = ONE_REGISTER_CODE_ITEM(
+TEST_F(GraphCheckerTest, CFG3) {
+  const std::vector<uint16_t> data = ONE_REGISTER_CODE_ITEM(
     Instruction::CONST_4 | 0 | 0,
     Instruction::IF_EQ, 3,
     Instruction::GOTO | 0x100,
@@ -107,12 +94,9 @@ TEST(GraphChecker, CFG3) {
 
 // Test case with an invalid graph containing inconsistent
 // predecessor/successor arcs in CFG.
-TEST(GraphChecker, InconsistentPredecessorsAndSuccessors) {
-  ArenaPool pool;
-  ArenaAllocator allocator(&pool);
-
-  HGraph* graph = CreateSimpleCFG(&allocator);
-  GraphChecker graph_checker(&allocator, graph);
+TEST_F(GraphCheckerTest, InconsistentPredecessorsAndSuccessors) {
+  HGraph* graph = CreateSimpleCFG();
+  GraphChecker graph_checker(graph);
   graph_checker.Run();
   ASSERT_TRUE(graph_checker.IsValid());
 
@@ -125,12 +109,9 @@ TEST(GraphChecker, InconsistentPredecessorsAndSuccessors) {
 
 // Test case with an invalid graph containing a non-branch last
 // instruction in a block.
-TEST(GraphChecker, BlockEndingWithNonBranchInstruction) {
-  ArenaPool pool;
-  ArenaAllocator allocator(&pool);
-
-  HGraph* graph = CreateSimpleCFG(&allocator);
-  GraphChecker graph_checker(&allocator, graph);
+TEST_F(GraphCheckerTest, BlockEndingWithNonBranchInstruction) {
+  HGraph* graph = CreateSimpleCFG();
+  GraphChecker graph_checker(graph);
   graph_checker.Run();
   ASSERT_TRUE(graph_checker.IsValid());
 
@@ -145,15 +126,15 @@ TEST(GraphChecker, BlockEndingWithNonBranchInstruction) {
   ASSERT_FALSE(graph_checker.IsValid());
 }
 
-TEST(SSAChecker, SSAPhi) {
+TEST_F(GraphCheckerTest, SSAPhi) {
   // This code creates one Phi function during the conversion to SSA form.
-  const uint16_t data[] = ONE_REGISTER_CODE_ITEM(
+  const std::vector<uint16_t> data = ONE_REGISTER_CODE_ITEM(
     Instruction::CONST_4 | 0 | 0,
     Instruction::IF_EQ, 3,
     Instruction::CONST_4 | 4 << 12 | 0,
     Instruction::RETURN | 0 << 8);
 
-  TestCodeSSA(data);
+  TestCode(data);
 }
 
 }  // namespace art

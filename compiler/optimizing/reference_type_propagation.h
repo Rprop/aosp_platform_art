@@ -17,11 +17,11 @@
 #ifndef ART_COMPILER_OPTIMIZING_REFERENCE_TYPE_PROPAGATION_H_
 #define ART_COMPILER_OPTIMIZING_REFERENCE_TYPE_PROPAGATION_H_
 
-#include "driver/dex_compilation_unit.h"
-#include "handle_scope-inl.h"
+#include "base/arena_containers.h"
+#include "mirror/class-inl.h"
 #include "nodes.h"
+#include "obj_ptr.h"
 #include "optimization.h"
-#include "optimizing_compiler_stats.h"
 
 namespace art {
 
@@ -31,48 +31,87 @@ namespace art {
 class ReferenceTypePropagation : public HOptimization {
  public:
   ReferenceTypePropagation(HGraph* graph,
-                           const DexFile& dex_file,
-                           const DexCompilationUnit& dex_compilation_unit,
-                           StackHandleScopeCollection* handles)
-    : HOptimization(graph, true, kReferenceTypePropagationPassName),
-      dex_file_(dex_file),
-      dex_compilation_unit_(dex_compilation_unit),
-      handles_(handles),
-      worklist_(graph->GetArena(), kDefaultWorklistSize) {}
+                           Handle<mirror::ClassLoader> class_loader,
+                           Handle<mirror::DexCache> hint_dex_cache,
+                           VariableSizedHandleScope* handles,
+                           bool is_first_run,
+                           const char* name = kReferenceTypePropagationPassName);
 
-  void Run() OVERRIDE;
+  // Visit a single instruction.
+  void Visit(HInstruction* instruction);
+
+  bool Run() OVERRIDE;
+
+  // Returns true if klass is admissible to the propagation: non-null and resolved.
+  // For an array type, we also check if the component type is admissible.
+  static bool IsAdmissible(ObjPtr<mirror::Class> klass) REQUIRES_SHARED(Locks::mutator_lock_) {
+    return klass != nullptr &&
+           klass->IsResolved() &&
+           (!klass->IsArrayClass() || IsAdmissible(klass->GetComponentType()));
+  }
 
   static constexpr const char* kReferenceTypePropagationPassName = "reference_type_propagation";
 
+  // Fix the reference type for an instruction whose inputs have changed.
+  // For a select instruction, the reference types of the inputs are merged
+  // and the resulting reference type is set on the select instruction.
+  static void FixUpInstructionType(HInstruction* instruction,
+                                   VariableSizedHandleScope* handle_scope);
+
  private:
-  void VisitNewInstance(HNewInstance* new_instance);
-  void VisitLoadClass(HLoadClass* load_class);
-  void VisitPhi(HPhi* phi);
-  void VisitBasicBlock(HBasicBlock* block);
+  class HandleCache {
+   public:
+    explicit HandleCache(VariableSizedHandleScope* handles) : handles_(handles) { }
 
-  void UpdateBoundType(HBoundType* bound_type) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  void UpdatePhi(HPhi* phi) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+    template <typename T>
+    MutableHandle<T> NewHandle(T* object) REQUIRES_SHARED(Locks::mutator_lock_) {
+      return handles_->NewHandle(object);
+    }
 
-  void BoundTypeForIfNotNull(HBasicBlock* block);
-  void BoundTypeForIfInstanceOf(HBasicBlock* block);
+    template <typename T>
+    MutableHandle<T> NewHandle(ObjPtr<T> object) REQUIRES_SHARED(Locks::mutator_lock_) {
+      return handles_->NewHandle(object);
+    }
 
-  void ProcessWorklist();
-  void AddToWorklist(HInstruction* instr);
-  void AddDependentInstructionsToWorklist(HInstruction* instr);
+    ReferenceTypeInfo::TypeHandle GetObjectClassHandle();
+    ReferenceTypeInfo::TypeHandle GetClassClassHandle();
+    ReferenceTypeInfo::TypeHandle GetMethodHandleClassHandle();
+    ReferenceTypeInfo::TypeHandle GetMethodTypeClassHandle();
+    ReferenceTypeInfo::TypeHandle GetStringClassHandle();
+    ReferenceTypeInfo::TypeHandle GetThrowableClassHandle();
 
-  bool UpdateNullability(HInstruction* instr);
-  bool UpdateReferenceTypeInfo(HInstruction* instr);
+   private:
+    VariableSizedHandleScope* handles_;
 
-  ReferenceTypeInfo MergeTypes(const ReferenceTypeInfo& a, const ReferenceTypeInfo& b)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+    ReferenceTypeInfo::TypeHandle object_class_handle_;
+    ReferenceTypeInfo::TypeHandle class_class_handle_;
+    ReferenceTypeInfo::TypeHandle method_handle_class_handle_;
+    ReferenceTypeInfo::TypeHandle method_type_class_handle_;
+    ReferenceTypeInfo::TypeHandle string_class_handle_;
+    ReferenceTypeInfo::TypeHandle throwable_class_handle_;
+  };
 
-  const DexFile& dex_file_;
-  const DexCompilationUnit& dex_compilation_unit_;
-  StackHandleScopeCollection* handles_;
+  class RTPVisitor;
 
-  GrowableArray<HInstruction*> worklist_;
+  static ReferenceTypeInfo MergeTypes(const ReferenceTypeInfo& a,
+                                      const ReferenceTypeInfo& b,
+                                      HandleCache* handle_cache)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
-  static constexpr size_t kDefaultWorklistSize = 8;
+  void ValidateTypes();
+
+  Handle<mirror::ClassLoader> class_loader_;
+
+  // Note: hint_dex_cache_ is usually, but not necessarily, the dex cache associated with
+  // graph_->GetDexFile(). Since we may look up also in other dex files, it's used only
+  // as a hint, to reduce the number of calls to the costly ClassLinker::FindDexCache().
+  Handle<mirror::DexCache> hint_dex_cache_;
+  HandleCache handle_cache_;
+
+  // Whether this reference type propagation is the first run we are doing.
+  const bool is_first_run_;
+
+  friend class ReferenceTypePropagationTest;
 
   DISALLOW_COPY_AND_ASSIGN(ReferenceTypePropagation);
 };

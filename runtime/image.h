@@ -19,10 +19,40 @@
 
 #include <string.h>
 
-#include "globals.h"
+#include "base/enums.h"
+#include "base/globals.h"
 #include "mirror/object.h"
 
 namespace art {
+
+class ArtField;
+class ArtMethod;
+template <class MirrorType> class ObjPtr;
+
+namespace linker {
+class ImageWriter;
+}  // namespace linker
+
+class ObjectVisitor {
+ public:
+  virtual ~ObjectVisitor() {}
+
+  virtual void Visit(mirror::Object* object) = 0;
+};
+
+class ArtMethodVisitor {
+ public:
+  virtual ~ArtMethodVisitor() {}
+
+  virtual void Visit(ArtMethod* method) = 0;
+};
+
+class ArtFieldVisitor {
+ public:
+  virtual ~ArtFieldVisitor() {}
+
+  virtual void Visit(ArtField* method) = 0;
+};
 
 class PACKED(4) ImageSection {
  public:
@@ -55,10 +85,36 @@ class PACKED(4) ImageSection {
 // header of image files written by ImageWriter, read and validated by Space.
 class PACKED(4) ImageHeader {
  public:
-  ImageHeader() : compile_pic_(0) {}
+  enum StorageMode : uint32_t {
+    kStorageModeUncompressed,
+    kStorageModeLZ4,
+    kStorageModeLZ4HC,
+    kStorageModeCount,  // Number of elements in enum.
+  };
+  static constexpr StorageMode kDefaultStorageMode = kStorageModeUncompressed;
+
+  ImageHeader()
+      : image_begin_(0U),
+        image_size_(0U),
+        oat_checksum_(0U),
+        oat_file_begin_(0U),
+        oat_data_begin_(0U),
+        oat_data_end_(0U),
+        oat_file_end_(0U),
+        boot_image_begin_(0U),
+        boot_image_size_(0U),
+        boot_oat_begin_(0U),
+        boot_oat_size_(0U),
+        patch_delta_(0),
+        image_roots_(0U),
+        pointer_size_(0U),
+        compile_pic_(0),
+        is_pic_(0),
+        storage_mode_(kDefaultStorageMode),
+        data_size_(0) {}
 
   ImageHeader(uint32_t image_begin,
-              uint32_t image_size_,
+              uint32_t image_size,
               ImageSection* sections,
               uint32_t image_roots,
               uint32_t oat_checksum,
@@ -66,8 +122,15 @@ class PACKED(4) ImageHeader {
               uint32_t oat_data_begin,
               uint32_t oat_data_end,
               uint32_t oat_file_end,
+              uint32_t boot_image_begin,
+              uint32_t boot_image_size,
+              uint32_t boot_oat_begin,
+              uint32_t boot_oat_size,
               uint32_t pointer_size,
-              bool compile_pic_);
+              bool compile_pic,
+              bool is_pic,
+              StorageMode storage_mode,
+              size_t data_size);
 
   bool IsValid() const;
   const char* GetMagic() const;
@@ -88,6 +151,8 @@ class PACKED(4) ImageHeader {
     oat_checksum_ = oat_checksum;
   }
 
+  // The location that the oat file was expected to be when the image was created. The actual
+  // oat file may be at a different location for application images.
   uint8_t* GetOatFileBegin() const {
     return reinterpret_cast<uint8_t*>(oat_file_begin_);
   }
@@ -104,7 +169,9 @@ class PACKED(4) ImageHeader {
     return reinterpret_cast<uint8_t*>(oat_file_end_);
   }
 
-  uint32_t GetPointerSize() const {
+  PointerSize GetPointerSize() const;
+
+  uint32_t GetPointerSizeUnchecked() const {
     return pointer_size_;
   }
 
@@ -112,63 +179,205 @@ class PACKED(4) ImageHeader {
     return patch_delta_;
   }
 
+  void SetPatchDelta(off_t patch_delta) {
+    patch_delta_ = patch_delta;
+  }
+
   static std::string GetOatLocationFromImageLocation(const std::string& image) {
-    std::string oat_filename = image;
-    if (oat_filename.length() <= 3) {
-      oat_filename += ".oat";
-    } else {
-      oat_filename.replace(oat_filename.length() - 3, 3, "oat");
-    }
-    return oat_filename;
+    return GetLocationFromImageLocation(image, "oat");
+  }
+
+  static std::string GetVdexLocationFromImageLocation(const std::string& image) {
+    return GetLocationFromImageLocation(image, "vdex");
   }
 
   enum ImageMethod {
     kResolutionMethod,
     kImtConflictMethod,
     kImtUnimplementedMethod,
-    kCalleeSaveMethod,
-    kRefsOnlySaveMethod,
-    kRefsAndArgsSaveMethod,
+    kSaveAllCalleeSavesMethod,
+    kSaveRefsOnlyMethod,
+    kSaveRefsAndArgsMethod,
+    kSaveEverythingMethod,
+    kSaveEverythingMethodForClinit,
+    kSaveEverythingMethodForSuspendCheck,
     kImageMethodsCount,  // Number of elements in enum.
   };
 
   enum ImageRoot {
     kDexCaches,
     kClassRoots,
+    kOomeWhenThrowingException,       // Pre-allocated OOME when throwing exception.
+    kOomeWhenThrowingOome,            // Pre-allocated OOME when throwing OOME.
+    kOomeWhenHandlingStackOverflow,   // Pre-allocated OOME when handling StackOverflowError.
+    kNoClassDefFoundError,            // Pre-allocated NoClassDefFoundError.
+    kSpecialRoots,                    // Different for boot image and app image, see aliases below.
     kImageRootsMax,
+
+    // Aliases.
+    kAppImageClassLoader = kSpecialRoots,   // The class loader used to build the app image.
+    kBootImageLiveObjects = kSpecialRoots,  // Array of boot image objects that must be kept live.
   };
 
   enum ImageSections {
     kSectionObjects,
     kSectionArtFields,
     kSectionArtMethods,
+    kSectionRuntimeMethods,
+    kSectionImTables,
+    kSectionIMTConflictTables,
+    kSectionDexCacheArrays,
     kSectionInternedStrings,
+    kSectionClassTable,
     kSectionImageBitmap,
     kSectionCount,  // Number of elements in enum.
   };
 
+  static size_t NumberOfImageRoots(bool app_image ATTRIBUTE_UNUSED) {
+    // At the moment, boot image and app image have the same number of roots,
+    // though the meaning of the kSpecialRoots is different.
+    return kImageRootsMax;
+  }
+
   ArtMethod* GetImageMethod(ImageMethod index) const;
   void SetImageMethod(ImageMethod index, ArtMethod* method);
 
-  const ImageSection& GetImageSection(ImageSections index) const;
+  const ImageSection& GetImageSection(ImageSections index) const {
+    DCHECK_LT(static_cast<size_t>(index), kSectionCount);
+    return sections_[index];
+  }
+
+  const ImageSection& GetObjectsSection() const {
+    return GetImageSection(kSectionObjects);
+  }
+
+  const ImageSection& GetFieldsSection() const {
+    return GetImageSection(ImageHeader::kSectionArtFields);
+  }
+
   const ImageSection& GetMethodsSection() const {
     return GetImageSection(kSectionArtMethods);
   }
 
-  mirror::Object* GetImageRoot(ImageRoot image_root) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  mirror::ObjectArray<mirror::Object>* GetImageRoots() const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  const ImageSection& GetRuntimeMethodsSection() const {
+    return GetImageSection(kSectionRuntimeMethods);
+  }
+
+  const ImageSection& GetImTablesSection() const {
+    return GetImageSection(kSectionImTables);
+  }
+
+  const ImageSection& GetIMTConflictTablesSection() const {
+    return GetImageSection(kSectionIMTConflictTables);
+  }
+
+  const ImageSection& GetDexCacheArraysSection() const {
+    return GetImageSection(kSectionDexCacheArrays);
+  }
+
+  const ImageSection& GetInternedStringsSection() const {
+    return GetImageSection(kSectionInternedStrings);
+  }
+
+  const ImageSection& GetClassTableSection() const {
+    return GetImageSection(kSectionClassTable);
+  }
+
+  const ImageSection& GetImageBitmapSection() const {
+    return GetImageSection(kSectionImageBitmap);
+  }
+
+  template <ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
+  ObjPtr<mirror::Object> GetImageRoot(ImageRoot image_root) const
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  template <ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
+  ObjPtr<mirror::ObjectArray<mirror::Object>> GetImageRoots() const
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   void RelocateImage(off_t delta);
+  void RelocateImageMethods(off_t delta);
+  void RelocateImageObjects(off_t delta);
 
   bool CompilePic() const {
     return compile_pic_ != 0;
   }
 
+  bool IsPic() const {
+    return is_pic_ != 0;
+  }
+
+  uint32_t GetBootImageBegin() const {
+    return boot_image_begin_;
+  }
+
+  uint32_t GetBootImageSize() const {
+    return boot_image_size_;
+  }
+
+  uint32_t GetBootOatBegin() const {
+    return boot_oat_begin_;
+  }
+
+  uint32_t GetBootOatSize() const {
+    return boot_oat_size_;
+  }
+
+  StorageMode GetStorageMode() const {
+    return storage_mode_;
+  }
+
+  uint64_t GetDataSize() const {
+    return data_size_;
+  }
+
+  bool IsAppImage() const {
+    // App images currently require a boot image, if the size is non zero then it is an app image
+    // header.
+    return boot_image_size_ != 0u;
+  }
+
+  // Visit mirror::Objects in the section starting at base.
+  // TODO: Delete base parameter if it is always equal to GetImageBegin.
+  void VisitObjects(ObjectVisitor* visitor,
+                    uint8_t* base,
+                    PointerSize pointer_size) const
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // Visit ArtMethods in the section starting at base. Includes runtime methods.
+  // TODO: Delete base parameter if it is always equal to GetImageBegin.
+  void VisitPackedArtMethods(ArtMethodVisitor* visitor,
+                             uint8_t* base,
+                             PointerSize pointer_size) const;
+
+  // Visit ArtMethods in the section starting at base.
+  // TODO: Delete base parameter if it is always equal to GetImageBegin.
+  void VisitPackedArtFields(ArtFieldVisitor* visitor, uint8_t* base) const;
+
+  template <typename Visitor>
+  void VisitPackedImTables(const Visitor& visitor,
+                           uint8_t* base,
+                           PointerSize pointer_size) const;
+
+  template <typename Visitor>
+  void VisitPackedImtConflictTables(const Visitor& visitor,
+                                    uint8_t* base,
+                                    PointerSize pointer_size) const;
+
  private:
   static const uint8_t kImageMagic[4];
   static const uint8_t kImageVersion[4];
+
+  static std::string GetLocationFromImageLocation(const std::string& image,
+                                                  const std::string& extension) {
+    std::string filename = image;
+    if (filename.length() <= 3) {
+      filename += "." + extension;
+    } else {
+      filename.replace(filename.length() - 3, 3, extension);
+    }
+    return filename;
+  }
 
   uint8_t magic_[4];
   uint8_t version_[4];
@@ -195,6 +404,16 @@ class PACKED(4) ImageHeader {
   // .so files. Used for positioning a following alloc spaces.
   uint32_t oat_file_end_;
 
+  // Boot image begin and end (app image headers only).
+  uint32_t boot_image_begin_;
+  uint32_t boot_image_size_;
+
+  // Boot oat begin and end (app image headers only).
+  uint32_t boot_oat_begin_;
+  uint32_t boot_oat_size_;
+
+  // TODO: We should probably insert a boot image checksum for app images.
+
   // The total delta that this image has been patched.
   int32_t patch_delta_;
 
@@ -207,19 +426,32 @@ class PACKED(4) ImageHeader {
   // Boolean (0 or 1) to denote if the image was compiled with --compile-pic option
   const uint32_t compile_pic_;
 
-  // Image sections
+  // Boolean (0 or 1) to denote if the image can be mapped at a random address, this only refers to
+  // the .art file. Currently, app oat files do not depend on their app image. There are no pointers
+  // from the app oat code to the app image.
+  const uint32_t is_pic_;
+
+  // Image section sizes/offsets correspond to the uncompressed form.
   ImageSection sections_[kSectionCount];
 
-  // Image methods.
+  // Image methods, may be inside of the boot image for app images.
   uint64_t image_methods_[kImageMethodsCount];
 
-  friend class ImageWriter;
+  // Storage method for the image, the image may be compressed.
+  StorageMode storage_mode_;
+
+  // Data size for the image data excluding the bitmap and the header. For compressed images, this
+  // is the compressed size in the file.
+  uint32_t data_size_;
+
+  friend class linker::ImageWriter;
 };
 
 std::ostream& operator<<(std::ostream& os, const ImageHeader::ImageMethod& policy);
 std::ostream& operator<<(std::ostream& os, const ImageHeader::ImageRoot& policy);
 std::ostream& operator<<(std::ostream& os, const ImageHeader::ImageSections& section);
 std::ostream& operator<<(std::ostream& os, const ImageSection& section);
+std::ostream& operator<<(std::ostream& os, const ImageHeader::StorageMode& mode);
 
 }  // namespace art
 

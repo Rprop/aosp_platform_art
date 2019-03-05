@@ -19,7 +19,7 @@
 #include "gc/heap.h"
 #include "gc/space/space.h"
 #include "partial_mark_sweep.h"
-#include "thread-inl.h"
+#include "thread-current-inl.h"
 
 namespace art {
 namespace gc {
@@ -39,7 +39,7 @@ void PartialMarkSweep::BindBitmaps() {
   for (const auto& space : GetHeap()->GetContinuousSpaces()) {
     if (space->GetGcRetentionPolicy() == space::kGcRetentionPolicyFullCollect) {
       CHECK(space->IsZygoteSpace());
-      CHECK(immune_region_.AddContinuousSpace(space)) << "Failed to add space " << *space;
+      immune_spaces_.AddSpace(space);
     }
   }
 }

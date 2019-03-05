@@ -13,29 +13,73 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+import java.lang.reflect.Method;
 
 public class Main {
+
+  private static int mX = 2;
+  private static int mY = -3;
+
   public static void main(String[] args) {
     System.out.println(foo(3, 4));
+    System.out.println(mulAndIntrinsic());
+    System.out.println(directIntrinsic(-5));
   }
-
-  // CHECK-START: int Main.foo(int, int) GVN (before)
-  // CHECK: Add
-  // CHECK: Add
-  // CHECK: Add
-
-  // CHECK-START: int Main.foo(int, int) GVN (after)
-  // CHECK: Add
-  // CHECK: Add
-  // CHECK-NOT: Add
 
   public static int foo(int x, int y) {
-    int sum1 = x + y;
-    int sum2 = y + x;
-    return sum1 + sum2;
+   try {
+      Class<?> c = Class.forName("Smali");
+      Method m = c.getMethod("foo", int.class, int.class);
+      return (Integer) m.invoke(null, x, y);
+    } catch (Throwable t) {
+      throw new RuntimeException(t);
+    }
   }
 
-  public static long bar(int i) {
-    return i;
+  /// CHECK-START: int Main.mulAndIntrinsic() GVN (before)
+  /// CHECK: StaticFieldGet
+  /// CHECK: StaticFieldGet
+  /// CHECK: Mul
+  /// CHECK: Abs
+  /// CHECK: StaticFieldGet
+  /// CHECK: StaticFieldGet
+  /// CHECK: Mul
+  /// CHECK: Add
+
+  /// CHECK-START: int Main.mulAndIntrinsic() GVN (after)
+  /// CHECK: StaticFieldGet
+  /// CHECK: StaticFieldGet
+  /// CHECK: Mul
+  /// CHECK: Abs
+  /// CHECK-NOT: StaticFieldGet
+  /// CHECK-NOT: StaticFieldGet
+  /// CHECK-NOT: Mul
+  /// CHECK: Add
+
+  public static int mulAndIntrinsic() {
+    // The intermediate call to abs() does not kill
+    // the common subexpression on the multiplication.
+    int mul1 = mX * mY;
+    int abs  = Math.abs(mul1);
+    int mul2 = mY * mX;
+    return abs + mul2;
   }
+
+  /// CHECK-START: int Main.directIntrinsic(int) GVN (before)
+  /// CHECK: Abs
+  /// CHECK: Abs
+  /// CHECK: Add
+
+  /// CHECK-START: int Main.directIntrinsic(int) GVN (after)
+  /// CHECK: Abs
+  /// CHECK-NOT: Abs
+  /// CHECK: Add
+
+  public static int directIntrinsic(int x) {
+    // Here, the two calls to abs() themselves can be replaced with just one.
+    int abs1 = Math.abs(x);
+    int abs2 = Math.abs(x);
+    return abs1 + abs2;
+  }
+
 }

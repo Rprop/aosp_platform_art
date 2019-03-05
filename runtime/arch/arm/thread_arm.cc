@@ -16,16 +16,18 @@
 
 #include "thread.h"
 
+#include <android-base/logging.h>
+
 #include "asm_support_arm.h"
-#include "base/logging.h"
+#include "base/enums.h"
 
 namespace art {
 
 void Thread::InitCpu() {
-  CHECK_EQ(THREAD_FLAGS_OFFSET, ThreadFlagsOffset<4>().Int32Value());
-  CHECK_EQ(THREAD_CARD_TABLE_OFFSET, CardTableOffset<4>().Int32Value());
-  CHECK_EQ(THREAD_EXCEPTION_OFFSET, ExceptionOffset<4>().Int32Value());
-  CHECK_EQ(THREAD_ID_OFFSET, ThinLockIdOffset<4>().Int32Value());
+  CHECK_EQ(THREAD_FLAGS_OFFSET, ThreadFlagsOffset<PointerSize::k32>().Int32Value());
+  CHECK_EQ(THREAD_CARD_TABLE_OFFSET, CardTableOffset<PointerSize::k32>().Int32Value());
+  CHECK_EQ(THREAD_EXCEPTION_OFFSET, ExceptionOffset<PointerSize::k32>().Int32Value());
+  CHECK_EQ(THREAD_ID_OFFSET, ThinLockIdOffset<PointerSize::k32>().Int32Value());
 }
 
 void Thread::CleanupCpu() {

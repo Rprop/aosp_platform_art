@@ -16,155 +16,74 @@
 
 import java.io.BufferedReader;
 import java.io.FileReader;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
+import java.io.InputStreamReader;
 import java.util.Arrays;
 import java.util.Comparator;
 
-public class Main implements Comparator<Main> {
-  // Whether to test local unwinding. Libunwind uses linker info to find executables. As we do
-  // not dlopen at the moment, this doesn't work, so keep it off for now.
-  public final static boolean TEST_LOCAL_UNWINDING = true;
+public class Main extends Base implements Comparator<Main> {
+  // Whether to test local unwinding.
+  private static boolean testLocal;
 
-  // Unwinding another process, modelling debuggerd. This doesn't use the linker, so should work
-  // no matter whether we're using dlopen or not.
-  public final static boolean TEST_REMOTE_UNWINDING = true;
+  // Unwinding another process, modelling debuggerd.
+  private static boolean testRemote;
 
-  private boolean secondary;
-
-  private boolean passed;
-
-  public Main(boolean secondary) {
-      this.secondary = secondary;
-  }
+  // We fork ourself to create the secondary process for remote unwinding.
+  private static boolean secondary;
 
   public static void main(String[] args) throws Exception {
-      boolean secondary = false;
-      if (args.length > 0 && args[args.length - 1].equals("--secondary")) {
-          secondary = true;
-      }
-      new Main(secondary).run();
-  }
-
-  static {
-      System.loadLibrary("arttest");
-  }
-
-  private void run() {
-      if (secondary) {
-          if (!TEST_REMOTE_UNWINDING) {
-              throw new RuntimeException("Should not be running secondary!");
+      System.loadLibrary(args[0]);
+      for (int i = 1; i < args.length; i++) {
+          if (args[i].equals("--test-local")) {
+              testLocal = true;
+          } else if (args[i].equals("--test-remote")) {
+              testRemote = true;
+          } else if (args[i].equals("--secondary")) {
+              secondary = true;
+          } else {
+              System.out.println("Unknown argument: " + args[i]);
+              System.exit(1);
           }
-          runSecondary();
-      } else {
-          runPrimary();
       }
+
+      // Call test() via base class to test unwinding through multidex.
+      new Main().runTest();
   }
 
-  private void runSecondary() {
-      foo();
-      throw new RuntimeException("Didn't expect to get back...");
-  }
-
-  private void runPrimary() {
-      // First do the in-process unwinding.
-      if (TEST_LOCAL_UNWINDING && !foo()) {
-          System.out.println("Unwinding self failed.");
-      }
-
-      if (!TEST_REMOTE_UNWINDING) {
-          // Skip the remote step.
-          return;
-      }
-
-      // Fork the secondary.
-      String[] cmdline = getCmdLine();
-      String[] secCmdLine = new String[cmdline.length + 1];
-      System.arraycopy(cmdline, 0, secCmdLine, 0, cmdline.length);
-      secCmdLine[secCmdLine.length - 1] = "--secondary";
-      Process p = exec(secCmdLine);
-
-      try {
-          int pid = getPid(p);
-          if (pid <= 0) {
-              throw new RuntimeException("Couldn't parse process");
-          }
-
-          // Wait a bit, so the forked process has time to run until its sleep phase.
-          try {
-              Thread.sleep(5000);
-          } catch (Exception e) {
-              throw new RuntimeException(e);
-          }
-
-          if (!unwindOtherProcess(pid)) {
-              System.out.println("Unwinding other process failed.");
-          }
-      } finally {
-          // Kill the forked process if it is not already dead.
-          p.destroy();
-      }
-  }
-
-  private static Process exec(String[] args) {
-      try {
-          return Runtime.getRuntime().exec(args);
-      } catch (Exception exc) {
-          throw new RuntimeException(exc);
-      }
-  }
-
-  private static int getPid(Process p) {
-      // Could do reflection for the private pid field, but String parsing is easier.
-      String s = p.toString();
-      if (s.startsWith("Process[pid=")) {
-          return Integer.parseInt(s.substring("Process[pid=".length(), s.length() - 1));
-      } else {
-          return -1;
-      }
-  }
-
-  // Read /proc/self/cmdline to find the invocation command line (so we can fork another runtime).
-  private static String[] getCmdLine() {
-      try {
-          BufferedReader in = new BufferedReader(new FileReader("/proc/self/cmdline"));
-          String s = in.readLine();
-          in.close();
-          return s.split("\0");
-      } catch (Exception exc) {
-          throw new RuntimeException(exc);
-      }
-  }
-
-  public boolean foo() {
-      // Call bar via Arrays.binarySearch.
-      // This tests that we can unwind from framework code.
+  public void test() {
+      // Call unwind() via Arrays.binarySearch to test unwinding through framework.
       Main[] array = { this, this, this };
       Arrays.binarySearch(array, 0, 3, this /* value */, this /* comparator */);
-      return passed;
   }
 
   public int compare(Main lhs, Main rhs) {
-      passed = bar(secondary);
+      unwind();
       // Returning "equal" ensures that we terminate search
-      // after first item and thus call bar() only once.
+      // after first item and thus call unwind() only once.
       return 0;
   }
 
-  public boolean bar(boolean b) {
-      if (b) {
-          return sleep(2, b, 1.0);
-      } else {
-          return unwindInProcess(1, b);
+  public void unwind() {
+      if (secondary) {
+          sigstop();  // This is helper child process. Stop and wait for unwinding.
+          return;     // Don't run the tests again in the secondary helper process.
+      }
+
+      if (testLocal) {
+          String result = unwindInProcess() ? "PASS" : "FAIL";
+          System.out.println("Unwind in process: " + result);
+      }
+
+      if (testRemote) {
+          // Start a secondary helper process. It will stop itself when it is ready.
+          int pid = startSecondaryProcess();
+          // Wait for the secondary process to stop and then unwind it remotely.
+          String result = unwindOtherProcess(pid) ? "PASS" : "FAIL";
+          System.out.println("Unwind other process: " + result);
       }
   }
 
-  // Native functions. Note: to avoid deduping, they must all have different signatures.
-
-  public native boolean sleep(int i, boolean b, double dummy);
-
-  public native boolean unwindInProcess(int i, boolean b);
-  public native boolean unwindOtherProcess(int pid);
+  public static native int startSecondaryProcess();
+  public static native boolean sigstop();
+  public static native boolean unwindInProcess();
+  public static native boolean unwindOtherProcess(int pid);
 }

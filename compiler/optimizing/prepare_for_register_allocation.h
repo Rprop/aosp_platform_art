@@ -21,6 +21,8 @@
 
 namespace art {
 
+class OptimizingCompilerStats;
+
 /**
  * A simplification pass over the graph before doing register allocation.
  * For example it changes uses of null checks and bounds checks to the original
@@ -28,18 +30,31 @@ namespace art {
  */
 class PrepareForRegisterAllocation : public HGraphDelegateVisitor {
  public:
-  explicit PrepareForRegisterAllocation(HGraph* graph) : HGraphDelegateVisitor(graph) {}
+  explicit PrepareForRegisterAllocation(HGraph* graph,
+                                        OptimizingCompilerStats* stats = nullptr)
+      : HGraphDelegateVisitor(graph, stats) {}
 
   void Run();
 
+  static constexpr const char* kPrepareForRegisterAllocationPassName =
+      "prepare_for_register_allocation";
+
  private:
+  void VisitCheckCast(HCheckCast* check_cast) OVERRIDE;
+  void VisitInstanceOf(HInstanceOf* instance_of) OVERRIDE;
   void VisitNullCheck(HNullCheck* check) OVERRIDE;
   void VisitDivZeroCheck(HDivZeroCheck* check) OVERRIDE;
   void VisitBoundsCheck(HBoundsCheck* check) OVERRIDE;
   void VisitBoundType(HBoundType* bound_type) OVERRIDE;
+  void VisitArraySet(HArraySet* instruction) OVERRIDE;
   void VisitClinitCheck(HClinitCheck* check) OVERRIDE;
   void VisitCondition(HCondition* condition) OVERRIDE;
+  void VisitConstructorFence(HConstructorFence* constructor_fence) OVERRIDE;
   void VisitInvokeStaticOrDirect(HInvokeStaticOrDirect* invoke) OVERRIDE;
+  void VisitDeoptimize(HDeoptimize* deoptimize) OVERRIDE;
+
+  bool CanMoveClinitCheck(HInstruction* input, HInstruction* user) const;
+  bool CanEmitConditionAt(HCondition* condition, HInstruction* user) const;
 
   DISALLOW_COPY_AND_ASSIGN(PrepareForRegisterAllocation);
 };

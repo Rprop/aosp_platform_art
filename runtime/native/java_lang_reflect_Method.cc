@@ -16,47 +16,78 @@
 
 #include "java_lang_reflect_Method.h"
 
+#include "nativehelper/jni_macros.h"
+
 #include "art_method-inl.h"
+#include "base/enums.h"
+#include "class_linker-inl.h"
 #include "class_linker.h"
-#include "jni_internal.h"
+#include "class_root.h"
+#include "dex/dex_file_annotations.h"
+#include "jni/jni_internal.h"
 #include "mirror/class-inl.h"
 #include "mirror/object-inl.h"
 #include "mirror/object_array-inl.h"
+#include "native_util.h"
 #include "reflection.h"
-#include "scoped_fast_native_object_access.h"
+#include "scoped_fast_native_object_access-inl.h"
 #include "well_known_classes.h"
 
 namespace art {
 
+static jobject Method_getDefaultValue(JNIEnv* env, jobject javaMethod) {
+  ScopedFastNativeObjectAccess soa(env);
+  ArtMethod* method = ArtMethod::FromReflectedMethod(soa, javaMethod);
+  if (!method->GetDeclaringClass()->IsAnnotation()) {
+    return nullptr;
+  }
+  return soa.AddLocalReference<jobject>(annotations::GetAnnotationDefaultValue(method));
+}
+
+static jobjectArray Method_getExceptionTypes(JNIEnv* env, jobject javaMethod) {
+  ScopedFastNativeObjectAccess soa(env);
+  ArtMethod* method = ArtMethod::FromReflectedMethod(soa, javaMethod);
+  if (method->GetDeclaringClass()->IsProxyClass()) {
+    ObjPtr<mirror::Class> klass = method->GetDeclaringClass();
+    int throws_index = -1;
+    size_t i = 0;
+    for (const auto& m : klass->GetDeclaredVirtualMethods(kRuntimePointerSize)) {
+      if (&m == method) {
+        throws_index = i;
+        break;
+      }
+      ++i;
+    }
+    CHECK_NE(throws_index, -1);
+    mirror::ObjectArray<mirror::Class>* declared_exceptions =
+        klass->GetProxyThrows()->Get(throws_index);
+    return soa.AddLocalReference<jobjectArray>(declared_exceptions->Clone(soa.Self()));
+  } else {
+    ObjPtr<mirror::ObjectArray<mirror::Class>> result_array =
+        annotations::GetExceptionTypesForMethod(method);
+    if (result_array == nullptr) {
+      // Return an empty array instead of a null pointer
+      ObjPtr<mirror::Class> class_array_class = GetClassRoot<mirror::ObjectArray<mirror::Class>>();
+      DCHECK(class_array_class != nullptr);
+      ObjPtr<mirror::ObjectArray<mirror::Class>> empty_array =
+          mirror::ObjectArray<mirror::Class>::Alloc(soa.Self(), class_array_class, 0);
+      return soa.AddLocalReference<jobjectArray>(empty_array);
+    } else {
+      return soa.AddLocalReference<jobjectArray>(result_array);
+    }
+  }
+}
+
 static jobject Method_invoke(JNIEnv* env, jobject javaMethod, jobject javaReceiver,
-                             jobject javaArgs) {
+                             jobjectArray javaArgs) {
   ScopedFastNativeObjectAccess soa(env);
   return InvokeMethod(soa, javaMethod, javaReceiver, javaArgs);
 }
 
-static jobject Method_getExceptionTypesNative(JNIEnv* env, jobject javaMethod) {
-  ScopedFastNativeObjectAccess soa(env);
-  ArtMethod* proxy_method = ArtMethod::FromReflectedMethod(soa, javaMethod);
-  CHECK(proxy_method->GetDeclaringClass()->IsProxyClass());
-  mirror::Class* proxy_class = proxy_method->GetDeclaringClass();
-  int throws_index = -1;
-  size_t i = 0;
-  for (const auto& m : proxy_class->GetVirtualMethods(sizeof(void*))) {
-    if (&m == proxy_method) {
-      throws_index = i;
-      break;
-    }
-    ++i;
-  }
-  CHECK_NE(throws_index, -1);
-  mirror::ObjectArray<mirror::Class>* declared_exceptions =
-          proxy_class->GetThrows()->Get(throws_index);
-  return soa.AddLocalReference<jobject>(declared_exceptions->Clone(soa.Self()));
-}
-
 static JNINativeMethod gMethods[] = {
-  NATIVE_METHOD(Method, invoke, "!(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"),
-  NATIVE_METHOD(Method, getExceptionTypesNative, "!()[Ljava/lang/Class;"),
+  FAST_NATIVE_METHOD(Method, getDefaultValue, "()Ljava/lang/Object;"),
+  FAST_NATIVE_METHOD(Method, getExceptionTypes, "()[Ljava/lang/Class;"),
+  FAST_NATIVE_METHOD(Method, invoke, "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"),
 };
 
 void register_java_lang_reflect_Method(JNIEnv* env) {

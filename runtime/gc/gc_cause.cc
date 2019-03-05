@@ -15,8 +15,11 @@
  */
 
 #include "gc_cause.h"
-#include "globals.h"
-#include "base/logging.h"
+
+#include <android-base/logging.h>
+
+#include "base/globals.h"
+#include "base/macros.h"
 
 #include <ostream>
 
@@ -25,6 +28,7 @@ namespace gc {
 
 const char* PrettyCause(GcCause cause) {
   switch (cause) {
+    case kGcCauseNone: return "None";
     case kGcCauseForAlloc: return "Alloc";
     case kGcCauseBackground: return "Background";
     case kGcCauseExplicit: return "Explicit";
@@ -33,10 +37,18 @@ const char* PrettyCause(GcCause cause) {
     case kGcCauseDisableMovingGc: return "DisableMovingGc";
     case kGcCauseHomogeneousSpaceCompact: return "HomogeneousSpaceCompact";
     case kGcCauseTrim: return "HeapTrim";
-    default:
-      LOG(FATAL) << "Unreachable";
-      UNREACHABLE();
+    case kGcCauseInstrumentation: return "Instrumentation";
+    case kGcCauseAddRemoveAppImageSpace: return "AddRemoveAppImageSpace";
+    case kGcCauseDebugger: return "Debugger";
+    case kGcCauseClassLinker: return "ClassLinker";
+    case kGcCauseJitCodeCache: return "JitCodeCache";
+    case kGcCauseAddRemoveSystemWeakHolder: return "SystemWeakHolder";
+    case kGcCauseHprof: return "Hprof";
+    case kGcCauseGetObjectsAllocated: return "ObjectsAllocated";
+    case kGcCauseProfileSaver: return "ProfileSaver";
   }
+  LOG(FATAL) << "Unreachable";
+  UNREACHABLE();
 }
 
 std::ostream& operator<<(std::ostream& os, const GcCause& gc_cause) {

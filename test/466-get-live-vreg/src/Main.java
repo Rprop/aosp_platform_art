@@ -18,9 +18,9 @@ public class Main {
   public Main() {
   }
 
-  static int testLiveArgument(int arg) {
+  static int $noinline$testLiveArgument(int arg1, Integer arg2) {
     doStaticNativeCallLiveVreg();
-    return arg;
+    return arg1 + arg2.intValue();
   }
 
   static void moveArgToCalleeSave() {
@@ -31,7 +31,7 @@ public class Main {
     }
   }
 
-  static void testIntervalHole(int arg, boolean test) {
+  static void $noinline$testIntervalHole(int arg, boolean test) {
     // Move the argument to callee save to ensure it is in
     // a readable register.
     moveArgToCalleeSave();
@@ -44,27 +44,54 @@ public class Main {
       // The environment use of `arg` should not make it live.
       doStaticNativeCallLiveVreg();
     }
+    if (staticField1 == 2) {
+      throw new Error("");
+    }
   }
 
   static native void doStaticNativeCallLiveVreg();
 
-  static {
-    System.loadLibrary("arttest");
-  }
-
   public static void main(String[] args) {
-    if (testLiveArgument(42) != 42) {
-      throw new Error("Expected 42");
+    System.loadLibrary(args[0]);
+    if ($noinline$testLiveArgument(staticField3, Integer.valueOf(1)) != staticField3 + 1) {
+      throw new Error("Expected " + staticField3 + 1);
     }
 
-    if (testLiveArgument(42) != 42) {
-      throw new Error("Expected 42");
+    if ($noinline$testLiveArgument(staticField3,Integer.valueOf(1)) != staticField3 + 1) {
+      throw new Error("Expected " + staticField3 + 1);
     }
 
-    testIntervalHole(1, true);
-    testIntervalHole(1, false);
+    testWrapperIntervalHole(1, true);
+    testWrapperIntervalHole(1, false);
+
+    $noinline$testCodeSinking(1);
   }
+
+  // Wrapper method to avoid inlining, which affects liveness
+  // of dex registers.
+  static void testWrapperIntervalHole(int arg, boolean test) {
+    try {
+      Thread.sleep(0);
+      $noinline$testIntervalHole(arg, test);
+    } catch (Exception e) {
+      throw new Error(e);
+    }
+  }
+
+  // The value of dex register which originally holded "Object[] o = new Object[1];" will not be
+  // live at the call to doStaticNativeCallLiveVreg after code sinking optimizizaion.
+  static void $noinline$testCodeSinking(int x) {
+    Object[] o = new Object[1];
+    o[0] = o;
+    doStaticNativeCallLiveVreg();
+    if (doThrow) {
+      throw new Error(o.toString());
+    }
+  }
+
+  static boolean doThrow;
 
   static int staticField1;
   static int staticField2;
+  static int staticField3 = 42;
 }

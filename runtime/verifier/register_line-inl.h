@@ -19,11 +19,17 @@
 
 #include "register_line.h"
 
+#include "base/logging.h"  // For VLOG.
+#include "debug_print.h"
 #include "method_verifier.h"
 #include "reg_type_cache-inl.h"
 
 namespace art {
 namespace verifier {
+
+// Should we dump a warning on failures to verify balanced locking? That would be an indication to
+// developers that their code will be slow.
+static constexpr bool kDumpLockFailures = true;
 
 inline const RegType& RegisterLine::GetRegisterType(MethodVerifier* verifier, uint32_t vsrc) const {
   // The register index was validated during the static pass, so we don't need to check it here.
@@ -31,6 +37,7 @@ inline const RegType& RegisterLine::GetRegisterType(MethodVerifier* verifier, ui
   return verifier->GetRegTypeCache()->GetFromId(line_[vsrc]);
 }
 
+template <LockOp kLockOp>
 inline bool RegisterLine::SetRegisterType(MethodVerifier* verifier, uint32_t vdst,
                                           const RegType& new_type) {
   DCHECK_LT(vdst, num_regs_);
@@ -43,8 +50,16 @@ inline bool RegisterLine::SetRegisterType(MethodVerifier* verifier, uint32_t vds
     //       as they are not accessed, and our backends can handle this nowadays.
     line_[vdst] = new_type.GetId();
   }
-  // Clear the monitor entry bits for this register.
-  ClearAllRegToLockDepths(vdst);
+  switch (kLockOp) {
+    case LockOp::kClear:
+      // Clear the monitor entry bits for this register.
+      ClearAllRegToLockDepths(vdst);
+      break;
+    case LockOp::kKeep:
+      // Should only be doing this with reference types.
+      DCHECK(new_type.IsReferenceTypes());
+      break;
+  }
   return true;
 }
 
@@ -89,7 +104,7 @@ inline void RegisterLine::CopyRegister1(MethodVerifier* verifier, uint32_t vdst,
                                  TypeCategory cat) {
   DCHECK(cat == kTypeCategory1nr || cat == kTypeCategoryRef);
   const RegType& type = GetRegisterType(verifier, vsrc);
-  if (!SetRegisterType(verifier, vdst, type)) {
+  if (!SetRegisterType<LockOp::kClear>(verifier, vdst, type)) {
     return;
   }
   if (!type.IsConflict() &&                                  // Allow conflicts to be copied around.
@@ -114,25 +129,17 @@ inline void RegisterLine::CopyRegister2(MethodVerifier* verifier, uint32_t vdst,
   }
 }
 
-inline size_t RegisterLine::GetMaxNonZeroReferenceReg(MethodVerifier* verifier,
-                                                      size_t max_ref_reg) const {
-  size_t i = static_cast<int>(max_ref_reg) < 0 ? 0 : max_ref_reg;
-  for (; i < num_regs_; i++) {
-    if (GetRegisterType(verifier, i).IsNonZeroReferenceTypes()) {
-      max_ref_reg = i;
-    }
-  }
-  return max_ref_reg;
-}
-
 inline bool RegisterLine::VerifyRegisterType(MethodVerifier* verifier, uint32_t vsrc,
                                              const RegType& check_type) {
   // Verify the src register type against the check type refining the type of the register
   const RegType& src_type = GetRegisterType(verifier, vsrc);
-  if (UNLIKELY(!check_type.IsAssignableFrom(src_type))) {
+  if (UNLIKELY(!check_type.IsAssignableFrom(src_type, verifier))) {
     enum VerifyError fail_type;
     if (!check_type.IsNonZeroReferenceTypes() || !src_type.IsNonZeroReferenceTypes()) {
       // Hard fail if one of the types is primitive, since they are concretely known.
+      fail_type = VERIFY_ERROR_BAD_CLASS_HARD;
+    } else if (check_type.IsUninitializedTypes() || src_type.IsUninitializedTypes()) {
+      // Hard fail for uninitialized types, which don't match anything but themselves.
       fail_type = VERIFY_ERROR_BAD_CLASS_HARD;
     } else if (check_type.IsUnresolvedTypes() || src_type.IsUnresolvedTypes()) {
       fail_type = VERIFY_ERROR_NO_CLASS;
@@ -141,6 +148,14 @@ inline bool RegisterLine::VerifyRegisterType(MethodVerifier* verifier, uint32_t 
     }
     verifier->Fail(fail_type) << "register v" << vsrc << " has type "
                                << src_type << " but expected " << check_type;
+    if (check_type.IsNonZeroReferenceTypes() &&
+        !check_type.IsUnresolvedTypes() &&
+        check_type.HasClass() &&
+        src_type.IsNonZeroReferenceTypes() &&
+        !src_type.IsUnresolvedTypes() &&
+        src_type.HasClass()) {
+      DumpB77342775DebugData(check_type.GetClass(), src_type.GetClass());
+    }
     return false;
   }
   if (check_type.IsLowHalf()) {
@@ -158,12 +173,60 @@ inline bool RegisterLine::VerifyRegisterType(MethodVerifier* verifier, uint32_t 
   return true;
 }
 
-inline bool RegisterLine::VerifyMonitorStackEmpty(MethodVerifier* verifier) const {
+inline void RegisterLine::VerifyMonitorStackEmpty(MethodVerifier* verifier) const {
   if (MonitorStackDepth() != 0) {
-    verifier->Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "expected empty monitor stack";
-    return false;
+    verifier->Fail(VERIFY_ERROR_LOCKING);
+    if (kDumpLockFailures) {
+      VLOG(verifier) << "expected empty monitor stack in "
+                     << verifier->GetMethodReference().PrettyMethod();
+    }
+  }
+}
+
+inline size_t RegisterLine::ComputeSize(size_t num_regs) {
+  return OFFSETOF_MEMBER(RegisterLine, line_) + num_regs * sizeof(uint16_t);
+}
+
+inline RegisterLine* RegisterLine::Create(size_t num_regs, MethodVerifier* verifier) {
+  void* memory = verifier->GetScopedAllocator().Alloc(ComputeSize(num_regs));
+  return new (memory) RegisterLine(num_regs, verifier);
+}
+
+inline RegisterLine::RegisterLine(size_t num_regs, MethodVerifier* verifier)
+    : num_regs_(num_regs),
+      monitors_(verifier->GetScopedAllocator().Adapter(kArenaAllocVerifier)),
+      reg_to_lock_depths_(std::less<uint32_t>(),
+                          verifier->GetScopedAllocator().Adapter(kArenaAllocVerifier)),
+      this_initialized_(false) {
+  std::uninitialized_fill_n(line_, num_regs_, 0u);
+  SetResultTypeToUnknown(verifier);
+}
+
+inline void RegisterLine::ClearRegToLockDepth(size_t reg, size_t depth) {
+  CHECK_LT(depth, 32u);
+  DCHECK(IsSetLockDepth(reg, depth));
+  auto it = reg_to_lock_depths_.find(reg);
+  DCHECK(it != reg_to_lock_depths_.end());
+  uint32_t depths = it->second ^ (1 << depth);
+  if (depths != 0) {
+    it->second = depths;
   } else {
-    return true;
+    reg_to_lock_depths_.erase(it);
+  }
+  // Need to unlock every register at the same lock depth. These are aliased locks.
+  uint32_t mask = 1 << depth;
+  for (auto& pair : reg_to_lock_depths_) {
+    if ((pair.second & mask) != 0) {
+      VLOG(verifier) << "Also unlocking " << pair.first;
+      pair.second ^= mask;
+    }
+  }
+}
+
+inline void RegisterLineArenaDelete::operator()(RegisterLine* ptr) const {
+  if (ptr != nullptr) {
+    ptr->~RegisterLine();
+    ProtectMemory(ptr, RegisterLine::ComputeSize(ptr->NumRegs()));
   }
 }
 

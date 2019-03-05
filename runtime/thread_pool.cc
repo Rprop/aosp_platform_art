@@ -16,13 +16,26 @@
 
 #include "thread_pool.h"
 
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/time.h>
+
+#include <pthread.h>
+
+#include <android-base/logging.h>
+#include <android-base/stringprintf.h>
+
+#include "base/bit_utils.h"
 #include "base/casts.h"
 #include "base/stl_util.h"
 #include "base/time_utils.h"
+#include "base/utils.h"
 #include "runtime.h"
-#include "thread-inl.h"
+#include "thread-current-inl.h"
 
 namespace art {
+
+using android::base::StringPrintf;
 
 static constexpr bool kMeasureWaitTime = false;
 
@@ -30,10 +43,18 @@ ThreadPoolWorker::ThreadPoolWorker(ThreadPool* thread_pool, const std::string& n
                                    size_t stack_size)
     : thread_pool_(thread_pool),
       name_(name) {
+  // Add an inaccessible page to catch stack overflow.
+  stack_size += kPageSize;
   std::string error_msg;
   stack_.reset(MemMap::MapAnonymous(name.c_str(), nullptr, stack_size, PROT_READ | PROT_WRITE,
                                     false, false, &error_msg));
   CHECK(stack_.get() != nullptr) << error_msg;
+  CHECK_ALIGNED(stack_->Begin(), kPageSize);
+  CheckedCall(mprotect,
+              "mprotect bottom page of thread pool worker stack",
+              stack_->Begin(),
+              kPageSize,
+              PROT_NONE);
   const char* reason = "new thread pool worker thread";
   pthread_attr_t attr;
   CHECK_PTHREAD_CALL(pthread_attr_init, (&attr), reason);
@@ -44,6 +65,19 @@ ThreadPoolWorker::ThreadPoolWorker(ThreadPool* thread_pool, const std::string& n
 
 ThreadPoolWorker::~ThreadPoolWorker() {
   CHECK_PTHREAD_CALL(pthread_join, (pthread_, nullptr), "thread pool worker shutdown");
+}
+
+void ThreadPoolWorker::SetPthreadPriority(int priority) {
+  CHECK_GE(priority, PRIO_MIN);
+  CHECK_LE(priority, PRIO_MAX);
+#if defined(ART_TARGET_ANDROID)
+  int result = setpriority(PRIO_PROCESS, pthread_gettid_np(pthread_), priority);
+  if (result != 0) {
+    PLOG(ERROR) << "Failed to setpriority to :" << priority;
+  }
+#else
+  UNUSED(priority);
+#endif
 }
 
 void ThreadPoolWorker::Run() {
@@ -59,9 +93,20 @@ void ThreadPoolWorker::Run() {
 void* ThreadPoolWorker::Callback(void* arg) {
   ThreadPoolWorker* worker = reinterpret_cast<ThreadPoolWorker*>(arg);
   Runtime* runtime = Runtime::Current();
-  CHECK(runtime->AttachCurrentThread(worker->name_.c_str(), true, nullptr, false));
+  CHECK(runtime->AttachCurrentThread(worker->name_.c_str(),
+                                     true,
+                                     nullptr,
+                                     worker->thread_pool_->create_peers_));
+  worker->thread_ = Thread::Current();
+  // Thread pool workers cannot call into java.
+  worker->thread_->SetCanCallIntoJava(false);
+  // Thread pool workers should not be getting paused by user-code.
+  worker->thread_->SetCanBeSuspendedByUserCode(false);
   // Do work until its time to shut down.
   worker->Run();
+  // Thread pool worker is finished. We want to allow suspension during shutdown.
+  worker->thread_->SetCanBeSuspendedByUserCode(true);
+  // Thread shuts down.
   runtime->DetachCurrentThread();
   return nullptr;
 }
@@ -75,7 +120,12 @@ void ThreadPool::AddTask(Thread* self, Task* task) {
   }
 }
 
-ThreadPool::ThreadPool(const char* name, size_t num_threads)
+void ThreadPool::RemoveAllTasks(Thread* self) {
+  MutexLock mu(self, task_queue_lock_);
+  tasks_.clear();
+}
+
+ThreadPool::ThreadPool(const char* name, size_t num_threads, bool create_peers)
   : name_(name),
     task_queue_lock_("task queue lock"),
     task_queue_condition_("task queue condition", task_queue_lock_),
@@ -87,12 +137,14 @@ ThreadPool::ThreadPool(const char* name, size_t num_threads)
     total_wait_time_(0),
     // Add one since the caller of constructor waits on the barrier too.
     creation_barier_(num_threads + 1),
-    max_active_workers_(num_threads) {
+    max_active_workers_(num_threads),
+    create_peers_(create_peers) {
   Thread* self = Thread::Current();
   while (GetThreadCount() < num_threads) {
     const std::string worker_name = StringPrintf("%s worker thread %zu", name_.c_str(),
                                                  GetThreadCount());
-    threads_.push_back(new ThreadPoolWorker(this, worker_name, ThreadPoolWorker::kDefaultStackSize));
+    threads_.push_back(
+        new ThreadPoolWorker(this, worker_name, ThreadPoolWorker::kDefaultStackSize));
   }
   // Wait for all of the threads to attach.
   creation_barier_.Wait(self);
@@ -146,7 +198,7 @@ Task* ThreadPool::GetTask(Thread* self) {
     }
 
     ++waiting_count_;
-    if (waiting_count_ == GetThreadCount() && tasks_.empty()) {
+    if (waiting_count_ == GetThreadCount() && !HasOutstandingTasks()) {
       // We may be done, lets broadcast to the completion condition.
       completion_condition_.Broadcast(self);
     }
@@ -169,7 +221,7 @@ Task* ThreadPool::TryGetTask(Thread* self) {
 }
 
 Task* ThreadPool::TryGetTaskLocked() {
-  if (started_ && !tasks_.empty()) {
+  if (HasOutstandingTasks()) {
     Task* task = tasks_.front();
     tasks_.pop_front();
     return task;
@@ -179,6 +231,7 @@ Task* ThreadPool::TryGetTaskLocked() {
 
 void ThreadPool::Wait(Thread* self, bool do_work, bool may_hold_locks) {
   if (do_work) {
+    CHECK(!create_peers_);
     Task* task = nullptr;
     while ((task = TryGetTask(self)) != nullptr) {
       task->Run(self);
@@ -187,7 +240,7 @@ void ThreadPool::Wait(Thread* self, bool do_work, bool may_hold_locks) {
   }
   // Wait until each thread is waiting and the task list is empty.
   MutexLock mu(self, task_queue_lock_);
-  while (!shutting_down_ && (waiting_count_ != GetThreadCount() || !tasks_.empty())) {
+  while (!shutting_down_ && (waiting_count_ != GetThreadCount() || HasOutstandingTasks())) {
     if (!may_hold_locks) {
       completion_condition_.Wait(self);
     } else {
@@ -201,112 +254,10 @@ size_t ThreadPool::GetTaskCount(Thread* self) {
   return tasks_.size();
 }
 
-WorkStealingWorker::WorkStealingWorker(ThreadPool* thread_pool, const std::string& name,
-                                       size_t stack_size)
-    : ThreadPoolWorker(thread_pool, name, stack_size), task_(nullptr) {}
-
-void WorkStealingWorker::Run() {
-  Thread* self = Thread::Current();
-  Task* task = nullptr;
-  WorkStealingThreadPool* thread_pool = down_cast<WorkStealingThreadPool*>(thread_pool_);
-  while ((task = thread_pool_->GetTask(self)) != nullptr) {
-    WorkStealingTask* stealing_task = down_cast<WorkStealingTask*>(task);
-
-    {
-      CHECK(task_ == nullptr);
-      MutexLock mu(self, thread_pool->work_steal_lock_);
-      // Register that we are running the task
-      ++stealing_task->ref_count_;
-      task_ = stealing_task;
-    }
-    stealing_task->Run(self);
-    // Mark ourselves as not running a task so that nobody tries to steal from us.
-    // There is a race condition that someone starts stealing from us at this point. This is okay
-    // due to the reference counting.
-    task_ = nullptr;
-
-    bool finalize;
-
-    // Steal work from tasks until there is none left to steal. Note: There is a race, but
-    // all that happens when the race occurs is that we steal some work instead of processing a
-    // task from the queue.
-    while (thread_pool->GetTaskCount(self) == 0) {
-      WorkStealingTask* steal_from_task  = nullptr;
-
-      {
-        MutexLock mu(self, thread_pool->work_steal_lock_);
-        // Try finding a task to steal from.
-        steal_from_task = thread_pool->FindTaskToStealFrom();
-        if (steal_from_task != nullptr) {
-          CHECK_NE(stealing_task, steal_from_task)
-              << "Attempting to steal from completed self task";
-          steal_from_task->ref_count_++;
-        } else {
-          break;
-        }
-      }
-
-      if (steal_from_task != nullptr) {
-        // Task which completed earlier is going to steal some work.
-        stealing_task->StealFrom(self, steal_from_task);
-
-        {
-          // We are done stealing from the task, lets decrement its reference count.
-          MutexLock mu(self, thread_pool->work_steal_lock_);
-          finalize = !--steal_from_task->ref_count_;
-        }
-
-        if (finalize) {
-          steal_from_task->Finalize();
-        }
-      }
-    }
-
-    {
-      MutexLock mu(self, thread_pool->work_steal_lock_);
-      // If nobody is still referencing task_ we can finalize it.
-      finalize = !--stealing_task->ref_count_;
-    }
-
-    if (finalize) {
-      stealing_task->Finalize();
-    }
+void ThreadPool::SetPthreadPriority(int priority) {
+  for (ThreadPoolWorker* worker : threads_) {
+    worker->SetPthreadPriority(priority);
   }
 }
-
-WorkStealingWorker::~WorkStealingWorker() {}
-
-WorkStealingThreadPool::WorkStealingThreadPool(const char* name, size_t num_threads)
-    : ThreadPool(name, 0),
-      work_steal_lock_("work stealing lock"),
-      steal_index_(0) {
-  while (GetThreadCount() < num_threads) {
-    const std::string worker_name = StringPrintf("Work stealing worker %zu", GetThreadCount());
-    threads_.push_back(new WorkStealingWorker(this, worker_name,
-                                              ThreadPoolWorker::kDefaultStackSize));
-  }
-}
-
-WorkStealingTask* WorkStealingThreadPool::FindTaskToStealFrom() {
-  const size_t thread_count = GetThreadCount();
-  for (size_t i = 0; i < thread_count; ++i) {
-    // TODO: Use CAS instead of lock.
-    ++steal_index_;
-    if (steal_index_ >= thread_count) {
-      steal_index_-= thread_count;
-    }
-
-    WorkStealingWorker* worker = down_cast<WorkStealingWorker*>(threads_[steal_index_]);
-    WorkStealingTask* task = worker->task_;
-    if (task) {
-      // Not null, we can probably steal from this worker.
-      return task;
-    }
-  }
-  // Couldn't find something to steal.
-  return nullptr;
-}
-
-WorkStealingThreadPool::~WorkStealingThreadPool() {}
 
 }  // namespace art

@@ -17,17 +17,18 @@
 #ifndef ART_RUNTIME_GC_REFERENCE_PROCESSOR_H_
 #define ART_RUNTIME_GC_REFERENCE_PROCESSOR_H_
 
+#include "base/globals.h"
 #include "base/mutex.h"
-#include "globals.h"
 #include "jni.h"
-#include "object_callbacks.h"
 #include "reference_queue.h"
 
 namespace art {
 
+class IsMarkedVisitor;
 class TimingLogger;
 
 namespace mirror {
+class Class;
 class FinalizerReference;
 class Object;
 class Reference;
@@ -35,67 +36,64 @@ class Reference;
 
 namespace gc {
 
+namespace collector {
+class GarbageCollector;
+}  // namespace collector
+
 class Heap;
 
-// Used to process java.lang.References concurrently or paused.
+// Used to process java.lang.ref.Reference instances concurrently or paused.
 class ReferenceProcessor {
  public:
-  explicit ReferenceProcessor();
-  static bool PreserveSoftReferenceCallback(mirror::HeapReference<mirror::Object>* obj, void* arg)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  void ProcessReferences(bool concurrent, TimingLogger* timings, bool clear_soft_references,
-                         IsHeapReferenceMarkedCallback* is_marked_callback,
-                         MarkObjectCallback* mark_object_callback,
-                         ProcessMarkStackCallback* process_mark_stack_callback, void* arg)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
-      EXCLUSIVE_LOCKS_REQUIRED(Locks::heap_bitmap_lock_)
-      LOCKS_EXCLUDED(Locks::reference_processor_lock_);
+  ReferenceProcessor();
+  void ProcessReferences(bool concurrent,
+                         TimingLogger* timings,
+                         bool clear_soft_references,
+                         gc::collector::GarbageCollector* collector)
+      REQUIRES_SHARED(Locks::mutator_lock_)
+      REQUIRES(Locks::heap_bitmap_lock_)
+      REQUIRES(!Locks::reference_processor_lock_);
   // The slow path bool is contained in the reference class object, can only be set once
   // Only allow setting this with mutators suspended so that we can avoid using a lock in the
   // GetReferent fast path as an optimization.
-  void EnableSlowPath() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void EnableSlowPath() REQUIRES_SHARED(Locks::mutator_lock_);
+  void BroadcastForSlowPath(Thread* self);
   // Decode the referent, may block if references are being processed.
-  mirror::Object* GetReferent(Thread* self, mirror::Reference* reference)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) LOCKS_EXCLUDED(Locks::reference_processor_lock_);
-  void EnqueueClearedReferences(Thread* self) LOCKS_EXCLUDED(Locks::mutator_lock_);
-  void DelayReferenceReferent(mirror::Class* klass, mirror::Reference* ref,
-                              IsHeapReferenceMarkedCallback* is_marked_callback, void* arg)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  void UpdateRoots(IsMarkedCallback* callback, void* arg)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_, Locks::heap_bitmap_lock_);
+  ObjPtr<mirror::Object> GetReferent(Thread* self, ObjPtr<mirror::Reference> reference)
+      REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Locks::reference_processor_lock_);
+  void EnqueueClearedReferences(Thread* self) REQUIRES(!Locks::mutator_lock_);
+  void DelayReferenceReferent(ObjPtr<mirror::Class> klass,
+                              ObjPtr<mirror::Reference> ref,
+                              collector::GarbageCollector* collector)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+  void UpdateRoots(IsMarkedVisitor* visitor)
+      REQUIRES_SHARED(Locks::mutator_lock_, Locks::heap_bitmap_lock_);
   // Make a circular list with reference if it is not enqueued. Uses the finalizer queue lock.
-  bool MakeCircularListIfUnenqueued(mirror::FinalizerReference* reference)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
-      LOCKS_EXCLUDED(Locks::reference_processor_lock_,
-                     Locks::reference_queue_finalizer_references_lock_);
+  bool MakeCircularListIfUnenqueued(ObjPtr<mirror::FinalizerReference> reference)
+      REQUIRES_SHARED(Locks::mutator_lock_)
+      REQUIRES(!Locks::reference_processor_lock_,
+               !Locks::reference_queue_finalizer_references_lock_);
+  void ClearReferent(ObjPtr<mirror::Reference> ref)
+      REQUIRES_SHARED(Locks::mutator_lock_)
+      REQUIRES(!Locks::reference_processor_lock_);
 
  private:
-  class ProcessReferencesArgs {
-   public:
-    ProcessReferencesArgs(IsHeapReferenceMarkedCallback* is_marked_callback,
-                          MarkObjectCallback* mark_callback, void* arg)
-        : is_marked_callback_(is_marked_callback), mark_callback_(mark_callback), arg_(arg) {
-    }
-
-    // The is marked callback is null when the args aren't set up.
-    IsHeapReferenceMarkedCallback* is_marked_callback_;
-    MarkObjectCallback* mark_callback_;
-    void* arg_;
-
-   private:
-    DISALLOW_IMPLICIT_CONSTRUCTORS(ProcessReferencesArgs);
-  };
-  bool SlowPathEnabled() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  bool SlowPathEnabled() REQUIRES_SHARED(Locks::mutator_lock_);
   // Called by ProcessReferences.
-  void DisableSlowPath(Thread* self) EXCLUSIVE_LOCKS_REQUIRED(Locks::reference_processor_lock_)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void DisableSlowPath(Thread* self) REQUIRES(Locks::reference_processor_lock_)
+      REQUIRES_SHARED(Locks::mutator_lock_);
   // If we are preserving references it means that some dead objects may become live, we use start
   // and stop preserving to block mutators using GetReferrent from getting access to these
   // referents.
-  void StartPreservingReferences(Thread* self) LOCKS_EXCLUDED(Locks::reference_processor_lock_);
-  void StopPreservingReferences(Thread* self) LOCKS_EXCLUDED(Locks::reference_processor_lock_);
-  // Process args, used by the GetReferent to return referents which are already marked.
-  ProcessReferencesArgs process_references_args_ GUARDED_BY(Locks::reference_processor_lock_);
+  void StartPreservingReferences(Thread* self) REQUIRES(!Locks::reference_processor_lock_);
+  void StopPreservingReferences(Thread* self) REQUIRES(!Locks::reference_processor_lock_);
+  // Wait until reference processing is done.
+  void WaitUntilDoneProcessingReferences(Thread* self)
+      REQUIRES_SHARED(Locks::mutator_lock_)
+      REQUIRES(Locks::reference_processor_lock_);
+  // Collector which is clearing references, used by the GetReferent to return referents which are
+  // already marked.
+  collector::GarbageCollector* collector_ GUARDED_BY(Locks::reference_processor_lock_);
   // Boolean for whether or not we are preserving references (either soft references or finalizers).
   // If this is true, then we cannot return a referent (see comment in GetReferent).
   bool preserving_references_ GUARDED_BY(Locks::reference_processor_lock_);

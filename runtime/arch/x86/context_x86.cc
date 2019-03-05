@@ -16,8 +16,9 @@
 
 #include "context_x86.h"
 
-#include "art_method-inl.h"
 #include "base/bit_utils.h"
+#include "base/bit_utils_iterator.h"
+#include "base/memory_tool.h"
 #include "quick/quick_method_frame_info.h"
 
 namespace art {
@@ -29,14 +30,14 @@ void X86Context::Reset() {
   std::fill_n(gprs_, arraysize(gprs_), nullptr);
   std::fill_n(fprs_, arraysize(fprs_), nullptr);
   gprs_[ESP] = &esp_;
+  gprs_[EAX] = &arg0_;
   // Initialize registers with easy to spot debug values.
   esp_ = X86Context::kBadGprBase + ESP;
   eip_ = X86Context::kBadGprBase + kNumberOfCpuRegisters;
+  arg0_ = 0;
 }
 
-void X86Context::FillCalleeSaves(const StackVisitor& fr) {
-  ArtMethod* method = fr.GetMethod();
-  const QuickMethodFrameInfo frame_info = method->GetQuickFrameInfo();
+void X86Context::FillCalleeSaves(uint8_t* frame, const QuickMethodFrameInfo& frame_info) {
   int spill_pos = 0;
 
   // Core registers come first, from the highest down to the lowest.
@@ -44,7 +45,7 @@ void X86Context::FillCalleeSaves(const StackVisitor& fr) {
       frame_info.CoreSpillMask() & ~(static_cast<uint32_t>(-1) << kNumberOfCpuRegisters);
   DCHECK_EQ(1, POPCOUNT(frame_info.CoreSpillMask() & ~core_regs));  // Return address spill.
   for (uint32_t core_reg : HighToLowBits(core_regs)) {
-    gprs_[core_reg] = fr.CalleeSaveAddress(spill_pos, frame_info.FrameSizeInBytes());
+    gprs_[core_reg] = CalleeSaveAddress(frame, spill_pos, frame_info.FrameSizeInBytes());
     ++spill_pos;
   }
   DCHECK_EQ(spill_pos, POPCOUNT(frame_info.CoreSpillMask()) - 1);
@@ -55,9 +56,9 @@ void X86Context::FillCalleeSaves(const StackVisitor& fr) {
   for (uint32_t fp_reg : HighToLowBits(fp_regs)) {
     // Two void* per XMM register.
     fprs_[2 * fp_reg] = reinterpret_cast<uint32_t*>(
-        fr.CalleeSaveAddress(spill_pos + 1, frame_info.FrameSizeInBytes()));
+        CalleeSaveAddress(frame, spill_pos + 1, frame_info.FrameSizeInBytes()));
     fprs_[2 * fp_reg + 1] = reinterpret_cast<uint32_t*>(
-        fr.CalleeSaveAddress(spill_pos, frame_info.FrameSizeInBytes()));
+        CalleeSaveAddress(frame, spill_pos, frame_info.FrameSizeInBytes()));
     spill_pos += 2;
   }
   DCHECK_EQ(spill_pos,
@@ -103,6 +104,7 @@ void X86Context::DoLongJump() {
   uintptr_t esp = gprs[kNumberOfCpuRegisters - ESP - 1] - sizeof(intptr_t);
   gprs[kNumberOfCpuRegisters] = esp;
   *(reinterpret_cast<uintptr_t*>(esp)) = eip_;
+  MEMORY_TOOL_HANDLE_NO_RETURN;
   __asm__ __volatile__(
       "movl %1, %%ebx\n\t"          // Address base of FPRs.
       "movsd 0(%%ebx), %%xmm0\n\t"  // Load up XMM0-XMM7.

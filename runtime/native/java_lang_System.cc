@@ -16,15 +16,18 @@
 
 #include "java_lang_System.h"
 
+#include "nativehelper/jni_macros.h"
+
 #include "common_throws.h"
 #include "gc/accounting/card_table-inl.h"
-#include "jni_internal.h"
+#include "jni/jni_internal.h"
 #include "mirror/array.h"
-#include "mirror/class.h"
 #include "mirror/class-inl.h"
+#include "mirror/class.h"
 #include "mirror/object-inl.h"
 #include "mirror/object_array-inl.h"
-#include "scoped_fast_native_object_access.h"
+#include "native_util.h"
+#include "scoped_fast_native_object_access-inl.h"
 
 namespace art {
 
@@ -35,9 +38,10 @@ namespace art {
  * References are never torn regardless of the number of bits used to represent them.
  */
 
-static void ThrowArrayStoreException_NotAnArray(const char* identifier, mirror::Object* array)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  std::string actualType(PrettyTypeOf(array));
+static void ThrowArrayStoreException_NotAnArray(const char* identifier,
+                                                ObjPtr<mirror::Object> array)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  std::string actualType(mirror::Object::PrettyTypeOf(array));
   Thread* self = Thread::Current();
   self->ThrowNewExceptionF("Ljava/lang/ArrayStoreException;",
                            "%s of type %s is not an array", identifier, actualType.c_str());
@@ -60,18 +64,18 @@ static void System_arraycopy(JNIEnv* env, jclass, jobject javaSrc, jint srcPos, 
   }
 
   // Make sure source and destination are both arrays.
-  mirror::Object* srcObject = soa.Decode<mirror::Object*>(javaSrc);
+  ObjPtr<mirror::Object> srcObject = soa.Decode<mirror::Object>(javaSrc);
   if (UNLIKELY(!srcObject->IsArrayInstance())) {
     ThrowArrayStoreException_NotAnArray("source", srcObject);
     return;
   }
-  mirror::Object* dstObject = soa.Decode<mirror::Object*>(javaDst);
+  ObjPtr<mirror::Object> dstObject = soa.Decode<mirror::Object>(javaDst);
   if (UNLIKELY(!dstObject->IsArrayInstance())) {
     ThrowArrayStoreException_NotAnArray("destination", dstObject);
     return;
   }
-  mirror::Array* srcArray = srcObject->AsArray();
-  mirror::Array* dstArray = dstObject->AsArray();
+  ObjPtr<mirror::Array> srcArray = srcObject->AsArray();
+  ObjPtr<mirror::Array> dstArray = dstObject->AsArray();
 
   // Bounds checking.
   if (UNLIKELY(srcPos < 0) || UNLIKELY(dstPos < 0) || UNLIKELY(count < 0) ||
@@ -84,8 +88,8 @@ static void System_arraycopy(JNIEnv* env, jclass, jobject javaSrc, jint srcPos, 
     return;
   }
 
-  mirror::Class* dstComponentType = dstArray->GetClass()->GetComponentType();
-  mirror::Class* srcComponentType = srcArray->GetClass()->GetComponentType();
+  ObjPtr<mirror::Class> dstComponentType = dstArray->GetClass()->GetComponentType();
+  ObjPtr<mirror::Class> srcComponentType = srcArray->GetClass()->GetComponentType();
   Primitive::Type dstComponentPrimitiveType = dstComponentType->GetPrimitiveType();
 
   if (LIKELY(srcComponentType == dstComponentType)) {
@@ -105,14 +109,20 @@ static void System_arraycopy(JNIEnv* env, jclass, jobject javaSrc, jint srcPos, 
         dstArray->AsShortSizedArray()->Memmove(dstPos, srcArray->AsShortSizedArray(), srcPos, count);
         return;
       case Primitive::kPrimInt:
-      case Primitive::kPrimFloat:
         DCHECK_EQ(Primitive::ComponentSize(dstComponentPrimitiveType), 4U);
         dstArray->AsIntArray()->Memmove(dstPos, srcArray->AsIntArray(), srcPos, count);
         return;
+      case Primitive::kPrimFloat:
+        DCHECK_EQ(Primitive::ComponentSize(dstComponentPrimitiveType), 4U);
+        dstArray->AsFloatArray()->Memmove(dstPos, srcArray->AsFloatArray(), srcPos, count);
+        return;
       case Primitive::kPrimLong:
-      case Primitive::kPrimDouble:
         DCHECK_EQ(Primitive::ComponentSize(dstComponentPrimitiveType), 8U);
         dstArray->AsLongArray()->Memmove(dstPos, srcArray->AsLongArray(), srcPos, count);
+        return;
+      case Primitive::kPrimDouble:
+        DCHECK_EQ(Primitive::ComponentSize(dstComponentPrimitiveType), 8U);
+        dstArray->AsDoubleArray()->Memmove(dstPos, srcArray->AsDoubleArray(), srcPos, count);
         return;
       case Primitive::kPrimNot: {
         mirror::ObjectArray<mirror::Object>* dstObjArray = dstArray->AsObjectArray<mirror::Object>();
@@ -121,120 +131,120 @@ static void System_arraycopy(JNIEnv* env, jclass, jobject javaSrc, jint srcPos, 
         return;
       }
       default:
-        LOG(FATAL) << "Unknown array type: " << PrettyTypeOf(srcArray);
+        LOG(FATAL) << "Unknown array type: " << srcArray->PrettyTypeOf();
         UNREACHABLE();
     }
   }
   // If one of the arrays holds a primitive type the other array must hold the exact same type.
   if (UNLIKELY((dstComponentPrimitiveType != Primitive::kPrimNot) ||
                srcComponentType->IsPrimitive())) {
-    std::string srcType(PrettyTypeOf(srcArray));
-    std::string dstType(PrettyTypeOf(dstArray));
+    std::string srcType(srcArray->PrettyTypeOf());
+    std::string dstType(dstArray->PrettyTypeOf());
     soa.Self()->ThrowNewExceptionF("Ljava/lang/ArrayStoreException;",
                                    "Incompatible types: src=%s, dst=%s",
                                    srcType.c_str(), dstType.c_str());
     return;
   }
   // Arrays hold distinct types and so therefore can't alias - use memcpy instead of memmove.
-  mirror::ObjectArray<mirror::Object>* dstObjArray = dstArray->AsObjectArray<mirror::Object>();
-  mirror::ObjectArray<mirror::Object>* srcObjArray = srcArray->AsObjectArray<mirror::Object>();
+  ObjPtr<mirror::ObjectArray<mirror::Object>> dstObjArray =
+      dstArray->AsObjectArray<mirror::Object>();
+  ObjPtr<mirror::ObjectArray<mirror::Object>> srcObjArray =
+      srcArray->AsObjectArray<mirror::Object>();
   // If we're assigning into say Object[] then we don't need per element checks.
   if (dstComponentType->IsAssignableFrom(srcComponentType)) {
     dstObjArray->AssignableMemcpy(dstPos, srcObjArray, srcPos, count);
     return;
   }
-  dstObjArray->AssignableCheckingMemcpy(dstPos, srcObjArray, srcPos, count, true);
+  // This code is never run under a transaction.
+  DCHECK(!Runtime::Current()->IsActiveTransaction());
+  dstObjArray->AssignableCheckingMemcpy<false>(dstPos, srcObjArray, srcPos, count, true);
 }
 
 // Template to convert general array to that of its specific primitive type.
 template <typename T>
-inline T* AsPrimitiveArray(mirror::Array* array) {
-  return down_cast<T*>(array);
+inline ObjPtr<T> AsPrimitiveArray(ObjPtr<mirror::Array> array)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  return ObjPtr<T>::DownCast(array);
 }
 
 template <typename T, Primitive::Type kPrimType>
 inline void System_arraycopyTUnchecked(JNIEnv* env, jobject javaSrc, jint srcPos,
                                        jobject javaDst, jint dstPos, jint count) {
   ScopedFastNativeObjectAccess soa(env);
-  mirror::Object* srcObject = soa.Decode<mirror::Object*>(javaSrc);
-  mirror::Object* dstObject = soa.Decode<mirror::Object*>(javaDst);
+  ObjPtr<mirror::Object> srcObject = soa.Decode<mirror::Object>(javaSrc);
+  ObjPtr<mirror::Object> dstObject = soa.Decode<mirror::Object>(javaDst);
   DCHECK(dstObject != nullptr);
-  mirror::Array* srcArray = srcObject->AsArray();
-  mirror::Array* dstArray = dstObject->AsArray();
+  ObjPtr<mirror::Array> srcArray = srcObject->AsArray();
+  ObjPtr<mirror::Array> dstArray = dstObject->AsArray();
   DCHECK_GE(count, 0);
   DCHECK_EQ(srcArray->GetClass(), dstArray->GetClass());
   DCHECK_EQ(srcArray->GetClass()->GetComponentType()->GetPrimitiveType(), kPrimType);
   AsPrimitiveArray<T>(dstArray)->Memmove(dstPos, AsPrimitiveArray<T>(srcArray), srcPos, count);
 }
 
-static void System_arraycopyCharUnchecked(JNIEnv* env, jclass, jobject javaSrc, jint srcPos,
-                                          jobject javaDst, jint dstPos, jint count) {
+static void System_arraycopyCharUnchecked(JNIEnv* env, jclass, jcharArray javaSrc, jint srcPos,
+                                          jcharArray javaDst, jint dstPos, jint count) {
   System_arraycopyTUnchecked<mirror::CharArray, Primitive::kPrimChar>(env, javaSrc, srcPos,
       javaDst, dstPos, count);
 }
 
-static void System_arraycopyByteUnchecked(JNIEnv* env, jclass, jobject javaSrc, jint srcPos,
-                                          jobject javaDst, jint dstPos, jint count) {
+static void System_arraycopyByteUnchecked(JNIEnv* env, jclass, jbyteArray javaSrc, jint srcPos,
+                                          jbyteArray javaDst, jint dstPos, jint count) {
   System_arraycopyTUnchecked<mirror::ByteArray, Primitive::kPrimByte>(env, javaSrc, srcPos,
       javaDst, dstPos, count);
 }
 
-static void System_arraycopyShortUnchecked(JNIEnv* env, jclass, jobject javaSrc, jint srcPos,
-                                           jobject javaDst, jint dstPos, jint count) {
+static void System_arraycopyShortUnchecked(JNIEnv* env, jclass, jshortArray javaSrc, jint srcPos,
+                                           jshortArray javaDst, jint dstPos, jint count) {
   System_arraycopyTUnchecked<mirror::ShortArray, Primitive::kPrimShort>(env, javaSrc, srcPos,
       javaDst, dstPos, count);
 }
 
-static void System_arraycopyIntUnchecked(JNIEnv* env, jclass, jobject javaSrc, jint srcPos,
-                                         jobject javaDst, jint dstPos, jint count) {
+static void System_arraycopyIntUnchecked(JNIEnv* env, jclass, jintArray javaSrc, jint srcPos,
+                                         jintArray javaDst, jint dstPos, jint count) {
   System_arraycopyTUnchecked<mirror::IntArray, Primitive::kPrimInt>(env, javaSrc, srcPos,
       javaDst, dstPos, count);
 }
 
-static void System_arraycopyLongUnchecked(JNIEnv* env, jclass, jobject javaSrc, jint srcPos,
-                                          jobject javaDst, jint dstPos, jint count) {
+static void System_arraycopyLongUnchecked(JNIEnv* env, jclass, jlongArray javaSrc, jint srcPos,
+                                          jlongArray javaDst, jint dstPos, jint count) {
   System_arraycopyTUnchecked<mirror::LongArray, Primitive::kPrimLong>(env, javaSrc, srcPos,
       javaDst, dstPos, count);
 }
 
-static void System_arraycopyFloatUnchecked(JNIEnv* env, jclass, jobject javaSrc, jint srcPos,
-                                           jobject javaDst, jint dstPos, jint count) {
+static void System_arraycopyFloatUnchecked(JNIEnv* env, jclass, jfloatArray javaSrc, jint srcPos,
+                                           jfloatArray javaDst, jint dstPos, jint count) {
   System_arraycopyTUnchecked<mirror::FloatArray, Primitive::kPrimFloat>(env, javaSrc, srcPos,
       javaDst, dstPos, count);
 }
 
-static void System_arraycopyDoubleUnchecked(JNIEnv* env, jclass, jobject javaSrc, jint srcPos,
-                                            jobject javaDst, jint dstPos, jint count) {
+static void System_arraycopyDoubleUnchecked(JNIEnv* env, jclass, jdoubleArray javaSrc, jint srcPos,
+                                            jdoubleArray javaDst, jint dstPos, jint count) {
   System_arraycopyTUnchecked<mirror::DoubleArray, Primitive::kPrimDouble>(env, javaSrc, srcPos,
       javaDst, dstPos, count);
 }
 
-static void System_arraycopyBooleanUnchecked(JNIEnv* env, jclass, jobject javaSrc, jint srcPos,
-                                             jobject javaDst, jint dstPos, jint count) {
+static void System_arraycopyBooleanUnchecked(JNIEnv* env,
+                                             jclass,
+                                             jbooleanArray javaSrc,
+                                             jint srcPos,
+                                             jbooleanArray javaDst,
+                                             jint dstPos,
+                                             jint count) {
   System_arraycopyTUnchecked<mirror::BooleanArray, Primitive::kPrimBoolean>(env, javaSrc, srcPos,
       javaDst, dstPos, count);
 }
 
-static jint System_identityHashCode(JNIEnv* env, jclass, jobject javaObject) {
-  if (UNLIKELY(javaObject == nullptr)) {
-    return 0;
-  }
-  ScopedFastNativeObjectAccess soa(env);
-  mirror::Object* o = soa.Decode<mirror::Object*>(javaObject);
-  return static_cast<jint>(o->IdentityHashCode());
-}
-
 static JNINativeMethod gMethods[] = {
-  NATIVE_METHOD(System, arraycopy, "!(Ljava/lang/Object;ILjava/lang/Object;II)V"),
-  NATIVE_METHOD(System, arraycopyCharUnchecked, "!([CI[CII)V"),
-  NATIVE_METHOD(System, arraycopyByteUnchecked, "!([BI[BII)V"),
-  NATIVE_METHOD(System, arraycopyShortUnchecked, "!([SI[SII)V"),
-  NATIVE_METHOD(System, arraycopyIntUnchecked, "!([II[III)V"),
-  NATIVE_METHOD(System, arraycopyLongUnchecked, "!([JI[JII)V"),
-  NATIVE_METHOD(System, arraycopyFloatUnchecked, "!([FI[FII)V"),
-  NATIVE_METHOD(System, arraycopyDoubleUnchecked, "!([DI[DII)V"),
-  NATIVE_METHOD(System, arraycopyBooleanUnchecked, "!([ZI[ZII)V"),
-  NATIVE_METHOD(System, identityHashCode, "!(Ljava/lang/Object;)I"),
+  FAST_NATIVE_METHOD(System, arraycopy, "(Ljava/lang/Object;ILjava/lang/Object;II)V"),
+  FAST_NATIVE_METHOD(System, arraycopyCharUnchecked, "([CI[CII)V"),
+  FAST_NATIVE_METHOD(System, arraycopyByteUnchecked, "([BI[BII)V"),
+  FAST_NATIVE_METHOD(System, arraycopyShortUnchecked, "([SI[SII)V"),
+  FAST_NATIVE_METHOD(System, arraycopyIntUnchecked, "([II[III)V"),
+  FAST_NATIVE_METHOD(System, arraycopyLongUnchecked, "([JI[JII)V"),
+  FAST_NATIVE_METHOD(System, arraycopyFloatUnchecked, "([FI[FII)V"),
+  FAST_NATIVE_METHOD(System, arraycopyDoubleUnchecked, "([DI[DII)V"),
+  FAST_NATIVE_METHOD(System, arraycopyBooleanUnchecked, "([ZI[ZII)V"),
 };
 
 void register_java_lang_System(JNIEnv* env) {

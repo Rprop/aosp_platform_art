@@ -22,12 +22,31 @@
 #include "mirror/class-inl.h"
 #include "mirror/object-inl.h"
 #include "mirror/object_array-inl.h"
-#include "scoped_thread_state_change.h"
+#include "scoped_thread_state_change-inl.h"
 
 namespace art {
 namespace gc {
 
-class HeapTest : public CommonRuntimeTest {};
+class HeapTest : public CommonRuntimeTest {
+ public:
+  void SetUp() OVERRIDE {
+    MemMap::Init();
+    std::string error_msg;
+    // Reserve the preferred address to force the heap to use another one for testing.
+    reserved_.reset(MemMap::MapAnonymous("ReserveMap",
+                                         gc::Heap::kPreferredAllocSpaceBegin,
+                                         16 * KB,
+                                         PROT_READ,
+                                         /*low_4gb*/ true,
+                                         /*reuse*/ false,
+                                         &error_msg));
+    ASSERT_TRUE(reserved_ != nullptr) << error_msg;
+    CommonRuntimeTest::SetUp();
+  }
+
+ private:
+  std::unique_ptr<MemMap> reserved_;
+};
 
 TEST_F(HeapTest, ClearGrowthLimit) {
   Heap* heap = Runtime::Current()->GetHeap();
@@ -59,7 +78,7 @@ TEST_F(HeapTest, GarbageCollectClassLinkerInit) {
       }
     }
   }
-  Runtime::Current()->GetHeap()->CollectGarbage(false);
+  Runtime::Current()->GetHeap()->CollectGarbage(/* clear_soft_references */ false);
 }
 
 TEST_F(HeapTest, HeapBitmapCapacityTest) {
@@ -70,6 +89,11 @@ TEST_F(HeapTest, HeapBitmapCapacityTest) {
   mirror::Object* fake_end_of_heap_object =
       reinterpret_cast<mirror::Object*>(&heap_begin[heap_capacity - kObjectAlignment]);
   bitmap->Set(fake_end_of_heap_object);
+}
+
+TEST_F(HeapTest, DumpGCPerformanceOnShutdown) {
+  Runtime::Current()->GetHeap()->CollectGarbage(/* clear_soft_references */ false);
+  Runtime::Current()->SetDumpGCPerformanceOnShutdown(true);
 }
 
 class ZygoteHeapTest : public CommonRuntimeTest {

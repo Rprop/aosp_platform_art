@@ -29,14 +29,14 @@ public class Clash4 {
 
         try {
             Proxy.newProxyInstance(Clash.class.getClassLoader(),
-                new Class[] {
+                new Class<?>[] {
                     Interface4a.class,
                     Interface4aa.class,
                     Interface4base.class,
                     Interface4b.class,
                     Interface4bb.class },
                 handler);
-            System.err.println("Clash4 did not throw expected exception");
+            System.out.println("Clash4 did not throw expected exception");
         } catch (IllegalArgumentException iae) {
             System.out.println("Clash4 threw expected exception");
             //System.out.println(iae);

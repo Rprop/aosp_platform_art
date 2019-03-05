@@ -28,7 +28,7 @@ extern "C" JNIEXPORT jint JNICALL Java_Main_getNativePriority(JNIEnv* env,
 extern "C" JNIEXPORT jboolean JNICALL Java_Main_supportsThreadPriorities(
     JNIEnv* env ATTRIBUTE_UNUSED,
     jclass clazz ATTRIBUTE_UNUSED) {
-#if defined(HAVE_ANDROID_OS)
+#if defined(ART_TARGET_ANDROID)
   return JNI_TRUE;
 #else
   return JNI_FALSE;

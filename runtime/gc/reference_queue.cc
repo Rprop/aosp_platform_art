@@ -22,6 +22,7 @@
 #include "mirror/class-inl.h"
 #include "mirror/object-inl.h"
 #include "mirror/reference-inl.h"
+#include "object_callbacks.h"
 
 namespace art {
 namespace gc {
@@ -29,92 +30,84 @@ namespace gc {
 ReferenceQueue::ReferenceQueue(Mutex* lock) : lock_(lock), list_(nullptr) {
 }
 
-void ReferenceQueue::AtomicEnqueueIfNotEnqueued(Thread* self, mirror::Reference* ref) {
+void ReferenceQueue::AtomicEnqueueIfNotEnqueued(Thread* self, ObjPtr<mirror::Reference> ref) {
   DCHECK(ref != nullptr);
   MutexLock mu(self, *lock_);
-  if (!ref->IsEnqueued()) {
-    EnqueuePendingReference(ref);
+  if (ref->IsUnprocessed()) {
+    EnqueueReference(ref);
   }
 }
 
-void ReferenceQueue::EnqueueReference(mirror::Reference* ref) {
-  CHECK(ref->IsEnqueuable());
-  EnqueuePendingReference(ref);
-}
-
-void ReferenceQueue::EnqueuePendingReference(mirror::Reference* ref) {
+void ReferenceQueue::EnqueueReference(ObjPtr<mirror::Reference> ref) {
   DCHECK(ref != nullptr);
+  CHECK(ref->IsUnprocessed());
   if (IsEmpty()) {
     // 1 element cyclic queue, ie: Reference ref = ..; ref.pendingNext = ref;
-    list_ = ref;
+    list_ = ref.Ptr();
   } else {
-    mirror::Reference* head = list_->GetPendingNext();
-    if (Runtime::Current()->IsActiveTransaction()) {
-      ref->SetPendingNext<true>(head);
-    } else {
-      ref->SetPendingNext<false>(head);
-    }
+    // The list is owned by the GC, everything that has been inserted must already be at least
+    // gray.
+    ObjPtr<mirror::Reference> head = list_->GetPendingNext<kWithoutReadBarrier>();
+    DCHECK(head != nullptr);
+    ref->SetPendingNext(head);
   }
-  if (Runtime::Current()->IsActiveTransaction()) {
-    list_->SetPendingNext<true>(ref);
-  } else {
-    list_->SetPendingNext<false>(ref);
-  }
+  // Add the reference in the middle to preserve the cycle.
+  list_->SetPendingNext(ref);
 }
 
-mirror::Reference* ReferenceQueue::DequeuePendingReference() {
+ObjPtr<mirror::Reference> ReferenceQueue::DequeuePendingReference() {
   DCHECK(!IsEmpty());
-  mirror::Reference* head = list_->GetPendingNext();
-  DCHECK(head != nullptr);
-  mirror::Reference* ref;
+  ObjPtr<mirror::Reference> ref = list_->GetPendingNext<kWithoutReadBarrier>();
+  DCHECK(ref != nullptr);
   // Note: the following code is thread-safe because it is only called from ProcessReferences which
   // is single threaded.
-  if (list_ == head) {
-    ref = list_;
+  if (list_ == ref) {
     list_ = nullptr;
   } else {
-    mirror::Reference* next = head->GetPendingNext();
-    if (Runtime::Current()->IsActiveTransaction()) {
-      list_->SetPendingNext<true>(next);
-    } else {
-      list_->SetPendingNext<false>(next);
-    }
-    ref = head;
+    ObjPtr<mirror::Reference> next = ref->GetPendingNext<kWithoutReadBarrier>();
+    list_->SetPendingNext(next);
   }
-  if (Runtime::Current()->IsActiveTransaction()) {
-    ref->SetPendingNext<true>(nullptr);
-  } else {
-    ref->SetPendingNext<false>(nullptr);
-  }
-  Heap* heap = Runtime::Current()->GetHeap();
-  if (kUseBakerOrBrooksReadBarrier && heap->CurrentCollectorType() == kCollectorTypeCC &&
-      heap->ConcurrentCopyingCollector()->IsActive()) {
-    // Clear the gray ptr we left in ConcurrentCopying::ProcessMarkStack().
-    // We don't want to do this when the zygote compaction collector (SemiSpace) is running.
-    CHECK(ref != nullptr);
-    CHECK_EQ(ref->GetReadBarrierPointer(), ReadBarrier::GrayPtr())
-        << "ref=" << ref << " rb_ptr=" << ref->GetReadBarrierPointer();
-    if (heap->ConcurrentCopyingCollector()->RegionSpace()->IsInToSpace(ref)) {
-      // Moving objects.
-      ref->AtomicSetReadBarrierPointer(ReadBarrier::GrayPtr(), ReadBarrier::WhitePtr());
-      CHECK_EQ(ref->GetReadBarrierPointer(), ReadBarrier::WhitePtr());
-    } else {
-      // Non-moving objects.
-      ref->AtomicSetReadBarrierPointer(ReadBarrier::GrayPtr(), ReadBarrier::BlackPtr());
-      CHECK_EQ(ref->GetReadBarrierPointer(), ReadBarrier::BlackPtr());
-    }
-  }
+  ref->SetPendingNext(nullptr);
   return ref;
 }
 
+// This must be called whenever DequeuePendingReference is called.
+void ReferenceQueue::DisableReadBarrierForReference(ObjPtr<mirror::Reference> ref) {
+  Heap* heap = Runtime::Current()->GetHeap();
+  if (kUseBakerOrBrooksReadBarrier && heap->CurrentCollectorType() == kCollectorTypeCC &&
+      heap->ConcurrentCopyingCollector()->IsActive()) {
+    // Change the gray ptr we left in ConcurrentCopying::ProcessMarkStackRef() to white.
+    // We check IsActive() above because we don't want to do this when the zygote compaction
+    // collector (SemiSpace) is running.
+    CHECK(ref != nullptr);
+    collector::ConcurrentCopying* concurrent_copying = heap->ConcurrentCopyingCollector();
+    uint32_t rb_state = ref->GetReadBarrierState();
+    if (rb_state == ReadBarrier::GrayState()) {
+      ref->AtomicSetReadBarrierState(ReadBarrier::GrayState(), ReadBarrier::WhiteState());
+      CHECK_EQ(ref->GetReadBarrierState(), ReadBarrier::WhiteState());
+    } else {
+      // In ConcurrentCopying::ProcessMarkStackRef() we may leave a white reference in the queue and
+      // find it here, which is OK.
+      CHECK_EQ(rb_state, ReadBarrier::WhiteState()) << "ref=" << ref << " rb_state=" << rb_state;
+      ObjPtr<mirror::Object> referent = ref->GetReferent<kWithoutReadBarrier>();
+      // The referent could be null if it's cleared by a mutator (Reference.clear()).
+      if (referent != nullptr) {
+        CHECK(concurrent_copying->IsInToSpace(referent.Ptr()))
+            << "ref=" << ref << " rb_state=" << ref->GetReadBarrierState()
+            << " referent=" << referent;
+      }
+    }
+  }
+}
+
 void ReferenceQueue::Dump(std::ostream& os) const {
-  mirror::Reference* cur = list_;
+  ObjPtr<mirror::Reference> cur = list_;
   os << "Reference starting at list_=" << list_ << "\n";
   if (cur == nullptr) {
     return;
   }
   do {
-    mirror::Reference* pending_next = cur->GetPendingNext();
+    ObjPtr<mirror::Reference> pending_next = cur->GetPendingNext();
     os << "Reference= " << cur << " PendingNext=" << pending_next;
     if (cur->IsFinalizerReferenceInstance()) {
       os << " Zombie=" << cur->AsFinalizerReference()->GetZombie();
@@ -126,7 +119,7 @@ void ReferenceQueue::Dump(std::ostream& os) const {
 
 size_t ReferenceQueue::GetLength() const {
   size_t count = 0;
-  mirror::Reference* cur = list_;
+  ObjPtr<mirror::Reference> cur = list_;
   if (cur != nullptr) {
     do {
       ++count;
@@ -137,36 +130,36 @@ size_t ReferenceQueue::GetLength() const {
 }
 
 void ReferenceQueue::ClearWhiteReferences(ReferenceQueue* cleared_references,
-                                          IsHeapReferenceMarkedCallback* preserve_callback,
-                                          void* arg) {
+                                          collector::GarbageCollector* collector) {
   while (!IsEmpty()) {
-    mirror::Reference* ref = DequeuePendingReference();
+    ObjPtr<mirror::Reference> ref = DequeuePendingReference();
     mirror::HeapReference<mirror::Object>* referent_addr = ref->GetReferentReferenceAddr();
-    if (referent_addr->AsMirrorPtr() != nullptr && !preserve_callback(referent_addr, arg)) {
+    // do_atomic_update is false because this happens during the reference processing phase where
+    // Reference.clear() would block.
+    if (!collector->IsNullOrMarkedHeapReference(referent_addr, /*do_atomic_update*/false)) {
       // Referent is white, clear it.
       if (Runtime::Current()->IsActiveTransaction()) {
         ref->ClearReferent<true>();
       } else {
         ref->ClearReferent<false>();
       }
-      if (ref->IsEnqueuable()) {
-        cleared_references->EnqueuePendingReference(ref);
-      }
+      cleared_references->EnqueueReference(ref);
     }
+    // Delay disabling the read barrier until here so that the ClearReferent call above in
+    // transaction mode will trigger the read barrier.
+    DisableReadBarrierForReference(ref);
   }
 }
 
 void ReferenceQueue::EnqueueFinalizerReferences(ReferenceQueue* cleared_references,
-                                                IsHeapReferenceMarkedCallback* is_marked_callback,
-                                                MarkObjectCallback* mark_object_callback,
-                                                void* arg) {
+                                                collector::GarbageCollector* collector) {
   while (!IsEmpty()) {
-    mirror::FinalizerReference* ref = DequeuePendingReference()->AsFinalizerReference();
+    ObjPtr<mirror::FinalizerReference> ref = DequeuePendingReference()->AsFinalizerReference();
     mirror::HeapReference<mirror::Object>* referent_addr = ref->GetReferentReferenceAddr();
-    if (referent_addr->AsMirrorPtr() != nullptr && !is_marked_callback(referent_addr, arg)) {
-      mirror::Object* forward_address = mark_object_callback(referent_addr->AsMirrorPtr(), arg);
-      // If the referent is non-null the reference must queuable.
-      DCHECK(ref->IsEnqueuable());
+    // do_atomic_update is false because this happens during the reference processing phase where
+    // Reference.clear() would block.
+    if (!collector->IsNullOrMarkedHeapReference(referent_addr, /*do_atomic_update*/false)) {
+      ObjPtr<mirror::Object> forward_address = collector->MarkObject(referent_addr->AsMirrorPtr());
       // Move the updated referent to the zombie field.
       if (Runtime::Current()->IsActiveTransaction()) {
         ref->SetZombie<true>(forward_address);
@@ -177,28 +170,32 @@ void ReferenceQueue::EnqueueFinalizerReferences(ReferenceQueue* cleared_referenc
       }
       cleared_references->EnqueueReference(ref);
     }
+    // Delay disabling the read barrier until here so that the ClearReferent call above in
+    // transaction mode will trigger the read barrier.
+    DisableReadBarrierForReference(ref->AsReference());
   }
 }
 
-void ReferenceQueue::ForwardSoftReferences(IsHeapReferenceMarkedCallback* preserve_callback,
-                                           void* arg) {
+void ReferenceQueue::ForwardSoftReferences(MarkObjectVisitor* visitor) {
   if (UNLIKELY(IsEmpty())) {
     return;
   }
-  mirror::Reference* const head = list_;
-  mirror::Reference* ref = head;
+  ObjPtr<mirror::Reference> const head = list_;
+  ObjPtr<mirror::Reference> ref = head;
   do {
     mirror::HeapReference<mirror::Object>* referent_addr = ref->GetReferentReferenceAddr();
     if (referent_addr->AsMirrorPtr() != nullptr) {
-      UNUSED(preserve_callback(referent_addr, arg));
+      // do_atomic_update is false because mutators can't access the referent due to the weak ref
+      // access blocking.
+      visitor->MarkHeapReference(referent_addr, /*do_atomic_update*/ false);
     }
     ref = ref->GetPendingNext();
   } while (LIKELY(ref != head));
 }
 
-void ReferenceQueue::UpdateRoots(IsMarkedCallback* callback, void* arg) {
+void ReferenceQueue::UpdateRoots(IsMarkedVisitor* visitor) {
   if (list_ != nullptr) {
-    list_ = down_cast<mirror::Reference*>(callback(list_, arg));
+    list_ = down_cast<mirror::Reference*>(visitor->IsMarked(list_));
   }
 }
 

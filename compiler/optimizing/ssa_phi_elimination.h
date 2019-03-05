@@ -29,10 +29,9 @@ namespace art {
 class SsaDeadPhiElimination : public HOptimization {
  public:
   explicit SsaDeadPhiElimination(HGraph* graph)
-      : HOptimization(graph, true, kSsaDeadPhiEliminationPassName),
-        worklist_(graph->GetArena(), kDefaultWorklistSize) {}
+      : HOptimization(graph, kSsaDeadPhiEliminationPassName) {}
 
-  void Run() OVERRIDE;
+  bool Run() OVERRIDE;
 
   void MarkDeadPhis();
   void EliminateDeadPhis();
@@ -40,10 +39,6 @@ class SsaDeadPhiElimination : public HOptimization {
   static constexpr const char* kSsaDeadPhiEliminationPassName = "dead_phi_elimination";
 
  private:
-  GrowableArray<HPhi*> worklist_;
-
-  static constexpr size_t kDefaultWorklistSize = 8;
-
   DISALLOW_COPY_AND_ASSIGN(SsaDeadPhiElimination);
 };
 
@@ -56,18 +51,13 @@ class SsaDeadPhiElimination : public HOptimization {
 class SsaRedundantPhiElimination : public HOptimization {
  public:
   explicit SsaRedundantPhiElimination(HGraph* graph)
-      : HOptimization(graph, true, kSsaRedundantPhiEliminationPassName),
-        worklist_(graph->GetArena(), kDefaultWorklistSize) {}
+      : HOptimization(graph, kSsaRedundantPhiEliminationPassName) {}
 
-  void Run() OVERRIDE;
+  bool Run() OVERRIDE;
 
   static constexpr const char* kSsaRedundantPhiEliminationPassName = "redundant_phi_elimination";
 
  private:
-  GrowableArray<HPhi*> worklist_;
-
-  static constexpr size_t kDefaultWorklistSize = 8;
-
   DISALLOW_COPY_AND_ASSIGN(SsaRedundantPhiElimination);
 };
 

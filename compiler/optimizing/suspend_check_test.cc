@@ -15,9 +15,10 @@
  */
 
 #include "builder.h"
-#include "dex_instruction.h"
+#include "dex/dex_instruction.h"
 #include "nodes.h"
 #include "optimizing_unit_test.h"
+#include "pretty_printer.h"
 
 #include "gtest/gtest.h"
 
@@ -27,39 +28,37 @@ namespace art {
  * Check that the HGraphBuilder adds suspend checks to backward branches.
  */
 
-static void TestCode(const uint16_t* data) {
-  ArenaPool pool;
-  ArenaAllocator allocator(&pool);
-  HGraph* graph = CreateGraph(&allocator);
-  HGraphBuilder builder(graph);
-  const DexFile::CodeItem* item = reinterpret_cast<const DexFile::CodeItem*>(data);
-  bool graph_built = builder.BuildGraph(*item);
-  ASSERT_TRUE(graph_built);
+class SuspendCheckTest : public OptimizingUnitTest {
+ protected:
+  void TestCode(const std::vector<uint16_t>& data);
+};
 
-  HBasicBlock* first_block = graph->GetEntryBlock()->GetSuccessors().Get(0);
-  HInstruction* first_instruction = first_block->GetFirstInstruction();
-  // Account for some tests having a store local as first instruction.
-  ASSERT_TRUE(first_instruction->IsSuspendCheck()
-              || first_instruction->GetNext()->IsSuspendCheck());
+void SuspendCheckTest::TestCode(const std::vector<uint16_t>& data) {
+  HGraph* graph = CreateCFG(data);
+  HBasicBlock* first_block = graph->GetEntryBlock()->GetSingleSuccessor();
+  HBasicBlock* loop_header = first_block->GetSingleSuccessor();
+  ASSERT_TRUE(loop_header->IsLoopHeader());
+  ASSERT_EQ(loop_header->GetLoopInformation()->GetPreHeader(), first_block);
+  ASSERT_TRUE(loop_header->GetFirstInstruction()->IsSuspendCheck());
 }
 
-TEST(CodegenTest, CFG1) {
-  const uint16_t data[] = ZERO_REGISTER_CODE_ITEM(
+TEST_F(SuspendCheckTest, CFG1) {
+  const std::vector<uint16_t> data = ZERO_REGISTER_CODE_ITEM(
     Instruction::NOP,
     Instruction::GOTO | 0xFF00);
 
   TestCode(data);
 }
 
-TEST(CodegenTest, CFG2) {
-  const uint16_t data[] = ZERO_REGISTER_CODE_ITEM(
+TEST_F(SuspendCheckTest, CFG2) {
+  const std::vector<uint16_t> data = ZERO_REGISTER_CODE_ITEM(
     Instruction::GOTO_32, 0, 0);
 
   TestCode(data);
 }
 
-TEST(CodegenTest, CFG3) {
-  const uint16_t data[] = ONE_REGISTER_CODE_ITEM(
+TEST_F(SuspendCheckTest, CFG3) {
+  const std::vector<uint16_t> data = ONE_REGISTER_CODE_ITEM(
     Instruction::CONST_4 | 0 | 0,
     Instruction::IF_EQ, 0xFFFF,
     Instruction::RETURN_VOID);
@@ -67,8 +66,8 @@ TEST(CodegenTest, CFG3) {
   TestCode(data);
 }
 
-TEST(CodegenTest, CFG4) {
-  const uint16_t data[] = ONE_REGISTER_CODE_ITEM(
+TEST_F(SuspendCheckTest, CFG4) {
+  const std::vector<uint16_t> data = ONE_REGISTER_CODE_ITEM(
     Instruction::CONST_4 | 0 | 0,
     Instruction::IF_NE, 0xFFFF,
     Instruction::RETURN_VOID);
@@ -76,8 +75,8 @@ TEST(CodegenTest, CFG4) {
   TestCode(data);
 }
 
-TEST(CodegenTest, CFG5) {
-  const uint16_t data[] = ONE_REGISTER_CODE_ITEM(
+TEST_F(SuspendCheckTest, CFG5) {
+  const std::vector<uint16_t> data = ONE_REGISTER_CODE_ITEM(
     Instruction::CONST_4 | 0 | 0,
     Instruction::IF_EQZ, 0xFFFF,
     Instruction::RETURN_VOID);
@@ -85,8 +84,8 @@ TEST(CodegenTest, CFG5) {
   TestCode(data);
 }
 
-TEST(CodegenTest, CFG6) {
-  const uint16_t data[] = ONE_REGISTER_CODE_ITEM(
+TEST_F(SuspendCheckTest, CFG6) {
+  const std::vector<uint16_t> data = ONE_REGISTER_CODE_ITEM(
     Instruction::CONST_4 | 0 | 0,
     Instruction::IF_NEZ, 0xFFFF,
     Instruction::RETURN_VOID);

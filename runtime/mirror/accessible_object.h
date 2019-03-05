@@ -17,12 +17,8 @@
 #ifndef ART_RUNTIME_MIRROR_ACCESSIBLE_OBJECT_H_
 #define ART_RUNTIME_MIRROR_ACCESSIBLE_OBJECT_H_
 
-#include "class.h"
-#include "gc_root.h"
 #include "object.h"
-#include "object_callbacks.h"
 #include "read_barrier_option.h"
-#include "thread.h"
 
 namespace art {
 
@@ -35,21 +31,14 @@ class MANAGED AccessibleObject : public Object {
     return OFFSET_OF_OBJECT_MEMBER(AccessibleObject, flag_);
   }
 
-  template<bool kTransactionActive>
-  void SetAccessible(bool value) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    UNUSED(padding_);
-    return SetFieldBoolean<kTransactionActive>(FlagOffset(), value ? 1u : 0u);
-  }
-
-  bool IsAccessible() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  bool IsAccessible() REQUIRES_SHARED(Locks::mutator_lock_) {
     return GetFieldBoolean(FlagOffset());
   }
 
  private:
   uint8_t flag_;
-  // Padding required for now since "packed" will cause reflect.Field fields to not be aligned
-  // otherwise.
-  uint8_t padding_[3];
+  // Padding required for correct alignment of subclasses like Executable, Field, etc.
+  uint8_t padding_[1] ATTRIBUTE_UNUSED;
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(AccessibleObject);
 };

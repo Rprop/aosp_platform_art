@@ -24,7 +24,6 @@
 
 #include "hprof.h"
 
-#include <cutils/open_memstream.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -32,33 +31,41 @@
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <time.h>
-#include <time.h>
 #include <unistd.h>
 
 #include <set>
 
+#include <android-base/logging.h>
+#include <android-base/stringprintf.h>
+
 #include "art_field-inl.h"
-#include "base/logging.h"
-#include "base/stringprintf.h"
+#include "art_method-inl.h"
+#include "base/array_ref.h"
+#include "base/globals.h"
+#include "base/macros.h"
+#include "base/mutex.h"
+#include "base/os.h"
+#include "base/safe_map.h"
 #include "base/time_utils.h"
 #include "base/unix_file/fd_file.h"
 #include "class_linker.h"
+#include "class_root.h"
 #include "common_throws.h"
 #include "debugger.h"
-#include "dex_file-inl.h"
-#include "gc_root.h"
+#include "dex/dex_file-inl.h"
 #include "gc/accounting/heap_bitmap.h"
+#include "gc/allocation_record.h"
+#include "gc/heap-visit-objects-inl.h"
 #include "gc/heap.h"
+#include "gc/scoped_gc_critical_section.h"
 #include "gc/space/space.h"
-#include "globals.h"
+#include "gc_root.h"
 #include "jdwp/jdwp.h"
 #include "jdwp/jdwp_priv.h"
-#include "mirror/class.h"
 #include "mirror/class-inl.h"
-#include "mirror/object-inl.h"
-#include "os.h"
-#include "safe_map.h"
-#include "scoped_thread_state_change.h"
+#include "mirror/class.h"
+#include "mirror/object-refvisitor-inl.h"
+#include "scoped_thread_state_change-inl.h"
 #include "thread_list.h"
 
 namespace art {
@@ -68,14 +75,13 @@ namespace hprof {
 static constexpr bool kDirectStream = true;
 
 static constexpr uint32_t kHprofTime = 0;
-static constexpr uint32_t kHprofNullStackTrace = 0;
 static constexpr uint32_t kHprofNullThread = 0;
 
 static constexpr size_t kMaxObjectsPerSegment = 128;
 static constexpr size_t kMaxBytesPerSegment = 4096;
 
 // The static field-name for the synthetic object generated to account for class static overhead.
-static constexpr const char* kStaticOverheadName = "$staticOverhead";
+static constexpr const char* kClassOverheadName = "$classOverhead";
 
 enum HprofTag {
   HPROF_TAG_STRING = 0x01,
@@ -144,6 +150,10 @@ enum HprofBasicType {
 
 typedef uint32_t HprofStringId;
 typedef uint32_t HprofClassObjectId;
+typedef uint32_t HprofClassSerialNumber;
+typedef uint32_t HprofStackTraceSerialNumber;
+typedef uint32_t HprofStackFrameId;
+static constexpr HprofStackTraceSerialNumber kHprofNullStackTrace = 0;
 
 class EndianOutput {
  public:
@@ -194,6 +204,10 @@ class EndianOutput {
     AddU4(PointerToLowMemUInt32(value));
   }
 
+  void AddStackTraceSerialNumber(HprofStackTraceSerialNumber value) {
+    AddU4(value);
+  }
+
   // The ID for the synthetic object generated to account for class static overhead.
   void AddClassStaticsId(const mirror::Class* value) {
     AddU4(1 | PointerToLowMemUInt32(value));
@@ -232,7 +246,7 @@ class EndianOutput {
   }
 
   void AddIdList(mirror::ObjectArray<mirror::Object>* values)
-  SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     const int32_t length = values->GetLength();
     for (int32_t i = 0; i < length; ++i) {
       AddObjectId(values->GetWithoutChecks(i));
@@ -259,6 +273,9 @@ class EndianOutput {
  protected:
   virtual void HandleU1List(const uint8_t* values ATTRIBUTE_UNUSED,
                             size_t count ATTRIBUTE_UNUSED) {
+  }
+  virtual void HandleU1AsU2List(const uint8_t* values ATTRIBUTE_UNUSED,
+                                size_t count ATTRIBUTE_UNUSED) {
   }
   virtual void HandleU2List(const uint16_t* values ATTRIBUTE_UNUSED,
                             size_t count ATTRIBUTE_UNUSED) {
@@ -298,6 +315,19 @@ class EndianOutputBuffered : public EndianOutput {
   void HandleU1List(const uint8_t* values, size_t count) OVERRIDE {
     DCHECK_EQ(length_, buffer_.size());
     buffer_.insert(buffer_.end(), values, values + count);
+  }
+
+  void HandleU1AsU2List(const uint8_t* values, size_t count) OVERRIDE {
+    DCHECK_EQ(length_, buffer_.size());
+    // All 8-bits are grouped in 2 to make 16-bit block like Java Char
+    if (count & 1) {
+      buffer_.push_back(0);
+    }
+    for (size_t i = 0; i < count; ++i) {
+      uint8_t value = *values;
+      buffer_.push_back(value);
+      values++;
+    }
   }
 
   void HandleU2List(const uint16_t* values, size_t count) OVERRIDE {
@@ -383,25 +413,21 @@ class FileEndianOutput FINAL : public EndianOutputBuffered {
   bool errors_;
 };
 
-class NetStateEndianOutput FINAL : public EndianOutputBuffered {
+class VectorEndianOuputput FINAL : public EndianOutputBuffered {
  public:
-  NetStateEndianOutput(JDWP::JdwpNetStateBase* net_state, size_t reserved_size)
-      : EndianOutputBuffered(reserved_size), net_state_(net_state) {
-    DCHECK(net_state != nullptr);
-  }
-  ~NetStateEndianOutput() {}
+  VectorEndianOuputput(std::vector<uint8_t>& data, size_t reserved_size)
+      : EndianOutputBuffered(reserved_size), full_data_(data) {}
+  ~VectorEndianOuputput() {}
 
  protected:
-  void HandleFlush(const uint8_t* buffer, size_t length) OVERRIDE {
-    std::vector<iovec> iov;
-    iov.push_back(iovec());
-    iov[0].iov_base = const_cast<void*>(reinterpret_cast<const void*>(buffer));
-    iov[0].iov_len = length;
-    net_state_->WriteBufferedPacketLocked(iov);
+  void HandleFlush(const uint8_t* buf, size_t length) OVERRIDE {
+    size_t old_size = full_data_.size();
+    full_data_.resize(old_size + length);
+    memcpy(full_data_.data() + old_size, buf, length);
   }
 
  private:
-  JDWP::JdwpNetStateBase* net_state_;
+  std::vector<uint8_t>& full_data_;
 };
 
 #define __ output_->
@@ -411,17 +437,20 @@ class Hprof : public SingleRootVisitor {
   Hprof(const char* output_filename, int fd, bool direct_to_ddms)
       : filename_(output_filename),
         fd_(fd),
-        direct_to_ddms_(direct_to_ddms),
-        start_ns_(NanoTime()),
-        current_heap_(HPROF_HEAP_DEFAULT),
-        objects_in_segment_(0),
-        next_string_id_(0x400000) {
+        direct_to_ddms_(direct_to_ddms) {
     LOG(INFO) << "hprof: heap dump \"" << filename_ << "\" starting...";
   }
 
   void Dump()
-      EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_)
-      LOCKS_EXCLUDED(Locks::heap_bitmap_lock_) {
+    REQUIRES(Locks::mutator_lock_)
+    REQUIRES(!Locks::heap_bitmap_lock_, !Locks::alloc_tracker_lock_) {
+    {
+      MutexLock mu(Thread::Current(), *Locks::alloc_tracker_lock_);
+      if (Runtime::Current()->GetHeap()->IsAllocTrackingEnabled()) {
+        PopulateAllocationTrackingTraces();
+      }
+    }
+
     // First pass to measure the size of the dump.
     size_t overall_size;
     size_t max_length;
@@ -435,6 +464,7 @@ class Hprof : public SingleRootVisitor {
     }
 
     bool okay;
+    visited_objects_.clear();
     if (direct_to_ddms_) {
       if (kDirectStream) {
         okay = DumpToDdmsDirect(overall_size, max_length, CHUNK_TYPE("HPDS"));
@@ -446,76 +476,89 @@ class Hprof : public SingleRootVisitor {
     }
 
     if (okay) {
-      uint64_t duration = NanoTime() - start_ns_;
-      LOG(INFO) << "hprof: heap dump completed ("
-          << PrettySize(RoundUp(overall_size, 1024))
-          << ") in " << PrettyDuration(duration);
+      const uint64_t duration = NanoTime() - start_ns_;
+      LOG(INFO) << "hprof: heap dump completed (" << PrettySize(RoundUp(overall_size, KB))
+                << ") in " << PrettyDuration(duration)
+                << " objects " << total_objects_
+                << " objects with stack traces " << total_objects_with_stack_trace_;
     }
   }
 
  private:
-  static void VisitObjectCallback(mirror::Object* obj, void* arg)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    DCHECK(obj != nullptr);
-    DCHECK(arg != nullptr);
-    reinterpret_cast<Hprof*>(arg)->DumpHeapObject(obj);
-  }
-
   void DumpHeapObject(mirror::Object* obj)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   void DumpHeapClass(mirror::Class* klass)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   void DumpHeapArray(mirror::Array* obj, mirror::Class* klass)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
-  void DumpHeapInstanceObject(mirror::Object* obj, mirror::Class* klass)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void DumpFakeObjectArray(mirror::Object* obj, const std::set<mirror::Object*>& elements)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  void DumpHeapInstanceObject(mirror::Object* obj,
+                              mirror::Class* klass,
+                              const std::set<mirror::Object*>& fake_roots)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  bool AddRuntimeInternalObjectsField(mirror::Class* klass) REQUIRES_SHARED(Locks::mutator_lock_);
 
   void ProcessHeap(bool header_first)
-      EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_) {
+      REQUIRES(Locks::mutator_lock_) {
     // Reset current heap and object count.
     current_heap_ = HPROF_HEAP_DEFAULT;
     objects_in_segment_ = 0;
 
     if (header_first) {
-      ProcessHeader();
+      ProcessHeader(true);
       ProcessBody();
     } else {
       ProcessBody();
-      ProcessHeader();
+      ProcessHeader(false);
     }
   }
 
-  void ProcessBody() EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  void ProcessBody() REQUIRES(Locks::mutator_lock_) {
     Runtime* const runtime = Runtime::Current();
     // Walk the roots and the heap.
     output_->StartNewRecord(HPROF_TAG_HEAP_DUMP_SEGMENT, kHprofTime);
 
+    simple_roots_.clear();
     runtime->VisitRoots(this);
     runtime->VisitImageRoots(this);
-    runtime->GetHeap()->VisitObjectsPaused(VisitObjectCallback, this);
-
+    auto dump_object = [this](mirror::Object* obj) REQUIRES_SHARED(Locks::mutator_lock_) {
+      DCHECK(obj != nullptr);
+      DumpHeapObject(obj);
+    };
+    runtime->GetHeap()->VisitObjectsPaused(dump_object);
     output_->StartNewRecord(HPROF_TAG_HEAP_DUMP_END, kHprofTime);
     output_->EndRecord();
   }
 
-  void ProcessHeader() EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  void ProcessHeader(bool string_first) REQUIRES(Locks::mutator_lock_) {
     // Write the header.
     WriteFixedHeader();
     // Write the string and class tables, and any stack traces, to the header.
     // (jhat requires that these appear before any of the data in the body that refers to them.)
-    WriteStringTable();
+    // jhat also requires the string table appear before class table and stack traces.
+    // However, WriteStackTraces() can modify the string table, so it's necessary to call
+    // WriteStringTable() last in the first pass, to compute the correct length of the output.
+    if (string_first) {
+      WriteStringTable();
+    }
     WriteClassTable();
     WriteStackTraces();
+    if (!string_first) {
+      WriteStringTable();
+    }
     output_->EndRecord();
   }
 
-  void WriteClassTable() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    uint32_t nextSerialNumber = 1;
-
-    for (mirror::Class* c : classes_) {
+  void WriteClassTable() REQUIRES_SHARED(Locks::mutator_lock_) {
+    for (const auto& p : classes_) {
+      mirror::Class* c = p.first;
+      HprofClassSerialNumber sn = p.second;
       CHECK(c != nullptr);
       output_->StartNewRecord(HPROF_TAG_LOAD_CLASS, kHprofTime);
       // LOAD CLASS format:
@@ -523,17 +566,17 @@ class Hprof : public SingleRootVisitor {
       // ID: class object ID. We use the address of the class object structure as its ID.
       // U4: stack trace serial number
       // ID: class name string ID
-      __ AddU4(nextSerialNumber++);
+      __ AddU4(sn);
       __ AddObjectId(c);
-      __ AddU4(kHprofNullStackTrace);
+      __ AddStackTraceSerialNumber(LookupStackTraceSerialNumber(c));
       __ AddStringId(LookupClassNameId(c));
     }
   }
 
   void WriteStringTable() {
-    for (const std::pair<std::string, HprofStringId>& p : strings_) {
+    for (const auto& p : strings_) {
       const std::string& string = p.first;
-      const size_t id = p.second;
+      const HprofStringId id = p.second;
 
       output_->StartNewRecord(HPROF_TAG_STRING, kHprofTime);
 
@@ -561,22 +604,38 @@ class Hprof : public SingleRootVisitor {
   }
 
   void VisitRoot(mirror::Object* obj, const RootInfo& root_info)
-      OVERRIDE SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+      OVERRIDE REQUIRES_SHARED(Locks::mutator_lock_);
   void MarkRootObject(const mirror::Object* obj, jobject jni_obj, HprofHeapTag heap_tag,
                       uint32_t thread_serial);
 
-  HprofClassObjectId LookupClassId(mirror::Class* c) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  HprofClassObjectId LookupClassId(mirror::Class* c) REQUIRES_SHARED(Locks::mutator_lock_) {
     if (c != nullptr) {
-      auto result = classes_.insert(c);
-      const mirror::Class* present = *result.first;
-      CHECK_EQ(present, c);
-      // Make sure that we've assigned a string ID for this class' name
-      LookupClassNameId(c);
+      auto it = classes_.find(c);
+      if (it == classes_.end()) {
+        // first time to see this class
+        HprofClassSerialNumber sn = next_class_serial_number_++;
+        classes_.Put(c, sn);
+        // Make sure that we've assigned a string ID for this class' name
+        LookupClassNameId(c);
+      }
     }
     return PointerToLowMemUInt32(c);
   }
 
-  HprofStringId LookupStringId(mirror::String* string) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  HprofStackTraceSerialNumber LookupStackTraceSerialNumber(const mirror::Object* obj)
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    auto r = allocation_records_.find(obj);
+    if (r == allocation_records_.end()) {
+      return kHprofNullStackTrace;
+    } else {
+      const gc::AllocRecordStackTrace* trace = r->second;
+      auto result = traces_.find(trace);
+      CHECK(result != traces_.end());
+      return result->second;
+    }
+  }
+
+  HprofStringId LookupStringId(mirror::String* string) REQUIRES_SHARED(Locks::mutator_lock_) {
     return LookupStringId(string->ToModifiedUtf8());
   }
 
@@ -594,8 +653,8 @@ class Hprof : public SingleRootVisitor {
     return id;
   }
 
-  HprofStringId LookupClassNameId(mirror::Class* c) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    return LookupStringId(PrettyDescriptor(c));
+  HprofStringId LookupClassNameId(mirror::Class* c) REQUIRES_SHARED(Locks::mutator_lock_) {
+    return LookupStringId(c->PrettyDescriptor());
   }
 
   void WriteFixedHeader() {
@@ -622,16 +681,70 @@ class Hprof : public SingleRootVisitor {
     __ AddU4(static_cast<uint32_t>(nowMs & 0xFFFFFFFF));
   }
 
-  void WriteStackTraces() {
+  void WriteStackTraces() REQUIRES_SHARED(Locks::mutator_lock_) {
     // Write a dummy stack trace record so the analysis tools don't freak out.
     output_->StartNewRecord(HPROF_TAG_STACK_TRACE, kHprofTime);
-    __ AddU4(kHprofNullStackTrace);
+    __ AddStackTraceSerialNumber(kHprofNullStackTrace);
     __ AddU4(kHprofNullThread);
     __ AddU4(0);    // no frames
+
+    // TODO: jhat complains "WARNING: Stack trace not found for serial # -1", but no trace should
+    // have -1 as its serial number (as long as HprofStackTraceSerialNumber doesn't overflow).
+    for (const auto& it : traces_) {
+      const gc::AllocRecordStackTrace* trace = it.first;
+      HprofStackTraceSerialNumber trace_sn = it.second;
+      size_t depth = trace->GetDepth();
+
+      // First write stack frames of the trace
+      for (size_t i = 0; i < depth; ++i) {
+        const gc::AllocRecordStackTraceElement* frame = &trace->GetStackElement(i);
+        ArtMethod* method = frame->GetMethod();
+        CHECK(method != nullptr);
+        output_->StartNewRecord(HPROF_TAG_STACK_FRAME, kHprofTime);
+        // STACK FRAME format:
+        // ID: stack frame ID. We use the address of the AllocRecordStackTraceElement object as its ID.
+        // ID: method name string ID
+        // ID: method signature string ID
+        // ID: source file name string ID
+        // U4: class serial number
+        // U4: >0, line number; 0, no line information available; -1, unknown location
+        auto frame_result = frames_.find(frame);
+        CHECK(frame_result != frames_.end());
+        __ AddU4(frame_result->second);
+        __ AddStringId(LookupStringId(method->GetName()));
+        __ AddStringId(LookupStringId(method->GetSignature().ToString()));
+        const char* source_file = method->GetDeclaringClassSourceFile();
+        if (source_file == nullptr) {
+          source_file = "";
+        }
+        __ AddStringId(LookupStringId(source_file));
+        auto class_result = classes_.find(method->GetDeclaringClass());
+        CHECK(class_result != classes_.end());
+        __ AddU4(class_result->second);
+        __ AddU4(frame->ComputeLineNumber());
+      }
+
+      // Then write the trace itself
+      output_->StartNewRecord(HPROF_TAG_STACK_TRACE, kHprofTime);
+      // STACK TRACE format:
+      // U4: stack trace serial number. We use the address of the AllocRecordStackTrace object as its serial number.
+      // U4: thread serial number. We use Thread::GetTid().
+      // U4: number of frames
+      // [ID]*: series of stack frame ID's
+      __ AddStackTraceSerialNumber(trace_sn);
+      __ AddU4(trace->GetTid());
+      __ AddU4(depth);
+      for (size_t i = 0; i < depth; ++i) {
+        const gc::AllocRecordStackTraceElement* frame = &trace->GetStackElement(i);
+        auto frame_result = frames_.find(frame);
+        CHECK(frame_result != frames_.end());
+        __ AddU4(frame_result->second);
+      }
+    }
   }
 
   bool DumpToDdmsBuffered(size_t overall_size ATTRIBUTE_UNUSED, size_t max_length ATTRIBUTE_UNUSED)
-      EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_) {
+      REQUIRES(Locks::mutator_lock_) {
     LOG(FATAL) << "Unimplemented";
     UNREACHABLE();
     //        // Send the data off to DDMS.
@@ -644,7 +757,7 @@ class Hprof : public SingleRootVisitor {
   }
 
   bool DumpToFile(size_t overall_size, size_t max_length)
-      EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_) {
+      REQUIRES(Locks::mutator_lock_) {
     // Where exactly are we writing to?
     int out_fd;
     if (fd_ >= 0) {
@@ -671,8 +784,9 @@ class Hprof : public SingleRootVisitor {
       okay = !file_output.Errors();
 
       if (okay) {
-        // Check for expected size.
-        CHECK_EQ(file_output.SumLength(), overall_size);
+        // Check for expected size. Output is expected to be less-or-equal than first phase, see
+        // b/23521263.
+        DCHECK_LE(file_output.SumLength(), overall_size);
       }
       output_ = nullptr;
     }
@@ -683,8 +797,9 @@ class Hprof : public SingleRootVisitor {
       file->Erase();
     }
     if (!okay) {
-      std::string msg(StringPrintf("Couldn't dump heap; writing \"%s\" failed: %s",
-                                   filename_.c_str(), strerror(errno)));
+      std::string msg(android::base::StringPrintf("Couldn't dump heap; writing \"%s\" failed: %s",
+                                                  filename_.c_str(),
+                                                  strerror(errno)));
       ThrowRuntimeException("%s", msg.c_str());
       LOG(ERROR) << msg;
     }
@@ -693,34 +808,66 @@ class Hprof : public SingleRootVisitor {
   }
 
   bool DumpToDdmsDirect(size_t overall_size, size_t max_length, uint32_t chunk_type)
-      EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_) {
+      REQUIRES(Locks::mutator_lock_) {
     CHECK(direct_to_ddms_);
-    JDWP::JdwpState* state = Dbg::GetJdwpState();
-    CHECK(state != nullptr);
-    JDWP::JdwpNetStateBase* net_state = state->netState;
-    CHECK(net_state != nullptr);
 
-    // Hold the socket lock for the whole time since we want this to be atomic.
-    MutexLock mu(Thread::Current(), *net_state->GetSocketLock());
+    std::vector<uint8_t> out_data;
 
-    // Prepare the Ddms chunk.
-    constexpr size_t kChunkHeaderSize = kJDWPHeaderLen + 8;
-    uint8_t chunk_header[kChunkHeaderSize] = { 0 };
-    state->SetupChunkHeader(chunk_type, overall_size, kChunkHeaderSize, chunk_header);
-
-    // Prepare the output and send the chunk header.
-    NetStateEndianOutput net_output(net_state, max_length);
-    output_ = &net_output;
-    net_output.AddU1List(chunk_header, kChunkHeaderSize);
+    // TODO It would be really good to have some streaming thing again. b/73084059
+    VectorEndianOuputput output(out_data, max_length);
+    output_ = &output;
 
     // Write the dump.
     ProcessHeap(true);
 
-    // Check for expected size.
-    CHECK_EQ(net_output.SumLength(), overall_size + kChunkHeaderSize);
+    Runtime::Current()->GetRuntimeCallbacks()->DdmPublishChunk(
+        chunk_type, ArrayRef<const uint8_t>(out_data.data(), out_data.size()));
+
+    // Check for expected size. See DumpToFile for comment.
+    DCHECK_LE(output.SumLength(), overall_size);
     output_ = nullptr;
 
     return true;
+  }
+
+  void PopulateAllocationTrackingTraces()
+      REQUIRES(Locks::mutator_lock_, Locks::alloc_tracker_lock_) {
+    gc::AllocRecordObjectMap* records = Runtime::Current()->GetHeap()->GetAllocationRecords();
+    CHECK(records != nullptr);
+    HprofStackTraceSerialNumber next_trace_sn = kHprofNullStackTrace + 1;
+    HprofStackFrameId next_frame_id = 0;
+    size_t count = 0;
+
+    for (auto it = records->Begin(), end = records->End(); it != end; ++it) {
+      const mirror::Object* obj = it->first.Read();
+      if (obj == nullptr) {
+        continue;
+      }
+      ++count;
+      const gc::AllocRecordStackTrace* trace = it->second.GetStackTrace();
+
+      // Copy the pair into a real hash map to speed up look up.
+      auto records_result = allocation_records_.emplace(obj, trace);
+      // The insertion should always succeed, i.e. no duplicate object pointers in "records"
+      CHECK(records_result.second);
+
+      // Generate serial numbers for traces, and IDs for frames.
+      auto traces_result = traces_.find(trace);
+      if (traces_result == traces_.end()) {
+        traces_.emplace(trace, next_trace_sn++);
+        // only check frames if the trace is newly discovered
+        for (size_t i = 0, depth = trace->GetDepth(); i < depth; ++i) {
+          const gc::AllocRecordStackTraceElement* frame = &trace->GetStackElement(i);
+          auto frames_result = frames_.find(frame);
+          if (frames_result == frames_.end()) {
+            frames_.emplace(frame, next_frame_id++);
+          }
+        }
+      }
+    }
+    CHECK_EQ(traces_.size(), next_trace_sn - kHprofNullStackTrace - 1);
+    CHECK_EQ(frames_.size(), next_frame_id);
+    total_objects_with_stack_trace_ = count;
   }
 
   // If direct_to_ddms_ is set, "filename_" and "fd" will be ignored.
@@ -730,17 +877,41 @@ class Hprof : public SingleRootVisitor {
   int fd_;
   bool direct_to_ddms_;
 
-  uint64_t start_ns_;
+  uint64_t start_ns_ = NanoTime();
 
-  EndianOutput* output_;
+  EndianOutput* output_ = nullptr;
 
-  HprofHeapId current_heap_;  // Which heap we're currently dumping.
-  size_t objects_in_segment_;
+  HprofHeapId current_heap_ = HPROF_HEAP_DEFAULT;  // Which heap we're currently dumping.
+  size_t objects_in_segment_ = 0;
 
-  std::set<mirror::Class*> classes_;
-  HprofStringId next_string_id_;
+  size_t total_objects_ = 0u;
+  size_t total_objects_with_stack_trace_ = 0u;
+
+  HprofStringId next_string_id_ = 0x400000;
   SafeMap<std::string, HprofStringId> strings_;
+  HprofClassSerialNumber next_class_serial_number_ = 1;
+  SafeMap<mirror::Class*, HprofClassSerialNumber> classes_;
 
+  std::unordered_map<const gc::AllocRecordStackTrace*, HprofStackTraceSerialNumber,
+                     gc::HashAllocRecordTypesPtr<gc::AllocRecordStackTrace>,
+                     gc::EqAllocRecordTypesPtr<gc::AllocRecordStackTrace>> traces_;
+  std::unordered_map<const gc::AllocRecordStackTraceElement*, HprofStackFrameId,
+                     gc::HashAllocRecordTypesPtr<gc::AllocRecordStackTraceElement>,
+                     gc::EqAllocRecordTypesPtr<gc::AllocRecordStackTraceElement>> frames_;
+  std::unordered_map<const mirror::Object*, const gc::AllocRecordStackTrace*> allocation_records_;
+
+  // Set used to keep track of what simple root records we have already
+  // emitted, to avoid emitting duplicate entries. The simple root records are
+  // those that contain no other information than the root type and the object
+  // id. A pair of root type and object id is packed into a uint64_t, with
+  // the root type in the upper 32 bits and the object id in the lower 32
+  // bits.
+  std::unordered_set<uint64_t> simple_roots_;
+
+  // To make sure we don't dump the same object multiple times. b/34967844
+  std::unordered_set<mirror::Object*> visited_objects_;
+
+  friend class GcRootVisitor;
   DISALLOW_COPY_AND_ASSIGN(Hprof);
 };
 
@@ -818,10 +989,14 @@ void Hprof::MarkRootObject(const mirror::Object* obj, jobject jni_obj, HprofHeap
     case HPROF_ROOT_MONITOR_USED:
     case HPROF_ROOT_INTERNED_STRING:
     case HPROF_ROOT_DEBUGGER:
-    case HPROF_ROOT_VM_INTERNAL:
-      __ AddU1(heap_tag);
-      __ AddObjectId(obj);
+    case HPROF_ROOT_VM_INTERNAL: {
+      uint64_t key = (static_cast<uint64_t>(heap_tag) << 32) | PointerToLowMemUInt32(obj);
+      if (simple_roots_.insert(key).second) {
+        __ AddU1(heap_tag);
+        __ AddObjectId(obj);
+      }
       break;
+    }
 
       // ID: object ID
       // ID: JNI global ref ID
@@ -881,14 +1056,61 @@ void Hprof::MarkRootObject(const mirror::Object* obj, jobject jni_obj, HprofHeap
   ++objects_in_segment_;
 }
 
-static int StackTraceSerialNumber(const mirror::Object* /*obj*/) {
-  return kHprofNullStackTrace;
+bool Hprof::AddRuntimeInternalObjectsField(mirror::Class* klass) {
+  if (klass->IsDexCacheClass()) {
+    return true;
+  }
+  // IsClassLoaderClass is true for subclasses of classloader but we only want to add the fake
+  // field to the java.lang.ClassLoader class.
+  if (klass->IsClassLoaderClass() && klass->GetSuperClass()->IsObjectClass()) {
+    return true;
+  }
+  return false;
 }
 
 void Hprof::DumpHeapObject(mirror::Object* obj) {
   // Ignore classes that are retired.
   if (obj->IsClass() && obj->AsClass()->IsRetired()) {
     return;
+  }
+  DCHECK(visited_objects_.insert(obj).second) << "Already visited " << obj;
+
+  ++total_objects_;
+
+  class RootCollector {
+   public:
+    RootCollector() {}
+
+    void operator()(mirror::Object*, MemberOffset, bool) const {}
+
+    // Note that these don't have read barriers. Its OK however since the GC is guaranteed to not be
+    // running during the hprof dumping process.
+    void VisitRootIfNonNull(mirror::CompressedReference<mirror::Object>* root) const
+        REQUIRES_SHARED(Locks::mutator_lock_) {
+      if (!root->IsNull()) {
+        VisitRoot(root);
+      }
+    }
+
+    void VisitRoot(mirror::CompressedReference<mirror::Object>* root) const
+        REQUIRES_SHARED(Locks::mutator_lock_) {
+      roots_.insert(root->AsMirrorPtr());
+    }
+
+    const std::set<mirror::Object*>& GetRoots() const {
+      return roots_;
+    }
+
+   private:
+    // These roots are actually live from the object. Avoid marking them as roots in hprof to make
+    // it easier to debug class unloading.
+    mutable std::set<mirror::Object*> roots_;
+  };
+
+  RootCollector visitor;
+  // Collect all native roots.
+  if (!obj->IsClass()) {
+    obj->VisitReferences(visitor, VoidFunctor());
   }
 
   gc::Heap* const heap = Runtime::Current()->GetHeap();
@@ -897,13 +1119,18 @@ void Hprof::DumpHeapObject(mirror::Object* obj) {
   if (space != nullptr) {
     if (space->IsZygoteSpace()) {
       heap_type = HPROF_HEAP_ZYGOTE;
-    } else if (space->IsImageSpace()) {
+      VisitRoot(obj, RootInfo(kRootVMInternal));
+    } else if (space->IsImageSpace() && heap->ObjectIsInBootImageSpace(obj)) {
+      // Only count objects in the boot image as HPROF_HEAP_IMAGE, this leaves app image objects as
+      // HPROF_HEAP_APP. b/35762934
       heap_type = HPROF_HEAP_IMAGE;
+      VisitRoot(obj, RootInfo(kRootVMInternal));
     }
   } else {
     const auto* los = heap->GetLargeObjectsSpace();
     if (los->Contains(obj) && los->IsZygoteLargeObject(Thread::Current(), obj)) {
       heap_type = HPROF_HEAP_ZYGOTE;
+      VisitRoot(obj, RootInfo(kRootVMInternal));
     }
   }
   CheckHeapSegmentConstraints();
@@ -947,7 +1174,7 @@ void Hprof::DumpHeapObject(mirror::Object* obj) {
     } else if (c->IsArrayClass()) {
       DumpHeapArray(obj->AsArray(), c);
     } else {
-      DumpHeapInstanceObject(obj, c);
+      DumpHeapInstanceObject(obj, c, visitor.GetRoots());
     }
   }
 
@@ -955,38 +1182,86 @@ void Hprof::DumpHeapObject(mirror::Object* obj) {
 }
 
 void Hprof::DumpHeapClass(mirror::Class* klass) {
-  if (!klass->IsLoaded() && !klass->IsErroneous()) {
-    // Class is allocated but not yet loaded: we cannot access its fields or super class.
+  if (!klass->IsResolved()) {
+    // Class is allocated but not yet resolved: we cannot access its fields or super class.
     return;
   }
-  size_t sFieldCount = klass->NumStaticFields();
-  if (sFieldCount != 0) {
-    int byteLength = sFieldCount * sizeof(JValue);  // TODO bogus; fields are packed
+
+  // Note: We will emit instance fields of Class as synthetic static fields with a prefix of
+  //       "$class$" so the class fields are visible in hprof dumps. For tools to account for that
+  //       correctly, we'll emit an instance size of zero for java.lang.Class, and also emit the
+  //       instance fields of java.lang.Object.
+  //
+  //       For other overhead (currently only the embedded vtable), we will generate a synthetic
+  //       byte array (or field[s] in case the overhead size is of reference size or less).
+
+  const size_t num_static_fields = klass->NumStaticFields();
+
+  // Total class size:
+  //   * class instance fields (including Object instance fields)
+  //   * vtable
+  //   * class static fields
+  const size_t total_class_size = klass->GetClassSize();
+
+  // Base class size (common parts of all Class instances):
+  //   * class instance fields (including Object instance fields)
+  constexpr size_t base_class_size = sizeof(mirror::Class);
+  CHECK_LE(base_class_size, total_class_size);
+
+  // Difference of Total and Base:
+  //   * vtable
+  //   * class static fields
+  const size_t base_overhead_size = total_class_size - base_class_size;
+
+  // Tools (ahat/Studio) will count the static fields and account for them in the class size. We
+  // must thus subtract them from base_overhead_size or they will be double-counted.
+  size_t class_static_fields_size = 0;
+  for (ArtField& class_static_field : klass->GetSFields()) {
+    size_t size = 0;
+    SignatureToBasicTypeAndSize(class_static_field.GetTypeDescriptor(), &size);
+    class_static_fields_size += size;
+  }
+
+  CHECK_GE(base_overhead_size, class_static_fields_size);
+  // Now we have:
+  //   * vtable
+  const size_t base_no_statics_overhead_size = base_overhead_size - class_static_fields_size;
+
+  // We may decide to display native overhead (the actual IMT, ArtFields and ArtMethods) in the
+  // future.
+  const size_t java_heap_overhead_size = base_no_statics_overhead_size;
+
+  // For overhead greater 4, we'll allocate a synthetic array.
+  if (java_heap_overhead_size > 4) {
     // Create a byte array to reflect the allocation of the
     // StaticField array at the end of this class.
     __ AddU1(HPROF_PRIMITIVE_ARRAY_DUMP);
     __ AddClassStaticsId(klass);
-    __ AddU4(StackTraceSerialNumber(klass));
-    __ AddU4(byteLength);
+    __ AddStackTraceSerialNumber(LookupStackTraceSerialNumber(klass));
+    __ AddU4(java_heap_overhead_size - 4);
     __ AddU1(hprof_basic_byte);
-    for (int i = 0; i < byteLength; ++i) {
+    for (size_t i = 0; i < java_heap_overhead_size - 4; ++i) {
       __ AddU1(0);
     }
   }
+  const size_t java_heap_overhead_field_count = java_heap_overhead_size > 0
+                                                    ? (java_heap_overhead_size == 3 ? 2u : 1u)
+                                                    : 0;
 
   __ AddU1(HPROF_CLASS_DUMP);
   __ AddClassId(LookupClassId(klass));
-  __ AddU4(StackTraceSerialNumber(klass));
+  __ AddStackTraceSerialNumber(LookupStackTraceSerialNumber(klass));
   __ AddClassId(LookupClassId(klass->GetSuperClass()));
   __ AddObjectId(klass->GetClassLoader());
   __ AddObjectId(nullptr);    // no signer
   __ AddObjectId(nullptr);    // no prot domain
   __ AddObjectId(nullptr);    // reserved
   __ AddObjectId(nullptr);    // reserved
+  // Instance size.
   if (klass->IsClassClass()) {
-    // ClassObjects have their static fields appended, so aren't all the same size.
-    // But they're at least this size.
-    __ AddU4(sizeof(mirror::Class));  // instance size
+    // As mentioned above, we will emit instance fields as synthetic static fields. So the
+    // base object is "empty."
+    __ AddU4(0);
   } else if (klass->IsStringClass()) {
     // Strings are variable length with character data at the end like arrays.
     // This outputs the size of an empty string.
@@ -1000,53 +1275,124 @@ void Hprof::DumpHeapClass(mirror::Class* klass) {
   __ AddU2(0);  // empty const pool
 
   // Static fields
-  if (sFieldCount == 0) {
-    __ AddU2((uint16_t)0);
-  } else {
-    __ AddU2((uint16_t)(sFieldCount+1));
-    __ AddStringId(LookupStringId(kStaticOverheadName));
-    __ AddU1(hprof_basic_object);
-    __ AddClassStaticsId(klass);
+  //
+  // Note: we report Class' and Object's instance fields here, too. This is for visibility reasons.
+  //       (b/38167721)
+  mirror::Class* class_class = klass->GetClass();
 
-    for (size_t i = 0; i < sFieldCount; ++i) {
-      ArtField* f = klass->GetStaticField(i);
+  DCHECK(class_class->GetSuperClass()->IsObjectClass());
+  const size_t static_fields_reported = class_class->NumInstanceFields()
+                                        + class_class->GetSuperClass()->NumInstanceFields()
+                                        + java_heap_overhead_field_count
+                                        + num_static_fields;
+  __ AddU2(dchecked_integral_cast<uint16_t>(static_fields_reported));
 
-      size_t size;
-      HprofBasicType t = SignatureToBasicTypeAndSize(f->GetTypeDescriptor(), &size);
-      __ AddStringId(LookupStringId(f->GetName()));
-      __ AddU1(t);
-      switch (t) {
-        case hprof_basic_byte:
-          __ AddU1(f->GetByte(klass));
+  if (java_heap_overhead_size != 0) {
+    __ AddStringId(LookupStringId(kClassOverheadName));
+    size_t overhead_fields = 0;
+    if (java_heap_overhead_size > 4) {
+      __ AddU1(hprof_basic_object);
+      __ AddClassStaticsId(klass);
+      ++overhead_fields;
+    } else {
+      switch (java_heap_overhead_size) {
+        case 4: {
+          __ AddU1(hprof_basic_int);
+          __ AddU4(0);
+          ++overhead_fields;
           break;
-        case hprof_basic_boolean:
-          __ AddU1(f->GetBoolean(klass));
+        }
+
+        case 2: {
+          __ AddU1(hprof_basic_short);
+          __ AddU2(0);
+          ++overhead_fields;
           break;
-        case hprof_basic_char:
-          __ AddU2(f->GetChar(klass));
+        }
+
+        case 3: {
+          __ AddU1(hprof_basic_short);
+          __ AddU2(0);
+          __ AddStringId(LookupStringId(std::string(kClassOverheadName) + "2"));
+          ++overhead_fields;
+        }
+        FALLTHROUGH_INTENDED;
+
+        case 1: {
+          __ AddU1(hprof_basic_byte);
+          __ AddU1(0);
+          ++overhead_fields;
           break;
-        case hprof_basic_short:
-          __ AddU2(f->GetShort(klass));
-          break;
-        case hprof_basic_float:
-        case hprof_basic_int:
-        case hprof_basic_object:
-          __ AddU4(f->Get32(klass));
-          break;
-        case hprof_basic_double:
-        case hprof_basic_long:
-          __ AddU8(f->Get64(klass));
-          break;
-        default:
-          LOG(FATAL) << "Unexpected size " << size;
-          UNREACHABLE();
+        }
       }
+    }
+    DCHECK_EQ(java_heap_overhead_field_count, overhead_fields);
+  }
+
+  // Helper lambda to emit the given static field. The second argument name_fn will be called to
+  // generate the name to emit. This can be used to emit something else than the field's actual
+  // name.
+  auto static_field_writer = [&](ArtField& field, auto name_fn)
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    __ AddStringId(LookupStringId(name_fn(field)));
+
+    size_t size;
+    HprofBasicType t = SignatureToBasicTypeAndSize(field.GetTypeDescriptor(), &size);
+    __ AddU1(t);
+    switch (t) {
+      case hprof_basic_byte:
+        __ AddU1(field.GetByte(klass));
+        return;
+      case hprof_basic_boolean:
+        __ AddU1(field.GetBoolean(klass));
+        return;
+      case hprof_basic_char:
+        __ AddU2(field.GetChar(klass));
+        return;
+      case hprof_basic_short:
+        __ AddU2(field.GetShort(klass));
+        return;
+      case hprof_basic_float:
+      case hprof_basic_int:
+      case hprof_basic_object:
+        __ AddU4(field.Get32(klass));
+        return;
+      case hprof_basic_double:
+      case hprof_basic_long:
+        __ AddU8(field.Get64(klass));
+        return;
+    }
+    LOG(FATAL) << "Unexpected size " << size;
+    UNREACHABLE();
+  };
+
+  {
+    auto class_instance_field_name_fn = [](ArtField& field) REQUIRES_SHARED(Locks::mutator_lock_) {
+      return std::string("$class$") + field.GetName();
+    };
+    for (ArtField& class_instance_field : class_class->GetIFields()) {
+      static_field_writer(class_instance_field, class_instance_field_name_fn);
+    }
+    for (ArtField& object_instance_field : class_class->GetSuperClass()->GetIFields()) {
+      static_field_writer(object_instance_field, class_instance_field_name_fn);
+    }
+  }
+
+  {
+    auto class_static_field_name_fn = [](ArtField& field) REQUIRES_SHARED(Locks::mutator_lock_) {
+      return field.GetName();
+    };
+    for (ArtField& class_static_field : klass->GetSFields()) {
+      static_field_writer(class_static_field, class_static_field_name_fn);
     }
   }
 
   // Instance fields for this class (no superclass fields)
   int iFieldCount = klass->NumInstanceFields();
-  if (klass->IsStringClass()) {
+  // add_internal_runtime_objects is only for classes that may retain objects live through means
+  // other than fields. It is never the case for strings.
+  const bool add_internal_runtime_objects = AddRuntimeInternalObjectsField(klass);
+  if (klass->IsStringClass() || add_internal_runtime_objects) {
     __ AddU2((uint16_t)iFieldCount + 1);
   } else {
     __ AddU2((uint16_t)iFieldCount);
@@ -1057,10 +1403,24 @@ void Hprof::DumpHeapClass(mirror::Class* klass) {
     HprofBasicType t = SignatureToBasicTypeAndSize(f->GetTypeDescriptor(), nullptr);
     __ AddU1(t);
   }
-  // Add native value character array for strings.
+  // Add native value character array for strings / byte array for compressed strings.
   if (klass->IsStringClass()) {
     __ AddStringId(LookupStringId("value"));
     __ AddU1(hprof_basic_object);
+  } else if (add_internal_runtime_objects) {
+    __ AddStringId(LookupStringId("runtimeInternalObjects"));
+    __ AddU1(hprof_basic_object);
+  }
+}
+
+void Hprof::DumpFakeObjectArray(mirror::Object* obj, const std::set<mirror::Object*>& elements) {
+  __ AddU1(HPROF_OBJECT_ARRAY_DUMP);
+  __ AddObjectId(obj);
+  __ AddStackTraceSerialNumber(LookupStackTraceSerialNumber(obj));
+  __ AddU4(elements.size());
+  __ AddClassId(LookupClassId(GetClassRoot<mirror::ObjectArray<mirror::Object>>().Ptr()));
+  for (mirror::Object* e : elements) {
+    __ AddObjectId(e);
   }
 }
 
@@ -1072,7 +1432,7 @@ void Hprof::DumpHeapArray(mirror::Array* obj, mirror::Class* klass) {
     __ AddU1(HPROF_OBJECT_ARRAY_DUMP);
 
     __ AddObjectId(obj);
-    __ AddU4(StackTraceSerialNumber(obj));
+    __ AddStackTraceSerialNumber(LookupStackTraceSerialNumber(obj));
     __ AddU4(length);
     __ AddClassId(LookupClassId(klass));
 
@@ -1087,7 +1447,7 @@ void Hprof::DumpHeapArray(mirror::Array* obj, mirror::Class* klass) {
     __ AddU1(HPROF_PRIMITIVE_ARRAY_DUMP);
 
     __ AddObjectId(obj);
-    __ AddU4(StackTraceSerialNumber(obj));
+    __ AddStackTraceSerialNumber(LookupStackTraceSerialNumber(obj));
     __ AddU4(length);
     __ AddU1(t);
 
@@ -1104,11 +1464,13 @@ void Hprof::DumpHeapArray(mirror::Array* obj, mirror::Class* klass) {
   }
 }
 
-void Hprof::DumpHeapInstanceObject(mirror::Object* obj, mirror::Class* klass) {
+void Hprof::DumpHeapInstanceObject(mirror::Object* obj,
+                                   mirror::Class* klass,
+                                   const std::set<mirror::Object*>& fake_roots) {
   // obj is an instance object.
   __ AddU1(HPROF_INSTANCE_DUMP);
   __ AddObjectId(obj);
-  __ AddU4(StackTraceSerialNumber(obj));
+  __ AddStackTraceSerialNumber(LookupStackTraceSerialNumber(obj));
   __ AddClassId(LookupClassId(klass));
 
   // Reserve some space for the length of the instance data, which we won't
@@ -1118,6 +1480,7 @@ void Hprof::DumpHeapInstanceObject(mirror::Object* obj, mirror::Class* klass) {
 
   // What we will use for the string value if the object is a string.
   mirror::Object* string_value = nullptr;
+  mirror::Object* fake_object_array = nullptr;
 
   // Write the instance data;  fields for this class, followed by super class fields, and so on.
   do {
@@ -1139,8 +1502,16 @@ void Hprof::DumpHeapInstanceObject(mirror::Object* obj, mirror::Class* klass) {
       case hprof_basic_short:
         __ AddU2(f->GetShort(obj));
         break;
-      case hprof_basic_float:
       case hprof_basic_int:
+        if (mirror::kUseStringCompression &&
+            klass->IsStringClass() &&
+            f->GetOffset().SizeValue() == mirror::String::CountOffset().SizeValue()) {
+          // Store the string length instead of the raw count field with compression flag.
+          __ AddU4(obj->AsString()->GetLength());
+          break;
+        }
+        FALLTHROUGH_INTENDED;
+      case hprof_basic_float:
       case hprof_basic_object:
         __ AddU4(f->Get32(obj));
         break;
@@ -1158,11 +1529,19 @@ void Hprof::DumpHeapInstanceObject(mirror::Object* obj, mirror::Class* klass) {
         string_value = reinterpret_cast<mirror::Object*>(
             reinterpret_cast<uintptr_t>(s) + kObjectAlignment);
       } else {
-        string_value = reinterpret_cast<mirror::Object*>(s->GetValue());
+        if (s->IsCompressed()) {
+          string_value = reinterpret_cast<mirror::Object*>(s->GetValueCompressed());
+        } else {
+          string_value = reinterpret_cast<mirror::Object*>(s->GetValue());
+        }
       }
       __ AddObjectId(string_value);
+    } else if (AddRuntimeInternalObjectsField(klass)) {
+      // We need an id that is guaranteed to not be used, use 1/2 of the object alignment.
+      fake_object_array = reinterpret_cast<mirror::Object*>(
+          reinterpret_cast<uintptr_t>(obj) + kObjectAlignment / 2);
+      __ AddObjectId(fake_object_array);
     }
-
     klass = klass->GetSuperClass();
   } while (klass != nullptr);
 
@@ -1175,10 +1554,17 @@ void Hprof::DumpHeapInstanceObject(mirror::Object* obj, mirror::Class* klass) {
     mirror::String* s = obj->AsString();
     __ AddU1(HPROF_PRIMITIVE_ARRAY_DUMP);
     __ AddObjectId(string_value);
-    __ AddU4(StackTraceSerialNumber(obj));
+    __ AddStackTraceSerialNumber(LookupStackTraceSerialNumber(obj));
     __ AddU4(s->GetLength());
-    __ AddU1(hprof_basic_char);
-    __ AddU2List(s->GetValue(), s->GetLength());
+    if (s->IsCompressed()) {
+      __ AddU1(hprof_basic_byte);
+      __ AddU1List(s->GetValueCompressed(), s->GetLength());
+    } else {
+      __ AddU1(hprof_basic_char);
+      __ AddU2List(s->GetValue(), s->GetLength());
+    }
+  } else if (fake_object_array != nullptr) {
+    DumpFakeObjectArray(fake_object_array, fake_roots);
   }
 }
 
@@ -1213,21 +1599,15 @@ void Hprof::VisitRoot(mirror::Object* obj, const RootInfo& info) {
 // Otherwise, "filename" is used to create an output file.
 void DumpHeap(const char* filename, int fd, bool direct_to_ddms) {
   CHECK(filename != nullptr);
-
   Thread* self = Thread::Current();
-  gc::Heap* heap = Runtime::Current()->GetHeap();
-  if (heap->IsGcConcurrentAndMoving()) {
-    // Need to take a heap dump while GC isn't running. See the
-    // comment in Heap::VisitObjects().
-    heap->IncrementDisableMovingGC(self);
-  }
-  Runtime::Current()->GetThreadList()->SuspendAll(__FUNCTION__, true /* long suspend */);
+  // Need to take a heap dump while GC isn't running. See the comment in Heap::VisitObjects().
+  // Also we need the critical section to avoid visiting the same object twice. See b/34967844
+  gc::ScopedGCCriticalSection gcs(self,
+                                  gc::kGcCauseHprof,
+                                  gc::kCollectorTypeHprof);
+  ScopedSuspendAll ssa(__FUNCTION__, true /* long suspend */);
   Hprof hprof(filename, fd, direct_to_ddms);
   hprof.Dump();
-  Runtime::Current()->GetThreadList()->ResumeAll();
-  if (heap->IsGcConcurrentAndMoving()) {
-    heap->DecrementDisableMovingGC(self);
-  }
 }
 
 }  // namespace hprof

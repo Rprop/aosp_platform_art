@@ -21,11 +21,13 @@
 #include <gtest/gtest.h>
 
 #include "common_runtime_test.h"
-#include "scoped_thread_state_change.h"
+#include "dexopt_test.h"
+#include "scoped_thread_state_change-inl.h"
+#include "vdex_file.h"
 
 namespace art {
 
-class OatFileTest : public CommonRuntimeTest {
+class OatFileTest : public DexoptTest {
 };
 
 TEST_F(OatFileTest, ResolveRelativeEncodedDexLocation) {
@@ -45,13 +47,13 @@ TEST_F(OatFileTest, ResolveRelativeEncodedDexLocation) {
       OatFile::ResolveRelativeEncodedDexLocation(
         "/data/app/foo/base.apk", "foo/base.apk"));
 
-  EXPECT_EQ(std::string("/data/app/foo/base.apk:classes2.dex"),
+  EXPECT_EQ(std::string("/data/app/foo/base.apk!classes2.dex"),
       OatFile::ResolveRelativeEncodedDexLocation(
-        "/data/app/foo/base.apk", "base.apk:classes2.dex"));
+        "/data/app/foo/base.apk", "base.apk!classes2.dex"));
 
-  EXPECT_EQ(std::string("/data/app/foo/base.apk:classes11.dex"),
+  EXPECT_EQ(std::string("/data/app/foo/base.apk!classes11.dex"),
       OatFile::ResolveRelativeEncodedDexLocation(
-        "/data/app/foo/base.apk", "base.apk:classes11.dex"));
+        "/data/app/foo/base.apk", "base.apk!classes11.dex"));
 
   EXPECT_EQ(std::string("base.apk"),
       OatFile::ResolveRelativeEncodedDexLocation(
@@ -62,54 +64,73 @@ TEST_F(OatFileTest, ResolveRelativeEncodedDexLocation) {
         "/data/app/foo/base.apk", "o/base.apk"));
 }
 
-static std::vector<const DexFile*> ToConstDexFiles(
-    const std::vector<std::unique_ptr<const DexFile>>& in) {
-  std::vector<const DexFile*> ret;
-  for (auto& d : in) {
-    ret.push_back(d.get());
-  }
-  return ret;
+TEST_F(OatFileTest, LoadOat) {
+  std::string dex_location = GetScratchDir() + "/LoadOat.jar";
+
+  Copy(GetDexSrc1(), dex_location);
+  GenerateOatForTest(dex_location.c_str(), CompilerFilter::kSpeed);
+
+  std::string oat_location;
+  std::string error_msg;
+  ASSERT_TRUE(OatFileAssistant::DexLocationToOatFilename(
+        dex_location, kRuntimeISA, &oat_location, &error_msg)) << error_msg;
+  std::unique_ptr<OatFile> odex_file(OatFile::Open(/* zip_fd */ -1,
+                                                   oat_location.c_str(),
+                                                   oat_location.c_str(),
+                                                   nullptr,
+                                                   nullptr,
+                                                   false,
+                                                   /*low_4gb*/false,
+                                                   dex_location.c_str(),
+                                                   &error_msg));
+  ASSERT_TRUE(odex_file.get() != nullptr);
+
+  // Check that the vdex file was loaded in the reserved space of odex file.
+  EXPECT_EQ(odex_file->GetVdexFile()->Begin(), odex_file->VdexBegin());
 }
 
-TEST_F(OatFileTest, DexFileDependencies) {
+TEST_F(OatFileTest, ChangingMultiDexUncompressed) {
+  std::string dex_location = GetScratchDir() + "/MultiDexUncompressed.jar";
+
+  Copy(GetTestDexFileName("MultiDexUncompressed"), dex_location);
+  GenerateOatForTest(dex_location.c_str(), CompilerFilter::kQuicken);
+
+  std::string oat_location;
   std::string error_msg;
+  ASSERT_TRUE(OatFileAssistant::DexLocationToOatFilename(
+        dex_location, kRuntimeISA, &oat_location, &error_msg)) << error_msg;
 
-  // No dependencies.
-  EXPECT_TRUE(OatFile::CheckStaticDexFileDependencies(nullptr, &error_msg)) << error_msg;
-  EXPECT_TRUE(OatFile::CheckStaticDexFileDependencies("", &error_msg)) << error_msg;
+  // Ensure we can load that file. Just a precondition.
+  {
+    std::unique_ptr<OatFile> odex_file(OatFile::Open(/* zip_fd */ -1,
+                                                     oat_location.c_str(),
+                                                     oat_location.c_str(),
+                                                     nullptr,
+                                                     nullptr,
+                                                     false,
+                                                     /*low_4gb*/false,
+                                                     dex_location.c_str(),
+                                                     &error_msg));
+    ASSERT_TRUE(odex_file != nullptr);
+    ASSERT_EQ(2u, odex_file->GetOatDexFiles().size());
+  }
 
-  // Ill-formed dependencies.
-  EXPECT_FALSE(OatFile::CheckStaticDexFileDependencies("abc", &error_msg));
-  EXPECT_FALSE(OatFile::CheckStaticDexFileDependencies("abc*123*def", &error_msg));
-  EXPECT_FALSE(OatFile::CheckStaticDexFileDependencies("abc*def*", &error_msg));
+  // Now replace the source.
+  Copy(GetTestDexFileName("MainUncompressed"), dex_location);
 
-  // Unsatisfiable dependency.
-  EXPECT_FALSE(OatFile::CheckStaticDexFileDependencies("abc*123*", &error_msg));
-
-  // Load some dex files to be able to do a real test.
-  ScopedObjectAccess soa(Thread::Current());
-
-  std::vector<std::unique_ptr<const DexFile>> dex_files1 = OpenTestDexFiles("Main");
-  std::vector<const DexFile*> dex_files_const1 = ToConstDexFiles(dex_files1);
-  std::string encoding1 = OatFile::EncodeDexFileDependencies(dex_files_const1);
-  EXPECT_TRUE(OatFile::CheckStaticDexFileDependencies(encoding1.c_str(), &error_msg))
-      << error_msg << " " << encoding1;
-  std::vector<std::string> split1;
-  EXPECT_TRUE(OatFile::GetDexLocationsFromDependencies(encoding1.c_str(), &split1));
-  ASSERT_EQ(split1.size(), 1U);
-  EXPECT_EQ(split1[0], dex_files_const1[0]->GetLocation());
-
-  std::vector<std::unique_ptr<const DexFile>> dex_files2 = OpenTestDexFiles("MultiDex");
-  EXPECT_GT(dex_files2.size(), 1U);
-  std::vector<const DexFile*> dex_files_const2 = ToConstDexFiles(dex_files2);
-  std::string encoding2 = OatFile::EncodeDexFileDependencies(dex_files_const2);
-  EXPECT_TRUE(OatFile::CheckStaticDexFileDependencies(encoding2.c_str(), &error_msg))
-      << error_msg << " " << encoding2;
-  std::vector<std::string> split2;
-  EXPECT_TRUE(OatFile::GetDexLocationsFromDependencies(encoding2.c_str(), &split2));
-  ASSERT_EQ(split2.size(), 2U);
-  EXPECT_EQ(split2[0], dex_files_const2[0]->GetLocation());
-  EXPECT_EQ(split2[1], dex_files_const2[1]->GetLocation());
+  // And try to load again.
+  std::unique_ptr<OatFile> odex_file(OatFile::Open(/* zip_fd */ -1,
+                                                   oat_location.c_str(),
+                                                   oat_location.c_str(),
+                                                   nullptr,
+                                                   nullptr,
+                                                   false,
+                                                   /*low_4gb*/false,
+                                                   dex_location.c_str(),
+                                                   &error_msg));
+  EXPECT_TRUE(odex_file == nullptr);
+  EXPECT_NE(std::string::npos, error_msg.find("expected 2 uncompressed dex files, but found 1"))
+      << error_msg;
 }
 
 }  // namespace art

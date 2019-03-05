@@ -14,10 +14,13 @@
  * limitations under the License.
  */
 
+#include "art_method-inl.h"
 #include "callee_save_frame.h"
+#include "dex/code_item_accessors-inl.h"
+#include "dex/dex_instruction-inl.h"
 #include "common_throws.h"
-#include "entrypoints/entrypoint_utils-inl.h"
 #include "mirror/object-inl.h"
+#include "nth_caller_visitor.h"
 #include "thread.h"
 #include "well_known_classes.h"
 
@@ -25,14 +28,23 @@ namespace art {
 
 // Deliver an exception that's pending on thread helping set up a callee save frame on the way.
 extern "C" NO_RETURN void artDeliverPendingExceptionFromCode(Thread* self)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   ScopedQuickEntrypointChecks sqec(self);
   self->QuickDeliverException();
 }
 
-// Called by generated call to throw an exception.
+extern "C" NO_RETURN uint64_t artInvokeObsoleteMethod(ArtMethod* method, Thread* self)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  DCHECK(method->IsObsolete());
+  ScopedQuickEntrypointChecks sqec(self);
+  ThrowInternalError("Attempting to invoke obsolete version of '%s'.",
+                     method->PrettyMethod().c_str());
+  self->QuickDeliverException();
+}
+
+// Called by generated code to throw an exception.
 extern "C" NO_RETURN void artDeliverExceptionFromCode(mirror::Throwable* exception, Thread* self)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   /*
    * exception may be null, in which case this routine should
    * throw NPE.  NOTE: this is a convenience for generated code,
@@ -49,61 +61,96 @@ extern "C" NO_RETURN void artDeliverExceptionFromCode(mirror::Throwable* excepti
   self->QuickDeliverException();
 }
 
-// Called by generated call to throw a NPE exception.
+// Called by generated code to throw a NPE exception.
 extern "C" NO_RETURN void artThrowNullPointerExceptionFromCode(Thread* self)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   ScopedQuickEntrypointChecks sqec(self);
-  self->NoteSignalBeingHandled();
-  ThrowNullPointerExceptionFromDexPC();
-  self->NoteSignalHandlerDone();
+  // We come from an explicit check in the generated code. This path is triggered
+  // only if the object is indeed null.
+  ThrowNullPointerExceptionFromDexPC(/* check_address */ false, 0U);
   self->QuickDeliverException();
 }
 
-// Called by generated call to throw an arithmetic divide by zero exception.
+// Installed by a signal handler to throw a NPE exception.
+extern "C" NO_RETURN void artThrowNullPointerExceptionFromSignal(uintptr_t addr, Thread* self)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  ScopedQuickEntrypointChecks sqec(self);
+  ThrowNullPointerExceptionFromDexPC(/* check_address */ true, addr);
+  self->QuickDeliverException();
+}
+
+// Called by generated code to throw an arithmetic divide by zero exception.
 extern "C" NO_RETURN void artThrowDivZeroFromCode(Thread* self)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   ScopedQuickEntrypointChecks sqec(self);
   ThrowArithmeticExceptionDivideByZero();
   self->QuickDeliverException();
 }
 
-// Called by generated call to throw an array index out of bounds exception.
+// Called by generated code to throw an array index out of bounds exception.
 extern "C" NO_RETURN void artThrowArrayBoundsFromCode(int index, int length, Thread* self)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   ScopedQuickEntrypointChecks sqec(self);
   ThrowArrayIndexOutOfBoundsException(index, length);
   self->QuickDeliverException();
 }
 
-extern "C" NO_RETURN void artThrowStackOverflowFromCode(Thread* self)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+// Called by generated code to throw a string index out of bounds exception.
+extern "C" NO_RETURN void artThrowStringBoundsFromCode(int index, int length, Thread* self)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   ScopedQuickEntrypointChecks sqec(self);
-  self->NoteSignalBeingHandled();
-  ThrowStackOverflowError(self);
-  self->NoteSignalHandlerDone();
+  ThrowStringIndexOutOfBoundsException(index, length);
   self->QuickDeliverException();
 }
 
-extern "C" NO_RETURN void artThrowNoSuchMethodFromCode(int32_t method_idx, Thread* self)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+extern "C" NO_RETURN void artThrowStackOverflowFromCode(Thread* self)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   ScopedQuickEntrypointChecks sqec(self);
-  ThrowNoSuchMethodError(method_idx);
+  ThrowStackOverflowError(self);
   self->QuickDeliverException();
 }
 
 extern "C" NO_RETURN void artThrowClassCastException(mirror::Class* dest_type,
                                                      mirror::Class* src_type,
                                                      Thread* self)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   ScopedQuickEntrypointChecks sqec(self);
+  if (dest_type == nullptr) {
+    // Find the target class for check cast using the bitstring check (dest_type == null).
+    NthCallerVisitor visitor(self, 0u);
+    visitor.WalkStack();
+    DCHECK(visitor.caller != nullptr);
+    uint32_t dex_pc = visitor.GetDexPc();
+    CodeItemDataAccessor accessor(*visitor.caller->GetDexFile(), visitor.caller->GetCodeItem());
+    const Instruction& check_cast = accessor.InstructionAt(dex_pc);
+    DCHECK_EQ(check_cast.Opcode(), Instruction::CHECK_CAST);
+    dex::TypeIndex type_index(check_cast.VRegB_21c());
+    ClassLinker* linker = Runtime::Current()->GetClassLinker();
+    dest_type = linker->LookupResolvedType(type_index, visitor.caller).Ptr();
+    CHECK(dest_type != nullptr) << "Target class should have been previously resolved: "
+        << visitor.caller->GetDexFile()->PrettyType(type_index);
+    CHECK(!dest_type->IsAssignableFrom(src_type))
+        << " " << std::hex << dest_type->PrettyDescriptor() << ";" << dest_type->Depth()
+        << "/" << dest_type->GetField32(mirror::Class::StatusOffset())
+        << " <: " << src_type->PrettyDescriptor() << ";" << src_type->Depth()
+        << "/" << src_type->GetField32(mirror::Class::StatusOffset());
+  }
   DCHECK(!dest_type->IsAssignableFrom(src_type));
   ThrowClassCastException(dest_type, src_type);
   self->QuickDeliverException();
 }
 
+extern "C" NO_RETURN void artThrowClassCastExceptionForObject(mirror::Object* obj,
+                                                              mirror::Class* dest_type,
+                                                              Thread* self)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  DCHECK(obj != nullptr);
+  artThrowClassCastException(dest_type, obj->GetClass(), self);
+}
+
 extern "C" NO_RETURN void artThrowArrayStoreException(mirror::Object* array, mirror::Object* value,
                                                       Thread* self)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   ScopedQuickEntrypointChecks sqec(self);
   ThrowArrayStoreException(value->GetClass(), array->GetClass());
   self->QuickDeliverException();

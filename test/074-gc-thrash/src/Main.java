@@ -52,9 +52,9 @@ public class Main {
             try {
                 dumpHprofDataMethod.invoke(null, dumpFile);
             } catch (IllegalAccessException iae) {
-                System.err.println(iae);
+                System.out.println(iae);
             } catch (InvocationTargetException ite) {
-                System.err.println(ite);
+                System.out.println(ite);
             }
         }
 
@@ -69,7 +69,7 @@ public class Main {
      */
     private static Method getDumpHprofDataMethod() {
         ClassLoader myLoader = Main.class.getClassLoader();
-        Class vmdClass;
+        Class<?> vmdClass;
         try {
             vmdClass = myLoader.loadClass("dalvik.system.VMDebug");
         } catch (ClassNotFoundException cnfe) {
@@ -78,10 +78,9 @@ public class Main {
 
         Method meth;
         try {
-            meth = vmdClass.getMethod("dumpHprofData",
-                    new Class[] { String.class });
+            meth = vmdClass.getMethod("dumpHprofData", String.class);
         } catch (NoSuchMethodException nsme) {
-            System.err.println("Found VMDebug but not dumpHprofData method");
+            System.out.println("Found VMDebug but not dumpHprofData method");
             return null;
         }
 
@@ -127,7 +126,7 @@ public class Main {
             deep.join();
             large.join();
         } catch (InterruptedException ie) {
-            System.err.println("join was interrupted");
+            System.out.println("join was interrupted");
         }
     }
 
@@ -138,7 +137,7 @@ public class Main {
         try {
             Thread.sleep(ms);
         } catch (InterruptedException ie) {
-            System.err.println("sleep was interrupted");
+            System.out.println("sleep was interrupted");
         }
     }
 
@@ -214,7 +213,7 @@ class Deep extends Thread {
         }
 
         if (!once) {
-            System.err.println("not even once?");
+            System.out.println("not even once?");
             return;
         }
 
@@ -230,7 +229,7 @@ class Deep extends Thread {
 
         for (int i = 0; i < MAX_DEPTH; i++) {
             if (weak[i].get() != null) {
-                System.err.println("Deep: weak still has " + i);
+                System.out.println("Deep: weak still has " + i);
             }
         }
 
@@ -252,7 +251,7 @@ class Deep extends Thread {
     private static void checkStringReferences() {
       for (int i = 0; i < MAX_DEPTH; i++) {
           if (strong[i] != weak[i].get()) {
-              System.err.println("Deep: " + i + " strong=" + strong[i] +
+              System.out.println("Deep: " + i + " strong=" + strong[i] +
                   ", weak=" + weak[i].get());
           }
       }

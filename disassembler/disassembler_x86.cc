@@ -21,9 +21,10 @@
 #include <ostream>
 #include <sstream>
 
-#include "base/logging.h"
-#include "base/stringprintf.h"
-#include "thread.h"
+#include "android-base/logging.h"
+#include "android-base/stringprintf.h"
+
+using android::base::StringPrintf;
 
 namespace art {
 namespace x86 {
@@ -243,7 +244,38 @@ std::string DisassemblerX86::DumpAddress(uint8_t mod, uint8_t rm, uint8_t rex64,
   return address.str();
 }
 
+size_t DisassemblerX86::DumpNops(std::ostream& os, const uint8_t* instr) {
+static constexpr uint8_t kNops[][10] = {
+      { },
+      { 0x90 },
+      { 0x66, 0x90 },
+      { 0x0f, 0x1f, 0x00 },
+      { 0x0f, 0x1f, 0x40, 0x00 },
+      { 0x0f, 0x1f, 0x44, 0x00, 0x00 },
+      { 0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00 },
+      { 0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00 },
+      { 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 },
+      { 0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 },
+      { 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 }
+  };
+
+  for (size_t i = 1; i < arraysize(kNops); ++i) {
+    if (memcmp(instr, kNops[i], i) == 0) {
+      os << FormatInstructionPointer(instr)
+         << StringPrintf(": %22s    \t       nop \n", DumpCodeHex(instr, instr + i).c_str());
+      return i;
+    }
+  }
+
+  return 0;
+}
+
 size_t DisassemblerX86::DumpInstruction(std::ostream& os, const uint8_t* instr) {
+  size_t nop_size = DumpNops(os, instr);
+  if (nop_size != 0u) {
+    return nop_size;
+  }
+
   const uint8_t* begin_instr = instr;
   bool have_prefixes = true;
   uint8_t prefix[4] = {0, 0, 0, 0};
@@ -400,6 +432,7 @@ DISASSEMBLER_ENTRY(cmp,
   case 0x89: opcode1 = "mov"; store = true; has_modrm = true; break;
   case 0x8A: opcode1 = "mov"; load = true; has_modrm = true; byte_operand = true; break;
   case 0x8B: opcode1 = "mov"; load = true; has_modrm = true; break;
+  case 0x9D: opcode1 = "popf"; break;
 
   case 0x0F:  // 2 byte extended opcode
     instr++;
@@ -541,6 +574,76 @@ DISASSEMBLER_ENTRY(cmp,
               load = true;
               src_reg_file = dst_reg_file = SSE;
               break;
+            case 0x29:
+              opcode1 = "pcmpeqq";
+              prefix[2] = 0;
+              has_modrm = true;
+              load = true;
+              src_reg_file = dst_reg_file = SSE;
+              break;
+            case 0x37:
+              opcode1 = "pcmpgtq";
+              prefix[2] = 0;
+              has_modrm = true;
+              load = true;
+              src_reg_file = dst_reg_file = SSE;
+              break;
+            case 0x38:
+              opcode1 = "pminsb";
+              prefix[2] = 0;
+              has_modrm = true;
+              load = true;
+              src_reg_file = dst_reg_file = SSE;
+              break;
+            case 0x39:
+              opcode1 = "pminsd";
+              prefix[2] = 0;
+              has_modrm = true;
+              load = true;
+              src_reg_file = dst_reg_file = SSE;
+              break;
+            case 0x3A:
+              opcode1 = "pminuw";
+              prefix[2] = 0;
+              has_modrm = true;
+              load = true;
+              src_reg_file = dst_reg_file = SSE;
+              break;
+            case 0x3B:
+              opcode1 = "pminud";
+              prefix[2] = 0;
+              has_modrm = true;
+              load = true;
+              src_reg_file = dst_reg_file = SSE;
+              break;
+            case 0x3C:
+              opcode1 = "pmaxsb";
+              prefix[2] = 0;
+              has_modrm = true;
+              load = true;
+              src_reg_file = dst_reg_file = SSE;
+              break;
+            case 0x3D:
+              opcode1 = "pmaxsd";
+              prefix[2] = 0;
+              has_modrm = true;
+              load = true;
+              src_reg_file = dst_reg_file = SSE;
+              break;
+            case 0x3E:
+              opcode1 = "pmaxuw";
+              prefix[2] = 0;
+              has_modrm = true;
+              load = true;
+              src_reg_file = dst_reg_file = SSE;
+              break;
+            case 0x3F:
+              opcode1 = "pmaxud";
+              prefix[2] = 0;
+              has_modrm = true;
+              load = true;
+              src_reg_file = dst_reg_file = SSE;
+              break;
             case 0x40:
               opcode1 = "pmulld";
               prefix[2] = 0;
@@ -565,7 +668,7 @@ DISASSEMBLER_ENTRY(cmp,
               opcode1 = "roundss";
               prefix[2] = 0;
               has_modrm = true;
-              store = true;
+              load = true;
               src_reg_file = SSE;
               dst_reg_file = SSE;
               immediate_bytes = 1;
@@ -574,7 +677,7 @@ DISASSEMBLER_ENTRY(cmp,
               opcode1 = "roundsd";
               prefix[2] = 0;
               has_modrm = true;
-              store = true;
+              load = true;
               src_reg_file = SSE;
               dst_reg_file = SSE;
               immediate_bytes = 1;
@@ -689,6 +792,7 @@ DISASSEMBLER_ENTRY(cmp,
         src_reg_file = dst_reg_file = SSE;
         break;
       case 0x60: case 0x61: case 0x62: case 0x6C:
+      case 0x68: case 0x69: case 0x6A: case 0x6D:
         if (prefix[2] == 0x66) {
           src_reg_file = dst_reg_file = SSE;
           prefix[2] = 0;  // Clear prefix now. It has served its purpose as part of the opcode.
@@ -700,9 +804,31 @@ DISASSEMBLER_ENTRY(cmp,
           case 0x61: opcode1 = "punpcklwd"; break;
           case 0x62: opcode1 = "punpckldq"; break;
           case 0x6c: opcode1 = "punpcklqdq"; break;
+          case 0x68: opcode1 = "punpckhbw"; break;
+          case 0x69: opcode1 = "punpckhwd"; break;
+          case 0x6A: opcode1 = "punpckhdq"; break;
+          case 0x6D: opcode1 = "punpckhqdq"; break;
         }
         load = true;
         has_modrm = true;
+        break;
+      case 0x64:
+      case 0x65:
+      case 0x66:
+        if (prefix[2] == 0x66) {
+          src_reg_file = dst_reg_file = SSE;
+          prefix[2] = 0;  // clear prefix now it's served its purpose as part of the opcode
+        } else {
+          src_reg_file = dst_reg_file = MMX;
+        }
+        switch (*instr) {
+          case 0x64: opcode1 = "pcmpgtb"; break;
+          case 0x65: opcode1 = "pcmpgtw"; break;
+          case 0x66: opcode1 = "pcmpgtd"; break;
+        }
+        prefix[2] = 0;
+        has_modrm = true;
+        load = true;
         break;
       case 0x6E:
         if (prefix[2] == 0x66) {
@@ -799,6 +925,24 @@ DISASSEMBLER_ENTRY(cmp,
         store = true;
         immediate_bytes = 1;
         break;
+      case 0x74:
+      case 0x75:
+      case 0x76:
+        if (prefix[2] == 0x66) {
+          src_reg_file = dst_reg_file = SSE;
+          prefix[2] = 0;  // clear prefix now it's served its purpose as part of the opcode
+        } else {
+          src_reg_file = dst_reg_file = MMX;
+        }
+        switch (*instr) {
+          case 0x74: opcode1 = "pcmpeqb"; break;
+          case 0x75: opcode1 = "pcmpeqw"; break;
+          case 0x76: opcode1 = "pcmpeqd"; break;
+        }
+        prefix[2] = 0;
+        has_modrm = true;
+        load = true;
+        break;
       case 0x7C:
         if (prefix[0] == 0xF2) {
           opcode1 = "haddps";
@@ -825,6 +969,22 @@ DISASSEMBLER_ENTRY(cmp,
         opcode1 = "movd";
         has_modrm = true;
         store = true;
+        break;
+      case 0x7F:
+        if (prefix[2] == 0x66) {
+          src_reg_file = dst_reg_file = SSE;
+          opcode1 = "movdqa";
+          prefix[2] = 0;  // clear prefix now it's served its purpose as part of the opcode
+        } else if (prefix[0] == 0xF3) {
+          src_reg_file = dst_reg_file = SSE;
+          opcode1 = "movdqu";
+          prefix[0] = 0;  // clear prefix now it's served its purpose as part of the opcode
+        } else {
+          dst_reg_file = MMX;
+          opcode1 = "movq";
+        }
+        store = true;
+        has_modrm = true;
         break;
       case 0x80: case 0x81: case 0x82: case 0x83: case 0x84: case 0x85: case 0x86: case 0x87:
       case 0x88: case 0x89: case 0x8A: case 0x8B: case 0x8C: case 0x8D: case 0x8E: case 0x8F:
@@ -928,6 +1088,21 @@ DISASSEMBLER_ENTRY(cmp,
         has_modrm = true;
         load = true;
         break;
+      case 0xBC:
+        opcode1 = "bsf";
+        has_modrm = true;
+        load = true;
+        break;
+      case 0xBD:
+        opcode1 = "bsr";
+        has_modrm = true;
+        load = true;
+        break;
+      case 0xB8:
+        opcode1 = "popcnt";
+        has_modrm = true;
+        load = true;
+        break;
       case 0xBE:
         opcode1 = "movsxb";
         has_modrm = true;
@@ -1018,6 +1193,46 @@ DISASSEMBLER_ENTRY(cmp,
           opcode_tmp = StringPrintf("unknown opcode '0F %02X'", *instr);
           opcode1 = opcode_tmp.c_str();
         }
+        break;
+      case 0xD8:
+      case 0xD9:
+      case 0xDA:
+      case 0xDC:
+      case 0xDD:
+      case 0xDE:
+      case 0xE0:
+      case 0xE3:
+      case 0xE8:
+      case 0xE9:
+      case 0xEA:
+      case 0xEC:
+      case 0xED:
+      case 0xEE:
+        if (prefix[2] == 0x66) {
+          src_reg_file = dst_reg_file = SSE;
+          prefix[2] = 0;  // clear prefix now it's served its purpose as part of the opcode
+        } else {
+          src_reg_file = dst_reg_file = MMX;
+        }
+        switch (*instr) {
+          case 0xD8: opcode1 = "psubusb"; break;
+          case 0xD9: opcode1 = "psubusw"; break;
+          case 0xDA: opcode1 = "pminub"; break;
+          case 0xDC: opcode1 = "paddusb"; break;
+          case 0xDD: opcode1 = "paddusw"; break;
+          case 0xDE: opcode1 = "pmaxub"; break;
+          case 0xE0: opcode1 = "pavgb"; break;
+          case 0xE3: opcode1 = "pavgw"; break;
+          case 0xE8: opcode1 = "psubsb"; break;
+          case 0xE9: opcode1 = "psubsw"; break;
+          case 0xEA: opcode1 = "pminsw"; break;
+          case 0xEC: opcode1 = "paddsb"; break;
+          case 0xED: opcode1 = "paddsw"; break;
+          case 0xEE: opcode1 = "pmaxsw"; break;
+        }
+        prefix[2] = 0;
+        has_modrm = true;
+        load = true;
         break;
       case 0xEB:
         if (prefix[2] == 0x66) {
@@ -1116,6 +1331,12 @@ DISASSEMBLER_ENTRY(cmp,
       opcode_tmp = StringPrintf("unknown opcode '%02X'", *instr);
       opcode1 = opcode_tmp.c_str();
     }
+    break;
+  case 0xA5:
+    opcode1 = (prefix[2] == 0x66 ? "movsw" : "movsl");
+    break;
+  case 0xA7:
+    opcode1 = (prefix[2] == 0x66 ? "cmpsw" : "cmpsl");
     break;
   case 0xAF:
     opcode1 = (prefix[2] == 0x66 ? "scasw" : "scasl");
@@ -1236,7 +1457,7 @@ DISASSEMBLER_ENTRY(cmp,
     has_modrm = true;
     reg_is_opcode = true;
     store = true;
-    immediate_bytes = ((instr[1] & 0x38) == 0) ? 1 : 0;
+    immediate_bytes = ((instr[1] & 0x38) == 0) ? (instr[0] == 0xF7 ? 4 : 1) : 0;
     break;
   case 0xFF:
     {
@@ -1356,11 +1577,11 @@ DISASSEMBLER_ENTRY(cmp,
   }
   if (prefix[1] == kFs && !supports_rex_) {
     args << "  ; ";
-    Thread::DumpThreadOffset<4>(args, address_bits);
+    GetDisassemblerOptions()->thread_offset_name_function_(args, address_bits);
   }
   if (prefix[1] == kGs && supports_rex_) {
     args << "  ; ";
-    Thread::DumpThreadOffset<8>(args, address_bits);
+    GetDisassemblerOptions()->thread_offset_name_function_(args, address_bits);
   }
   const char* prefix_str;
   switch (prefix[0]) {

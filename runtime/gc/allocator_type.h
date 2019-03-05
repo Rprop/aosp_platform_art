@@ -17,7 +17,7 @@
 #ifndef ART_RUNTIME_GC_ALLOCATOR_TYPE_H_
 #define ART_RUNTIME_GC_ALLOCATOR_TYPE_H_
 
-#include <ostream>
+#include <iosfwd>
 
 namespace art {
 namespace gc {
@@ -34,6 +34,10 @@ enum AllocatorType {
   kAllocatorTypeRegionTLAB,
 };
 std::ostream& operator<<(std::ostream& os, const AllocatorType& rhs);
+
+inline constexpr bool IsTLABAllocator(AllocatorType allocator) {
+  return allocator == kAllocatorTypeTLAB || allocator == kAllocatorTypeRegionTLAB;
+}
 
 }  // namespace gc
 }  // namespace art

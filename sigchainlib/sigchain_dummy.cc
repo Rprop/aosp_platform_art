@@ -17,13 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#ifdef HAVE_ANDROID_OS
-#include <android/log.h>
-#else
-#include <stdarg.h>
-#include <iostream>
-#endif
-
+#include "log.h"
 #include "sigchain.h"
 
 #define ATTRIBUTE_UNUSED __attribute__((__unused__))
@@ -33,53 +27,21 @@
 #pragma GCC diagnostic ignored "-Wunknown-pragmas"
 #pragma GCC diagnostic ignored "-Wmissing-noreturn"
 
-static void log(const char* format, ...) {
-  char buf[256];
-  va_list ap;
-  va_start(ap, format);
-  vsnprintf(buf, sizeof(buf), format, ap);
-#ifdef HAVE_ANDROID_OS
-  __android_log_write(ANDROID_LOG_ERROR, "libsigchain", buf);
-#else
-  std::cout << buf << "\n";
-#endif
-  va_end(ap);
-}
-
 namespace art {
 
-
-extern "C" void ClaimSignalChain(int signal ATTRIBUTE_UNUSED,
-                                 struct sigaction* oldaction ATTRIBUTE_UNUSED) {
-  log("ClaimSignalChain is not exported by the main executable.");
-  abort();
-}
-
-extern "C" void UnclaimSignalChain(int signal ATTRIBUTE_UNUSED) {
-  log("UnclaimSignalChain is not exported by the main executable.");
-  abort();
-}
-
-extern "C" void InvokeUserSignalHandler(int sig ATTRIBUTE_UNUSED,
-                                        siginfo_t* info ATTRIBUTE_UNUSED,
-                                        void* context ATTRIBUTE_UNUSED) {
-  log("InvokeUserSignalHandler is not exported by the main executable.");
-  abort();
-}
-
-extern "C" void InitializeSignalChain() {
-  log("InitializeSignalChain is not exported by the main executable.");
-  abort();
-}
-
-extern "C" void EnsureFrontOfChain(int signal ATTRIBUTE_UNUSED,
-                                   struct sigaction* expected_action ATTRIBUTE_UNUSED) {
+extern "C" void EnsureFrontOfChain(int signal ATTRIBUTE_UNUSED) {
   log("EnsureFrontOfChain is not exported by the main executable.");
   abort();
 }
 
-extern "C" void SetSpecialSignalHandlerFn(int signal ATTRIBUTE_UNUSED,
-                                          SpecialSignalHandlerFn fn ATTRIBUTE_UNUSED) {
+extern "C" void AddSpecialSignalHandlerFn(int signal ATTRIBUTE_UNUSED,
+                                          SigchainAction* sa ATTRIBUTE_UNUSED) {
+  log("SetSpecialSignalHandlerFn is not exported by the main executable.");
+  abort();
+}
+
+extern "C" void RemoveSpecialSignalHandlerFn(int signal ATTRIBUTE_UNUSED,
+                                             bool (*fn)(int, siginfo_t*, void*) ATTRIBUTE_UNUSED) {
   log("SetSpecialSignalHandlerFn is not exported by the main executable.");
   abort();
 }

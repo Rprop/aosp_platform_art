@@ -17,15 +17,16 @@
 #ifndef ART_RUNTIME_ARCH_X86_CONTEXT_X86_H_
 #define ART_RUNTIME_ARCH_X86_CONTEXT_X86_H_
 
+#include <android-base/logging.h>
+
 #include "arch/context.h"
-#include "base/logging.h"
 #include "base/macros.h"
 #include "registers_x86.h"
 
 namespace art {
 namespace x86 {
 
-class X86Context : public Context {
+class X86Context FINAL : public Context {
  public:
   X86Context() {
     Reset();
@@ -34,7 +35,7 @@ class X86Context : public Context {
 
   void Reset() OVERRIDE;
 
-  void FillCalleeSaves(const StackVisitor& fr) OVERRIDE SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void FillCalleeSaves(uint8_t* frame, const QuickMethodFrameInfo& fr) OVERRIDE;
 
   void SetSP(uintptr_t new_sp) OVERRIDE {
     SetGPR(ESP, new_sp);
@@ -42,6 +43,10 @@ class X86Context : public Context {
 
   void SetPC(uintptr_t new_pc) OVERRIDE {
     eip_ = new_pc;
+  }
+
+  void SetArg0(uintptr_t new_arg0_value) OVERRIDE {
+    SetGPR(EAX, new_arg0_value);
   }
 
   bool IsAccessibleGPR(uint32_t reg) OVERRIDE {
@@ -95,10 +100,10 @@ class X86Context : public Context {
   // Pointers to register locations. Values are initialized to null or the special registers below.
   uintptr_t* gprs_[kNumberOfCpuRegisters];
   uint32_t* fprs_[kNumberOfFloatRegisters];
-  // Hold values for esp and eip if they are not located within a stack frame. EIP is somewhat
+  // Hold values for esp, eip and arg0 if they are not located within a stack frame. EIP is somewhat
   // special in that it cannot be encoded normally as a register operand to an instruction (except
   // in 64bit addressing modes).
-  uintptr_t esp_, eip_;
+  uintptr_t esp_, eip_, arg0_;
 };
 }  // namespace x86
 }  // namespace art

@@ -22,12 +22,30 @@
 
 #include <string>
 
+#include <android-base/logging.h>
+
 #include "arch/instruction_set.h"
+#include "base/common_art_test.h"
+#include "base/globals.h"
 #include "base/mutex.h"
-#include "globals.h"
-#include "os.h"
+#include "base/os.h"
+#include "base/unix_file/fd_file.h"
+#include "dex/art_dex_file_loader.h"
+#include "dex/compact_dex_level.h"
+// TODO: Add inl file and avoid including inl.
+#include "obj_ptr-inl.h"
+#include "scoped_thread_state_change-inl.h"
 
 namespace art {
+
+using LogSeverity = android::base::LogSeverity;
+using ScopedLogSeverity = android::base::ScopedLogSeverity;
+
+// OBJ pointer helpers to avoid needing .Decode everywhere.
+#define EXPECT_OBJ_PTR_EQ(a, b) EXPECT_EQ(MakeObjPtr(a).Ptr(), MakeObjPtr(b).Ptr());
+#define ASSERT_OBJ_PTR_EQ(a, b) ASSERT_EQ(MakeObjPtr(a).Ptr(), MakeObjPtr(b).Ptr());
+#define EXPECT_OBJ_PTR_NE(a, b) EXPECT_NE(MakeObjPtr(a).Ptr(), MakeObjPtr(b).Ptr());
+#define ASSERT_OBJ_PTR_NE(a, b) ASSERT_NE(MakeObjPtr(a).Ptr(), MakeObjPtr(b).Ptr());
 
 class ClassLinker;
 class CompilerCallbacks;
@@ -35,78 +53,53 @@ class DexFile;
 class JavaVMExt;
 class Runtime;
 typedef std::vector<std::pair<std::string, const void*>> RuntimeOptions;
+class Thread;
+class VariableSizedHandleScope;
 
-class ScratchFile {
+class CommonRuntimeTestImpl : public CommonArtTestImpl {
  public:
-  ScratchFile();
+  CommonRuntimeTestImpl();
+  virtual ~CommonRuntimeTestImpl();
 
-  ScratchFile(const ScratchFile& other, const char* suffix);
-
-  explicit ScratchFile(File* file);
-
-  ~ScratchFile();
-
-  const std::string& GetFilename() const {
-    return filename_;
-  }
-
-  File* GetFile() const {
-    return file_.get();
-  }
-
-  int GetFd() const;
-
-  void Close();
-  void Unlink();
-
- private:
-  std::string filename_;
-  std::unique_ptr<File> file_;
-};
-
-class CommonRuntimeTest : public testing::Test {
- public:
-  static void SetUpAndroidRoot();
-
-  // Note: setting up ANDROID_DATA may create a temporary directory. If this is used in a
-  // non-derived class, be sure to also call the corresponding tear-down below.
-  static void SetUpAndroidData(std::string& android_data);
-
-  static void TearDownAndroidData(const std::string& android_data, bool fail_on_error);
-
-  CommonRuntimeTest();
-  ~CommonRuntimeTest();
-
-  // Gets the path of the libcore dex file.
-  static std::string GetLibCoreDexFileName();
-
-  // Returns bin directory which contains host's prebuild tools.
-  static std::string GetAndroidHostToolsDir();
-
-  // Returns bin directory which contains target's prebuild tools.
   static std::string GetAndroidTargetToolsDir(InstructionSet isa);
 
- protected:
-  static bool IsHost() {
-    return !kIsTargetBuild;
+  // A helper function to fill the heap.
+  static void FillHeap(Thread* self,
+                       ClassLinker* class_linker,
+                       VariableSizedHandleScope* handle_scope)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+  // A helper to set up a small heap (4M) to make FillHeap faster.
+  static void SetUpRuntimeOptionsForFillHeap(RuntimeOptions *options);
+
+  template <typename Mutator>
+  bool MutateDexFile(File* output_dex, const std::string& input_jar, const Mutator& mutator) {
+    std::vector<std::unique_ptr<const DexFile>> dex_files;
+    std::string error_msg;
+    const ArtDexFileLoader dex_file_loader;
+    CHECK(dex_file_loader.Open(input_jar.c_str(),
+                               input_jar.c_str(),
+                               /*verify*/ true,
+                               /*verify_checksum*/ true,
+                               &error_msg,
+                               &dex_files)) << error_msg;
+    EXPECT_EQ(dex_files.size(), 1u) << "Only one input dex is supported";
+    const std::unique_ptr<const DexFile>& dex = dex_files[0];
+    CHECK(dex->EnableWrite()) << "Failed to enable write";
+    DexFile* dex_file = const_cast<DexFile*>(dex.get());
+    mutator(dex_file);
+    const_cast<DexFile::Header&>(dex_file->GetHeader()).checksum_ = dex_file->CalculateChecksum();
+    if (!output_dex->WriteFully(dex->Begin(), dex->Size())) {
+      return false;
+    }
+    if (output_dex->Flush() != 0) {
+      PLOG(FATAL) << "Could not flush the output file.";
+    }
+    return true;
   }
 
-  // File location to core.art, e.g. $ANDROID_HOST_OUT/system/framework/core.art
-  static std::string GetCoreArtLocation();
-
-  // File location to core.oat, e.g. $ANDROID_HOST_OUT/system/framework/core.oat
-  static std::string GetCoreOatLocation();
-
-  std::unique_ptr<const DexFile> LoadExpectSingleDexFile(const char* location);
-
-  virtual void SetUp();
-
+ protected:
   // Allow subclases such as CommonCompilerTest to add extra options.
   virtual void SetUpRuntimeOptions(RuntimeOptions* options ATTRIBUTE_UNUSED) {}
-
-  void ClearDirectory(const char* dirpath);
-
-  virtual void TearDown();
 
   // Called before the runtime is created.
   virtual void PreRuntimeCreate() {}
@@ -114,23 +107,19 @@ class CommonRuntimeTest : public testing::Test {
   // Called after the runtime is created.
   virtual void PostRuntimeCreate() {}
 
-  // Gets the path of the specified dex file for host or target.
-  static std::string GetDexFileName(const std::string& jar_prefix);
+  // Loads the test dex file identified by the given dex_name into a PathClassLoader.
+  // Returns the created class loader.
+  jobject LoadDex(const char* dex_name) REQUIRES_SHARED(Locks::mutator_lock_);
+  // Loads the test dex file identified by the given first_dex_name and second_dex_name
+  // into a PathClassLoader. Returns the created class loader.
+  jobject LoadMultiDex(const char* first_dex_name, const char* second_dex_name)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
-  std::string GetTestAndroidRoot();
-
-  std::string GetTestDexFileName(const char* name);
-
-  std::vector<std::unique_ptr<const DexFile>> OpenTestDexFiles(const char* name)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
-  std::unique_ptr<const DexFile> OpenTestDexFile(const char* name)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
-  jobject LoadDex(const char* dex_name) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
-  std::string android_data_;
-  std::string dalvik_cache_;
+  jobject LoadDexInPathClassLoader(const std::string& dex_name, jobject parent_loader);
+  jobject LoadDexInDelegateLastClassLoader(const std::string& dex_name, jobject parent_loader);
+  jobject LoadDexInWellKnownClassLoader(const std::string& dex_name,
+                                        jclass loader_class,
+                                        jobject parent_loader);
 
   std::unique_ptr<Runtime> runtime_;
 
@@ -140,20 +129,47 @@ class CommonRuntimeTest : public testing::Test {
   const DexFile* java_lang_dex_file_;
   std::vector<const DexFile*> boot_class_path_;
 
-  // Get the dex files from a PathClassLoader. This in order of the dex elements and their dex
-  // arrays.
+  // Get the dex files from a PathClassLoader or DelegateLastClassLoader.
+  // This only looks into the current class loader and does not recurse into the parents.
   std::vector<const DexFile*> GetDexFiles(jobject jclass_loader);
+  std::vector<const DexFile*> GetDexFiles(ScopedObjectAccess& soa,
+                                          Handle<mirror::ClassLoader> class_loader)
+    REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Get the first dex file from a PathClassLoader. Will abort if it is null.
   const DexFile* GetFirstDexFile(jobject jclass_loader);
 
   std::unique_ptr<CompilerCallbacks> callbacks_;
 
- private:
-  static std::string GetCoreFileLocation(const char* suffix);
+  virtual void SetUp();
 
-  std::vector<std::unique_ptr<const DexFile>> loaded_dex_files_;
+  virtual void TearDown();
+
+  // Called to finish up runtime creation and filling test fields. By default runs root
+  // initializers, initialize well-known classes, and creates the heap thread pool.
+  virtual void FinalizeSetup();
 };
+
+template <typename TestType>
+class CommonRuntimeTestBase : public TestType, public CommonRuntimeTestImpl {
+ public:
+  CommonRuntimeTestBase() {}
+  virtual ~CommonRuntimeTestBase() {}
+
+ protected:
+  virtual void SetUp() OVERRIDE {
+    CommonRuntimeTestImpl::SetUp();
+  }
+
+  virtual void TearDown() OVERRIDE {
+    CommonRuntimeTestImpl::TearDown();
+  }
+};
+
+using CommonRuntimeTest = CommonRuntimeTestBase<testing::Test>;
+
+template <typename Param>
+using CommonRuntimeTestWithParam = CommonRuntimeTestBase<testing::TestWithParam<Param>>;
 
 // Sets a CheckJni abort hook to catch failures. Note that this will cause CheckJNI to carry on
 // rather than aborting, so be careful!
@@ -163,6 +179,7 @@ class CheckJniAbortCatcher {
 
   ~CheckJniAbortCatcher();
 
+  void Check(const std::string& expected_text);
   void Check(const char* expected_text);
 
  private:
@@ -174,27 +191,60 @@ class CheckJniAbortCatcher {
   DISALLOW_COPY_AND_ASSIGN(CheckJniAbortCatcher);
 };
 
-// TODO: When heap reference poisoning works with the compiler, get rid of this.
-#define TEST_DISABLED_FOR_HEAP_REFERENCE_POISONING() \
-  if (kPoisonHeapReferences) { \
-    printf("WARNING: TEST DISABLED FOR HEAP REFERENCE POISONING\n"); \
+#define TEST_DISABLED_FOR_ARM() \
+  if (kRuntimeISA == InstructionSet::kArm || kRuntimeISA == InstructionSet::kThumb2) { \
+    printf("WARNING: TEST DISABLED FOR ARM\n"); \
+    return; \
+  }
+
+#define TEST_DISABLED_FOR_ARM64() \
+  if (kRuntimeISA == InstructionSet::kArm64) { \
+    printf("WARNING: TEST DISABLED FOR ARM64\n"); \
     return; \
   }
 
 #define TEST_DISABLED_FOR_MIPS() \
-  if (kRuntimeISA == kMips) { \
+  if (kRuntimeISA == InstructionSet::kMips) { \
     printf("WARNING: TEST DISABLED FOR MIPS\n"); \
     return; \
   }
 
+#define TEST_DISABLED_FOR_MIPS64() \
+  if (kRuntimeISA == InstructionSet::kMips64) { \
+    printf("WARNING: TEST DISABLED FOR MIPS64\n"); \
+    return; \
+  }
+
+#define TEST_DISABLED_FOR_X86() \
+  if (kRuntimeISA == InstructionSet::kX86) { \
+    printf("WARNING: TEST DISABLED FOR X86\n"); \
+    return; \
+  }
+
+#define TEST_DISABLED_FOR_STRING_COMPRESSION() \
+  if (mirror::kUseStringCompression) { \
+    printf("WARNING: TEST DISABLED FOR STRING COMPRESSION\n"); \
+    return; \
+  }
+
+#define TEST_DISABLED_WITHOUT_BAKER_READ_BARRIERS() \
+  if (!kEmitCompilerReadBarrier || !kUseBakerReadBarrier) { \
+    printf("WARNING: TEST DISABLED FOR GC WITHOUT BAKER READ BARRIER\n"); \
+    return; \
+  }
+
+#define TEST_DISABLED_FOR_HEAP_POISONING() \
+  if (kPoisonHeapReferences) { \
+    printf("WARNING: TEST DISABLED FOR HEAP POISONING\n"); \
+    return; \
+  }
+
+#define TEST_DISABLED_FOR_MEMORY_TOOL_WITH_HEAP_POISONING_WITHOUT_READ_BARRIERS() \
+  if (kRunningOnMemoryTool && kPoisonHeapReferences && !kEmitCompilerReadBarrier) { \
+    printf("WARNING: TEST DISABLED FOR MEMORY TOOL WITH HEAP POISONING WITHOUT READ BARRIERS\n"); \
+    return; \
+  }
+
 }  // namespace art
-
-namespace std {
-
-// TODO: isn't gtest supposed to be able to print STL types for itself?
-template <typename T>
-std::ostream& operator<<(std::ostream& os, const std::vector<T>& rhs);
-
-}  // namespace std
 
 #endif  // ART_RUNTIME_COMMON_RUNTIME_TEST_H_

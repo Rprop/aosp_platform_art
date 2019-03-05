@@ -17,184 +17,426 @@
 #ifndef ART_RUNTIME_CLASS_LINKER_INL_H_
 #define ART_RUNTIME_CLASS_LINKER_INL_H_
 
-#include "art_field.h"
+#include <atomic>
+
+#include "art_field-inl.h"
+#include "art_method-inl.h"
 #include "class_linker.h"
-#include "gc_root-inl.h"
 #include "gc/heap-inl.h"
+#include "gc_root-inl.h"
+#include "handle_scope-inl.h"
 #include "mirror/class_loader.h"
 #include "mirror/dex_cache-inl.h"
 #include "mirror/iftable.h"
-#include "mirror/object_array.h"
-#include "handle_scope-inl.h"
+#include "mirror/object_array-inl.h"
+#include "obj_ptr-inl.h"
+#include "scoped_thread_state_change-inl.h"
 
 namespace art {
 
-inline mirror::Class* ClassLinker::FindSystemClass(Thread* self, const char* descriptor) {
-  return FindClass(self, descriptor, NullHandle<mirror::ClassLoader>());
-}
-
-inline mirror::Class* ClassLinker::FindArrayClass(Thread* self, mirror::Class** element_class) {
+inline ObjPtr<mirror::Class> ClassLinker::FindArrayClass(Thread* self,
+                                                         ObjPtr<mirror::Class> element_class) {
   for (size_t i = 0; i < kFindArrayCacheSize; ++i) {
     // Read the cached array class once to avoid races with other threads setting it.
-    mirror::Class* array_class = find_array_class_cache_[i].Read();
-    if (array_class != nullptr && array_class->GetComponentType() == *element_class) {
+    ObjPtr<mirror::Class> array_class = find_array_class_cache_[i].Read();
+    if (array_class != nullptr && array_class->GetComponentType() == element_class) {
       return array_class;
     }
   }
-  DCHECK(!(*element_class)->IsPrimitiveVoid());
   std::string descriptor = "[";
   std::string temp;
-  descriptor += (*element_class)->GetDescriptor(&temp);
-  StackHandleScope<2> hs(Thread::Current());
-  Handle<mirror::ClassLoader> class_loader(hs.NewHandle((*element_class)->GetClassLoader()));
-  HandleWrapper<mirror::Class> h_element_class(hs.NewHandleWrapper(element_class));
-  mirror::Class* array_class = FindClass(self, descriptor.c_str(), class_loader);
-  // Benign races in storing array class and incrementing index.
-  size_t victim_index = find_array_class_cache_next_victim_;
-  find_array_class_cache_[victim_index] = GcRoot<mirror::Class>(array_class);
-  find_array_class_cache_next_victim_ = (victim_index + 1) % kFindArrayCacheSize;
+  descriptor += element_class->GetDescriptor(&temp);
+  StackHandleScope<1> hs(Thread::Current());
+  Handle<mirror::ClassLoader> class_loader(hs.NewHandle(element_class->GetClassLoader()));
+  ObjPtr<mirror::Class> array_class = FindClass(self, descriptor.c_str(), class_loader);
+  if (array_class != nullptr) {
+    // Benign races in storing array class and incrementing index.
+    size_t victim_index = find_array_class_cache_next_victim_;
+    find_array_class_cache_[victim_index] = GcRoot<mirror::Class>(array_class);
+    find_array_class_cache_next_victim_ = (victim_index + 1) % kFindArrayCacheSize;
+  } else {
+    // We should have a NoClassDefFoundError.
+    self->AssertPendingException();
+  }
   return array_class;
 }
 
-inline mirror::String* ClassLinker::ResolveString(uint32_t string_idx,
-                                                  ArtMethod* referrer) {
-  mirror::Class* declaring_class = referrer->GetDeclaringClass();
-  mirror::String* resolved_string = declaring_class->GetDexCacheStrings()->Get(string_idx);
-  if (UNLIKELY(resolved_string == nullptr)) {
+inline ObjPtr<mirror::String> ClassLinker::ResolveString(dex::StringIndex string_idx,
+                                                         ArtField* referrer) {
+  Thread::PoisonObjectPointersIfDebug();
+  DCHECK(!Thread::Current()->IsExceptionPending());
+  // We do not need the read barrier for getting the DexCache for the initial resolved type
+  // lookup as both from-space and to-space copies point to the same native resolved types array.
+  ObjPtr<mirror::String> resolved =
+      referrer->GetDexCache<kWithoutReadBarrier>()->GetResolvedString(string_idx);
+  if (resolved == nullptr) {
+    resolved = DoResolveString(string_idx, referrer->GetDexCache());
+  }
+  return resolved;
+}
+
+inline ObjPtr<mirror::String> ClassLinker::ResolveString(dex::StringIndex string_idx,
+                                                         ArtMethod* referrer) {
+  Thread::PoisonObjectPointersIfDebug();
+  DCHECK(!Thread::Current()->IsExceptionPending());
+  // We do not need the read barrier for getting the DexCache for the initial resolved type
+  // lookup as both from-space and to-space copies point to the same native resolved types array.
+  ObjPtr<mirror::String> resolved =
+      referrer->GetDexCache<kWithoutReadBarrier>()->GetResolvedString(string_idx);
+  if (resolved == nullptr) {
+    resolved = DoResolveString(string_idx, referrer->GetDexCache());
+  }
+  return resolved;
+}
+
+inline ObjPtr<mirror::String> ClassLinker::ResolveString(dex::StringIndex string_idx,
+                                                         Handle<mirror::DexCache> dex_cache) {
+  Thread::PoisonObjectPointersIfDebug();
+  DCHECK(!Thread::Current()->IsExceptionPending());
+  ObjPtr<mirror::String> resolved = dex_cache->GetResolvedString(string_idx);
+  if (resolved == nullptr) {
+    resolved = DoResolveString(string_idx, dex_cache);
+  }
+  return resolved;
+}
+
+inline ObjPtr<mirror::String> ClassLinker::LookupString(dex::StringIndex string_idx,
+                                                        ObjPtr<mirror::DexCache> dex_cache) {
+  ObjPtr<mirror::String> resolved = dex_cache->GetResolvedString(string_idx);
+  if (resolved == nullptr) {
+    resolved = DoLookupString(string_idx, dex_cache);
+  }
+  return resolved;
+}
+
+inline ObjPtr<mirror::Class> ClassLinker::ResolveType(dex::TypeIndex type_idx,
+                                                      ObjPtr<mirror::Class> referrer) {
+  if (kObjPtrPoisoning) {
     StackHandleScope<1> hs(Thread::Current());
-    Handle<mirror::DexCache> dex_cache(hs.NewHandle(declaring_class->GetDexCache()));
+    HandleWrapperObjPtr<mirror::Class> referrer_wrapper = hs.NewHandleWrapper(&referrer);
+    Thread::Current()->PoisonObjectPointers();
+  }
+  DCHECK(!Thread::Current()->IsExceptionPending());
+  // We do not need the read barrier for getting the DexCache for the initial resolved type
+  // lookup as both from-space and to-space copies point to the same native resolved types array.
+  ObjPtr<mirror::Class> resolved_type =
+      referrer->GetDexCache<kDefaultVerifyFlags, kWithoutReadBarrier>()->GetResolvedType(type_idx);
+  if (resolved_type == nullptr) {
+    resolved_type = DoResolveType(type_idx, referrer);
+  }
+  return resolved_type;
+}
+
+inline ObjPtr<mirror::Class> ClassLinker::ResolveType(dex::TypeIndex type_idx,
+                                                      ArtField* referrer) {
+  Thread::PoisonObjectPointersIfDebug();
+  DCHECK(!Thread::Current()->IsExceptionPending());
+  // We do not need the read barrier for getting the DexCache for the initial resolved type
+  // lookup as both from-space and to-space copies point to the same native resolved types array.
+  ObjPtr<mirror::Class> resolved_type =
+      referrer->GetDexCache<kWithoutReadBarrier>()->GetResolvedType(type_idx);
+  if (UNLIKELY(resolved_type == nullptr)) {
+    resolved_type = DoResolveType(type_idx, referrer->GetDeclaringClass());
+  }
+  return resolved_type;
+}
+
+inline ObjPtr<mirror::Class> ClassLinker::ResolveType(dex::TypeIndex type_idx,
+                                                      ArtMethod* referrer) {
+  Thread::PoisonObjectPointersIfDebug();
+  DCHECK(!Thread::Current()->IsExceptionPending());
+  // We do not need the read barrier for getting the DexCache for the initial resolved type
+  // lookup as both from-space and to-space copies point to the same native resolved types array.
+  ObjPtr<mirror::Class> resolved_type =
+      referrer->GetDexCache<kWithoutReadBarrier>()->GetResolvedType(type_idx);
+  if (UNLIKELY(resolved_type == nullptr)) {
+    resolved_type = DoResolveType(type_idx, referrer->GetDeclaringClass());
+  }
+  return resolved_type;
+}
+
+inline ObjPtr<mirror::Class> ClassLinker::ResolveType(dex::TypeIndex type_idx,
+                                                      Handle<mirror::DexCache> dex_cache,
+                                                      Handle<mirror::ClassLoader> class_loader) {
+  DCHECK(dex_cache != nullptr);
+  Thread::PoisonObjectPointersIfDebug();
+  ObjPtr<mirror::Class> resolved = dex_cache->GetResolvedType(type_idx);
+  if (resolved == nullptr) {
+    resolved = DoResolveType(type_idx, dex_cache, class_loader);
+  }
+  return resolved;
+}
+
+inline ObjPtr<mirror::Class> ClassLinker::LookupResolvedType(dex::TypeIndex type_idx,
+                                                             ObjPtr<mirror::Class> referrer) {
+  // We do not need the read barrier for getting the DexCache for the initial resolved type
+  // lookup as both from-space and to-space copies point to the same native resolved types array.
+  ObjPtr<mirror::Class> type =
+      referrer->GetDexCache<kDefaultVerifyFlags, kWithoutReadBarrier>()->GetResolvedType(type_idx);
+  if (type == nullptr) {
+    type = DoLookupResolvedType(type_idx, referrer);
+  }
+  return type;
+}
+
+inline ObjPtr<mirror::Class> ClassLinker::LookupResolvedType(dex::TypeIndex type_idx,
+                                                             ArtField* referrer) {
+  // We do not need the read barrier for getting the DexCache for the initial resolved type
+  // lookup as both from-space and to-space copies point to the same native resolved types array.
+  ObjPtr<mirror::Class> type =
+      referrer->GetDexCache<kWithoutReadBarrier>()->GetResolvedType(type_idx);
+  if (type == nullptr) {
+    type = DoLookupResolvedType(type_idx, referrer->GetDeclaringClass());
+  }
+  return type;
+}
+
+inline ObjPtr<mirror::Class> ClassLinker::LookupResolvedType(dex::TypeIndex type_idx,
+                                                             ArtMethod* referrer) {
+  // We do not need the read barrier for getting the DexCache for the initial resolved type
+  // lookup as both from-space and to-space copies point to the same native resolved types array.
+  ObjPtr<mirror::Class> type =
+      referrer->GetDexCache<kWithoutReadBarrier>()->GetResolvedType(type_idx);
+  if (type == nullptr) {
+    type = DoLookupResolvedType(type_idx, referrer->GetDeclaringClass());
+  }
+  return type;
+}
+
+inline ObjPtr<mirror::Class> ClassLinker::LookupResolvedType(
+    dex::TypeIndex type_idx,
+    ObjPtr<mirror::DexCache> dex_cache,
+    ObjPtr<mirror::ClassLoader> class_loader) {
+  ObjPtr<mirror::Class> type = dex_cache->GetResolvedType(type_idx);
+  if (type == nullptr) {
+    type = DoLookupResolvedType(type_idx, dex_cache, class_loader);
+  }
+  return type;
+}
+
+template <bool kThrowOnError, typename ClassGetter>
+inline bool ClassLinker::CheckInvokeClassMismatch(ObjPtr<mirror::DexCache> dex_cache,
+                                                  InvokeType type,
+                                                  ClassGetter class_getter) {
+  switch (type) {
+    case kStatic:
+    case kSuper:
+      break;
+    case kInterface: {
+      // We have to check whether the method id really belongs to an interface (dex static bytecode
+      // constraints A15, A16). Otherwise you must not invoke-interface on it.
+      ObjPtr<mirror::Class> klass = class_getter();
+      if (UNLIKELY(!klass->IsInterface())) {
+        if (kThrowOnError) {
+          ThrowIncompatibleClassChangeError(klass,
+                                            "Found class %s, but interface was expected",
+                                            klass->PrettyDescriptor().c_str());
+        }
+        return true;
+      }
+      break;
+    }
+    case kDirect:
+      if (dex_cache->GetDexFile()->SupportsDefaultMethods()) {
+        break;
+      }
+      FALLTHROUGH_INTENDED;
+    case kVirtual: {
+      // Similarly, invoke-virtual (and invoke-direct without default methods) must reference
+      // a non-interface class (dex static bytecode constraint A24, A25).
+      ObjPtr<mirror::Class> klass = class_getter();
+      if (UNLIKELY(klass->IsInterface())) {
+        if (kThrowOnError) {
+          ThrowIncompatibleClassChangeError(klass,
+                                            "Found interface %s, but class was expected",
+                                            klass->PrettyDescriptor().c_str());
+        }
+        return true;
+      }
+      break;
+    }
+    default:
+      LOG(FATAL) << "Unreachable - invocation type: " << type;
+      UNREACHABLE();
+  }
+  return false;
+}
+
+template <bool kThrow>
+inline bool ClassLinker::CheckInvokeClassMismatch(ObjPtr<mirror::DexCache> dex_cache,
+                                                  InvokeType type,
+                                                  uint32_t method_idx,
+                                                  ObjPtr<mirror::ClassLoader> class_loader) {
+  return CheckInvokeClassMismatch<kThrow>(
+      dex_cache,
+      type,
+      [this, dex_cache, method_idx, class_loader]() REQUIRES_SHARED(Locks::mutator_lock_) {
+        const DexFile::MethodId& method_id = dex_cache->GetDexFile()->GetMethodId(method_idx);
+        ObjPtr<mirror::Class> klass =
+            LookupResolvedType(method_id.class_idx_, dex_cache, class_loader);
+        DCHECK(klass != nullptr);
+        return klass;
+      });
+}
+
+inline ArtMethod* ClassLinker::LookupResolvedMethod(uint32_t method_idx,
+                                                    ObjPtr<mirror::DexCache> dex_cache,
+                                                    ObjPtr<mirror::ClassLoader> class_loader) {
+  PointerSize pointer_size = image_pointer_size_;
+  ArtMethod* resolved = dex_cache->GetResolvedMethod(method_idx, pointer_size);
+  if (resolved == nullptr) {
     const DexFile& dex_file = *dex_cache->GetDexFile();
-    resolved_string = ResolveString(dex_file, string_idx, dex_cache);
-    if (resolved_string != nullptr) {
-      DCHECK_EQ(dex_cache->GetResolvedString(string_idx), resolved_string);
+    const DexFile::MethodId& method_id = dex_file.GetMethodId(method_idx);
+    ObjPtr<mirror::Class> klass = LookupResolvedType(method_id.class_idx_, dex_cache, class_loader);
+    if (klass != nullptr) {
+      resolved = FindResolvedMethod(klass, dex_cache, class_loader, method_idx);
     }
   }
-  return resolved_string;
+  return resolved;
 }
 
-inline mirror::Class* ClassLinker::ResolveType(uint16_t type_idx,
-                                               ArtMethod* referrer) {
-  mirror::Class* resolved_type = referrer->GetDexCacheResolvedType(type_idx);
-  if (UNLIKELY(resolved_type == nullptr)) {
-    mirror::Class* declaring_class = referrer->GetDeclaringClass();
-    StackHandleScope<2> hs(Thread::Current());
-    Handle<mirror::DexCache> dex_cache(hs.NewHandle(declaring_class->GetDexCache()));
-    Handle<mirror::ClassLoader> class_loader(hs.NewHandle(declaring_class->GetClassLoader()));
-    const DexFile& dex_file = *dex_cache->GetDexFile();
-    resolved_type = ResolveType(dex_file, type_idx, dex_cache, class_loader);
-    // Note: We cannot check here to see whether we added the type to the cache. The type
-    //       might be an erroneous class, which results in it being hidden from us.
-  }
-  return resolved_type;
-}
-
-inline mirror::Class* ClassLinker::ResolveType(uint16_t type_idx, ArtField* referrer) {
-  mirror::Class* declaring_class = referrer->GetDeclaringClass();
-  mirror::DexCache* dex_cache_ptr = declaring_class->GetDexCache();
-  mirror::Class* resolved_type = dex_cache_ptr->GetResolvedType(type_idx);
-  if (UNLIKELY(resolved_type == nullptr)) {
-    StackHandleScope<2> hs(Thread::Current());
-    Handle<mirror::DexCache> dex_cache(hs.NewHandle(dex_cache_ptr));
-    Handle<mirror::ClassLoader> class_loader(hs.NewHandle(declaring_class->GetClassLoader()));
-    const DexFile& dex_file = *dex_cache->GetDexFile();
-    resolved_type = ResolveType(dex_file, type_idx, dex_cache, class_loader);
-    // Note: We cannot check here to see whether we added the type to the cache. The type
-    //       might be an erroneous class, which results in it being hidden from us.
-  }
-  return resolved_type;
-}
-
+template <InvokeType type, ClassLinker::ResolveMode kResolveMode>
 inline ArtMethod* ClassLinker::GetResolvedMethod(uint32_t method_idx, ArtMethod* referrer) {
-  ArtMethod* resolved_method = referrer->GetDexCacheResolvedMethod(
+  DCHECK(referrer != nullptr);
+  // Note: The referrer can be a Proxy constructor. In that case, we need to do the
+  // lookup in the context of the original method from where it steals the code.
+  // However, we delay the GetInterfaceMethodIfProxy() until needed.
+  DCHECK(!referrer->IsProxyMethod() || referrer->IsConstructor());
+  // We do not need the read barrier for getting the DexCache for the initial resolved method
+  // lookup as both from-space and to-space copies point to the same native resolved methods array.
+  ArtMethod* resolved_method = referrer->GetDexCache<kWithoutReadBarrier>()->GetResolvedMethod(
       method_idx, image_pointer_size_);
-  if (resolved_method == nullptr || resolved_method->IsRuntimeMethod()) {
+  if (resolved_method == nullptr) {
     return nullptr;
+  }
+  DCHECK(!resolved_method->IsRuntimeMethod());
+  if (kResolveMode == ResolveMode::kCheckICCEAndIAE) {
+    referrer = referrer->GetInterfaceMethodIfProxy(image_pointer_size_);
+    // Check if the invoke type matches the class type.
+    ObjPtr<mirror::DexCache> dex_cache = referrer->GetDexCache();
+    ObjPtr<mirror::ClassLoader> class_loader = referrer->GetClassLoader();
+    if (CheckInvokeClassMismatch</* kThrow */ false>(dex_cache, type, method_idx, class_loader)) {
+      return nullptr;
+    }
+    // Check access.
+    ObjPtr<mirror::Class> referring_class = referrer->GetDeclaringClass();
+    if (!referring_class->CanAccessResolvedMethod(resolved_method->GetDeclaringClass(),
+                                                  resolved_method,
+                                                  dex_cache,
+                                                  method_idx)) {
+      return nullptr;
+    }
+    // Check if the invoke type matches the method type.
+    if (UNLIKELY(resolved_method->CheckIncompatibleClassChange(type))) {
+      return nullptr;
+    }
   }
   return resolved_method;
 }
 
-inline ArtMethod* ClassLinker::ResolveMethod(Thread* self, uint32_t method_idx,
-                                             ArtMethod* referrer, InvokeType type) {
-  ArtMethod* resolved_method = GetResolvedMethod(method_idx, referrer);
+template <ClassLinker::ResolveMode kResolveMode>
+inline ArtMethod* ClassLinker::ResolveMethod(Thread* self,
+                                             uint32_t method_idx,
+                                             ArtMethod* referrer,
+                                             InvokeType type) {
+  DCHECK(referrer != nullptr);
+  // Note: The referrer can be a Proxy constructor. In that case, we need to do the
+  // lookup in the context of the original method from where it steals the code.
+  // However, we delay the GetInterfaceMethodIfProxy() until needed.
+  DCHECK(!referrer->IsProxyMethod() || referrer->IsConstructor());
+  Thread::PoisonObjectPointersIfDebug();
+  // We do not need the read barrier for getting the DexCache for the initial resolved method
+  // lookup as both from-space and to-space copies point to the same native resolved methods array.
+  ArtMethod* resolved_method = referrer->GetDexCache<kWithoutReadBarrier>()->GetResolvedMethod(
+      method_idx, image_pointer_size_);
+  DCHECK(resolved_method == nullptr || !resolved_method->IsRuntimeMethod());
   if (UNLIKELY(resolved_method == nullptr)) {
-    mirror::Class* declaring_class = referrer->GetDeclaringClass();
+    referrer = referrer->GetInterfaceMethodIfProxy(image_pointer_size_);
+    ObjPtr<mirror::Class> declaring_class = referrer->GetDeclaringClass();
     StackHandleScope<2> hs(self);
-    Handle<mirror::DexCache> h_dex_cache(hs.NewHandle(declaring_class->GetDexCache()));
+    Handle<mirror::DexCache> h_dex_cache(hs.NewHandle(referrer->GetDexCache()));
     Handle<mirror::ClassLoader> h_class_loader(hs.NewHandle(declaring_class->GetClassLoader()));
-    const DexFile* dex_file = h_dex_cache->GetDexFile();
-    resolved_method = ResolveMethod(*dex_file, method_idx, h_dex_cache, h_class_loader, referrer,
-                                    type);
+    resolved_method = ResolveMethod<kResolveMode>(method_idx,
+                                                  h_dex_cache,
+                                                  h_class_loader,
+                                                  referrer,
+                                                  type);
+  } else if (kResolveMode == ResolveMode::kCheckICCEAndIAE) {
+    referrer = referrer->GetInterfaceMethodIfProxy(image_pointer_size_);
+    // Check if the invoke type matches the class type.
+    ObjPtr<mirror::DexCache> dex_cache = referrer->GetDexCache();
+    ObjPtr<mirror::ClassLoader> class_loader = referrer->GetClassLoader();
+    if (CheckInvokeClassMismatch</* kThrow */ true>(dex_cache, type, method_idx, class_loader)) {
+      DCHECK(Thread::Current()->IsExceptionPending());
+      return nullptr;
+    }
+    // Check access.
+    ObjPtr<mirror::Class> referring_class = referrer->GetDeclaringClass();
+    if (!referring_class->CheckResolvedMethodAccess(resolved_method->GetDeclaringClass(),
+                                                    resolved_method,
+                                                    dex_cache,
+                                                    method_idx,
+                                                    type)) {
+      DCHECK(Thread::Current()->IsExceptionPending());
+      return nullptr;
+    }
+    // Check if the invoke type matches the method type.
+    if (UNLIKELY(resolved_method->CheckIncompatibleClassChange(type))) {
+      ThrowIncompatibleClassChangeError(type,
+                                        resolved_method->GetInvokeType(),
+                                        resolved_method,
+                                        referrer);
+      return nullptr;
+    }
   }
   // Note: We cannot check here to see whether we added the method to the cache. It
   //       might be an erroneous class, which results in it being hidden from us.
   return resolved_method;
 }
 
-inline ArtField* ClassLinker::GetResolvedField(uint32_t field_idx, mirror::DexCache* dex_cache) {
-  return dex_cache->GetResolvedField(field_idx, image_pointer_size_);
+inline ArtField* ClassLinker::LookupResolvedField(uint32_t field_idx,
+                                                  ArtMethod* referrer,
+                                                  bool is_static) {
+  // We do not need the read barrier for getting the DexCache for the initial resolved field
+  // lookup as both from-space and to-space copies point to the same native resolved fields array.
+  ArtField* field = referrer->GetDexCache<kWithoutReadBarrier>()->GetResolvedField(
+      field_idx, image_pointer_size_);
+  if (field == nullptr) {
+    ObjPtr<mirror::ClassLoader> class_loader = referrer->GetDeclaringClass()->GetClassLoader();
+    field = LookupResolvedField(field_idx, referrer->GetDexCache(), class_loader, is_static);
+  }
+  return field;
 }
 
-inline ArtField* ClassLinker::GetResolvedField(
-    uint32_t field_idx, mirror::Class* field_declaring_class) {
-  return GetResolvedField(field_idx, field_declaring_class->GetDexCache());
-}
-
-inline ArtField* ClassLinker::ResolveField(uint32_t field_idx, ArtMethod* referrer,
+inline ArtField* ClassLinker::ResolveField(uint32_t field_idx,
+                                           ArtMethod* referrer,
                                            bool is_static) {
-  mirror::Class* declaring_class = referrer->GetDeclaringClass();
-  ArtField* resolved_field = GetResolvedField(field_idx, declaring_class);
+  Thread::PoisonObjectPointersIfDebug();
+  // We do not need the read barrier for getting the DexCache for the initial resolved field
+  // lookup as both from-space and to-space copies point to the same native resolved fields array.
+  ArtField* resolved_field = referrer->GetDexCache<kWithoutReadBarrier>()->GetResolvedField(
+      field_idx, image_pointer_size_);
   if (UNLIKELY(resolved_field == nullptr)) {
     StackHandleScope<2> hs(Thread::Current());
-    Handle<mirror::DexCache> dex_cache(hs.NewHandle(declaring_class->GetDexCache()));
-    Handle<mirror::ClassLoader> class_loader(hs.NewHandle(declaring_class->GetClassLoader()));
-    const DexFile& dex_file = *dex_cache->GetDexFile();
-    resolved_field = ResolveField(dex_file, field_idx, dex_cache, class_loader, is_static);
+    ObjPtr<mirror::Class> referring_class = referrer->GetDeclaringClass();
+    Handle<mirror::DexCache> dex_cache(hs.NewHandle(referrer->GetDexCache()));
+    Handle<mirror::ClassLoader> class_loader(hs.NewHandle(referring_class->GetClassLoader()));
+    resolved_field = ResolveField(field_idx, dex_cache, class_loader, is_static);
     // Note: We cannot check here to see whether we added the field to the cache. The type
     //       might be an erroneous class, which results in it being hidden from us.
   }
   return resolved_field;
 }
 
-inline mirror::Object* ClassLinker::AllocObject(Thread* self) {
-  return GetClassRoot(kJavaLangObject)->Alloc<true, false>(self,
-      Runtime::Current()->GetHeap()->GetCurrentAllocator());
-}
-
-template <class T>
-inline mirror::ObjectArray<T>* ClassLinker::AllocObjectArray(Thread* self, size_t length) {
-  return mirror::ObjectArray<T>::Alloc(self, GetClassRoot(kObjectArrayClass), length);
-}
-
-inline mirror::ObjectArray<mirror::Class>* ClassLinker::AllocClassArray(Thread* self,
-                                                                        size_t length) {
-  return mirror::ObjectArray<mirror::Class>::Alloc(self, GetClassRoot(kClassArrayClass), length);
-}
-
-inline mirror::ObjectArray<mirror::String>* ClassLinker::AllocStringArray(Thread* self,
-                                                                          size_t length) {
-  return mirror::ObjectArray<mirror::String>::Alloc(self, GetClassRoot(kJavaLangStringArrayClass),
-                                                    length);
-}
-
-inline mirror::IfTable* ClassLinker::AllocIfTable(Thread* self, size_t ifcount) {
-  return down_cast<mirror::IfTable*>(
-      mirror::IfTable::Alloc(self, GetClassRoot(kObjectArrayClass),
-                             ifcount * mirror::IfTable::kMax));
-}
-
-inline mirror::Class* ClassLinker::GetClassRoot(ClassRoot class_root)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  DCHECK(!class_roots_.IsNull());
-  mirror::ObjectArray<mirror::Class>* class_roots = class_roots_.Read();
-  mirror::Class* klass = class_roots->Get(class_root);
-  DCHECK(klass != nullptr);
-  return klass;
-}
-
-inline mirror::DexCache* ClassLinker::GetDexCache(size_t idx) {
-  dex_lock_.AssertSharedHeld(Thread::Current());
-  DCHECK(idx < dex_caches_.size());
-  return dex_caches_[idx].Read();
+template <class Visitor>
+inline void ClassLinker::VisitClassTables(const Visitor& visitor) {
+  Thread* const self = Thread::Current();
+  WriterMutexLock mu(self, *Locks::classlinker_classes_lock_);
+  for (const ClassLoaderData& data : class_loaders_) {
+    if (data.class_table != nullptr) {
+      visitor(data.class_table);
+    }
+  }
 }
 
 }  // namespace art

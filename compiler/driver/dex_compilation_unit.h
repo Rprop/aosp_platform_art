@@ -19,9 +19,11 @@
 
 #include <stdint.h>
 
-#include "dex_file.h"
-#include "jni.h"
 #include "base/arena_object.h"
+#include "dex/code_item_accessors.h"
+#include "dex/dex_file.h"
+#include "handle.h"
+#include "jni.h"
 
 namespace art {
 namespace mirror {
@@ -29,23 +31,21 @@ class ClassLoader;
 class DexCache;
 }  // namespace mirror
 class ClassLinker;
-struct CompilationUnit;
 class VerifiedMethod;
 
 class DexCompilationUnit : public DeletableArenaObject<kArenaAllocMisc> {
  public:
-  explicit DexCompilationUnit(CompilationUnit* cu);
+  DexCompilationUnit(Handle<mirror::ClassLoader> class_loader,
+                     ClassLinker* class_linker,
+                     const DexFile& dex_file,
+                     const DexFile::CodeItem* code_item,
+                     uint16_t class_def_idx,
+                     uint32_t method_idx,
+                     uint32_t access_flags,
+                     const VerifiedMethod* verified_method,
+                     Handle<mirror::DexCache> dex_cache);
 
-  DexCompilationUnit(CompilationUnit* cu, jobject class_loader, ClassLinker* class_linker,
-                     const DexFile& dex_file, const DexFile::CodeItem* code_item,
-                     uint16_t class_def_idx, uint32_t method_idx, uint32_t access_flags,
-                     const VerifiedMethod* verified_method);
-
-  CompilationUnit* GetCompilationUnit() const {
-    return cu_;
-  }
-
-  jobject GetClassLoader() const {
+  Handle<mirror::ClassLoader> GetClassLoader() const {
     return class_loader_;
   }
 
@@ -109,10 +109,16 @@ class DexCompilationUnit : public DeletableArenaObject<kArenaAllocMisc> {
 
   const std::string& GetSymbol();
 
- private:
-  CompilationUnit* const cu_;
+  Handle<mirror::DexCache> GetDexCache() const {
+    return dex_cache_;
+  }
 
-  const jobject class_loader_;
+  const CodeItemDataAccessor& GetCodeItemAccessor() const {
+    return code_item_accessor_;
+  }
+
+ private:
+  const Handle<mirror::ClassLoader> class_loader_;
 
   ClassLinker* const class_linker_;
 
@@ -123,6 +129,10 @@ class DexCompilationUnit : public DeletableArenaObject<kArenaAllocMisc> {
   const uint32_t dex_method_idx_;
   const uint32_t access_flags_;
   const VerifiedMethod* verified_method_;
+
+  const Handle<mirror::DexCache> dex_cache_;
+
+  const CodeItemDataAccessor code_item_accessor_;
 
   std::string symbol_;
 };

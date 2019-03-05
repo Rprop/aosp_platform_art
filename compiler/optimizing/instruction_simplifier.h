@@ -23,19 +23,35 @@
 
 namespace art {
 
+class CodeGenerator;
+
 /**
  * Implements optimizations specific to each instruction.
+ *
+ * Note that graph simplifications producing a constant should be
+ * implemented in art::HConstantFolding, while graph simplifications
+ * not producing constants should be implemented in
+ * art::InstructionSimplifier.  (This convention is a choice that was
+ * made during the development of these parts of the compiler and is
+ * not bound by any technical requirement.)
  */
 class InstructionSimplifier : public HOptimization {
  public:
   InstructionSimplifier(HGraph* graph,
+                        CodeGenerator* codegen,
                         OptimizingCompilerStats* stats = nullptr,
                         const char* name = kInstructionSimplifierPassName)
-    : HOptimization(graph, true, name, stats) {}
+      : HOptimization(graph, name, stats),
+        codegen_(codegen) {}
 
   static constexpr const char* kInstructionSimplifierPassName = "instruction_simplifier";
 
-  void Run() OVERRIDE;
+  bool Run() OVERRIDE;
+
+ private:
+  CodeGenerator* codegen_;
+
+  DISALLOW_COPY_AND_ASSIGN(InstructionSimplifier);
 };
 
 }  // namespace art

@@ -21,16 +21,17 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "android-base/stringprintf.h"
+
 #include "art_field-inl.h"
 #include "art_method-inl.h"
-#include "base/logging.h"
-#include "base/stringprintf.h"
+#include "base/logging.h"  // For VLOG.
 #include "debugger.h"
 #include "jdwp/jdwp_constants.h"
 #include "jdwp/jdwp_expand_buf.h"
 #include "jdwp/jdwp_priv.h"
 #include "jdwp/object_registry.h"
-#include "scoped_thread_state_change.h"
+#include "scoped_thread_state_change-inl.h"
 #include "thread-inl.h"
 
 #include "handle_scope-inl.h"
@@ -103,6 +104,8 @@ namespace art {
 
 namespace JDWP {
 
+using android::base::StringPrintf;
+
 /*
  * Stuff to compare against when deciding if a mod matches.  Only the
  * values for mods valid for the event being evaluated will be filled in.
@@ -161,7 +164,7 @@ static uint32_t GetInstrumentationEventFor(JdwpEventKind eventKind) {
       return instrumentation::Instrumentation::kDexPcMoved;
     case EK_EXCEPTION:
     case EK_EXCEPTION_CATCH:
-      return instrumentation::Instrumentation::kExceptionCaught;
+      return instrumentation::Instrumentation::kExceptionThrown;
     case EK_METHOD_ENTRY:
       return instrumentation::Instrumentation::kMethodEntered;
     case EK_METHOD_EXIT:
@@ -246,6 +249,43 @@ JdwpError JdwpState::RegisterEvent(JdwpEvent* pEvent) {
   Dbg::ManageDeoptimization();
 
   return ERR_NONE;
+}
+
+void JdwpState::UnregisterLocationEventsOnClass(ObjPtr<mirror::Class> klass) {
+  VLOG(jdwp) << "Removing events within " << klass->PrettyClass();
+  StackHandleScope<1> hs(Thread::Current());
+  Handle<mirror::Class> h_klass(hs.NewHandle(klass));
+  std::vector<JdwpEvent*> to_remove;
+  MutexLock mu(Thread::Current(), event_list_lock_);
+  for (JdwpEvent* cur_event = event_list_; cur_event != nullptr; cur_event = cur_event->next) {
+    // Fill in the to_remove list
+    bool found_event = false;
+    for (int i = 0; i < cur_event->modCount && !found_event; i++) {
+      JdwpEventMod& mod = cur_event->mods[i];
+      switch (mod.modKind) {
+        case MK_LOCATION_ONLY: {
+          JdwpLocation& loc = mod.locationOnly.loc;
+          JdwpError error;
+          ObjPtr<mirror::Class> breakpoint_class(
+              Dbg::GetObjectRegistry()->Get<art::mirror::Class*>(loc.class_id, &error));
+          DCHECK_EQ(error, ERR_NONE);
+          if (breakpoint_class == h_klass.Get()) {
+            to_remove.push_back(cur_event);
+            found_event = true;
+          }
+          break;
+        }
+        default:
+          // TODO Investigate how we should handle non-locationOnly events.
+          break;
+      }
+    }
+  }
+
+  for (JdwpEvent* event : to_remove) {
+    UnregisterEvent(event);
+    EventFree(event);
+  }
 }
 
 /*
@@ -447,7 +487,7 @@ static bool PatternMatch(const char* pattern, const std::string& target) {
  * need to do this even if later mods cause us to ignore the event.
  */
 static bool ModsMatch(JdwpEvent* pEvent, const ModBasket& basket)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   JdwpEventMod* pMod = pEvent->mods;
 
   for (int i = pEvent->modCount; i > 0; i--, pMod++) {
@@ -460,8 +500,8 @@ static bool ModsMatch(JdwpEvent* pEvent, const ModBasket& basket)
       }
       break;
     case MK_CONDITIONAL:
-      CHECK(false);  // should not be getting these
-      break;
+      LOG(FATAL) << "Unexpected MK_CONDITIONAL";  // should not be getting these
+      UNREACHABLE();
     case MK_THREAD_ONLY:
       if (!Dbg::MatchThread(pMod->threadOnly.threadId, basket.thread)) {
         return false;
@@ -621,9 +661,9 @@ void JdwpState::SendRequestAndPossiblySuspend(ExpandBuf* pReq, JdwpSuspendPolicy
   Thread* const self = Thread::Current();
   self->AssertThreadSuspensionIsAllowable();
   CHECK(pReq != nullptr);
+  CHECK_EQ(threadId, Dbg::GetThreadSelfId()) << "Only the current thread can suspend itself";
   /* send request and possibly suspend ourselves */
-  JDWP::ObjectId thread_self_id = Dbg::GetThreadSelfId();
-  self->TransitionFromRunnableToSuspended(kWaitingForDebuggerSend);
+  ScopedThreadSuspension sts(self, kWaitingForDebuggerSend);
   if (suspend_policy != SP_NONE) {
     AcquireJdwpTokenForEvent(threadId);
   }
@@ -631,9 +671,8 @@ void JdwpState::SendRequestAndPossiblySuspend(ExpandBuf* pReq, JdwpSuspendPolicy
   {
     // Before suspending, we change our state to kSuspended so the debugger sees us as RUNNING.
     ScopedThreadStateChange stsc(self, kSuspended);
-    SuspendByPolicy(suspend_policy, thread_self_id);
+    SuspendByPolicy(suspend_policy, threadId);
   }
-  self->TransitionFromSuspendedToRunnable();
 }
 
 /*
@@ -659,13 +698,10 @@ void JdwpState::ReleaseJdwpTokenForCommand() {
 }
 
 void JdwpState::AcquireJdwpTokenForEvent(ObjectId threadId) {
-  CHECK_NE(Thread::Current(), GetDebugThread()) << "Expected event thread";
-  CHECK_NE(debug_thread_id_, threadId) << "Not expected debug thread";
   SetWaitForJdwpToken(threadId);
 }
 
 void JdwpState::ReleaseJdwpTokenForEvent() {
-  CHECK_NE(Thread::Current(), GetDebugThread()) << "Expected event thread";
   ClearWaitForJdwpToken();
 }
 
@@ -686,23 +722,28 @@ void JdwpState::SetWaitForJdwpToken(ObjectId threadId) {
   /* this is held for very brief periods; contention is unlikely */
   MutexLock mu(self, jdwp_token_lock_);
 
-  CHECK_NE(jdwp_token_owner_thread_id_, threadId) << "Thread is already holding event thread lock";
+  if (jdwp_token_owner_thread_id_ == threadId) {
+    // Only the debugger thread may already hold the event token. For instance, it may trigger
+    // a CLASS_PREPARE event while processing a command that initializes a class.
+    CHECK_EQ(threadId, debug_thread_id_) << "Non-debugger thread is already holding event token";
+  } else {
+    /*
+     * If another thread is already doing stuff, wait for it.  This can
+     * go to sleep indefinitely.
+     */
 
-  /*
-   * If another thread is already doing stuff, wait for it.  This can
-   * go to sleep indefinitely.
-   */
-  while (jdwp_token_owner_thread_id_ != 0) {
-    VLOG(jdwp) << StringPrintf("event in progress (%#" PRIx64 "), %#" PRIx64 " sleeping",
-                               jdwp_token_owner_thread_id_, threadId);
-    waited = true;
-    jdwp_token_cond_.Wait(self);
-  }
+    while (jdwp_token_owner_thread_id_ != 0) {
+      VLOG(jdwp) << StringPrintf("event in progress (%#" PRIx64 "), %#" PRIx64 " sleeping",
+                                 jdwp_token_owner_thread_id_, threadId);
+      waited = true;
+      jdwp_token_cond_.Wait(self);
+    }
 
-  if (waited || threadId != debug_thread_id_) {
-    VLOG(jdwp) << StringPrintf("event token grabbed (%#" PRIx64 ")", threadId);
+    if (waited || threadId != debug_thread_id_) {
+      VLOG(jdwp) << StringPrintf("event token grabbed (%#" PRIx64 ")", threadId);
+    }
+    jdwp_token_owner_thread_id_ = threadId;
   }
-  jdwp_token_owner_thread_id_ = threadId;
 }
 
 /*
@@ -782,9 +823,9 @@ void JdwpState::PostVMStart() {
   SendRequestAndPossiblySuspend(pReq, suspend_policy, threadId);
 }
 
-static void LogMatchingEventsAndThread(const std::vector<JdwpEvent*> match_list,
+static void LogMatchingEventsAndThread(const std::vector<JdwpEvent*>& match_list,
                                        ObjectId thread_id)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   for (size_t i = 0, e = match_list.size(); i < e; ++i) {
     JdwpEvent* pEvent = match_list[i];
     VLOG(jdwp) << "EVENT #" << i << ": " << pEvent->eventKind
@@ -800,7 +841,7 @@ static void LogMatchingEventsAndThread(const std::vector<JdwpEvent*> match_list,
 
 static void SetJdwpLocationFromEventLocation(const JDWP::EventLocation* event_location,
                                              JDWP::JdwpLocation* jdwp_location)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   DCHECK(event_location != nullptr);
   DCHECK(jdwp_location != nullptr);
   Dbg::SetJdwpLocation(jdwp_location, event_location->method, event_location->dex_pc);
@@ -1143,7 +1184,7 @@ void JdwpState::PostException(const EventLocation* pThrowLoc, mirror::Throwable*
   SetJdwpLocationFromEventLocation(pCatchLoc, &jdwp_catch_location);
 
   if (VLOG_IS_ON(jdwp)) {
-    std::string exceptionClassName(PrettyDescriptor(exception_object->GetClass()));
+    std::string exceptionClassName(mirror::Class::PrettyDescriptor(exception_object->GetClass()));
 
     LogMatchingEventsAndThread(match_list, thread_id);
     VLOG(jdwp) << "  throwLocation=" << jdwp_throw_location;
@@ -1225,14 +1266,15 @@ void JdwpState::PostClassPrepare(mirror::Class* klass) {
     VLOG(jdwp) << "  suspend_policy=" << suspend_policy;
   }
 
-  if (thread_id == debug_thread_id_) {
+  ObjectId reported_thread_id = thread_id;
+  if (reported_thread_id == debug_thread_id_) {
     /*
      * JDWP says that, for a class prep in the debugger thread, we
      * should set thread to null and if any threads were supposed
      * to be suspended then we suspend all other threads.
      */
     VLOG(jdwp) << "  NOTE: class prepare in debugger thread!";
-    thread_id = 0;
+    reported_thread_id = 0;
     if (suspend_policy == SP_EVENT_THREAD) {
       suspend_policy = SP_ALL;
     }
@@ -1245,7 +1287,7 @@ void JdwpState::PostClassPrepare(mirror::Class* klass) {
   for (const JdwpEvent* pEvent : match_list) {
     expandBufAdd1(pReq, pEvent->eventKind);
     expandBufAdd4BE(pReq, pEvent->requestId);
-    expandBufAddObjectId(pReq, thread_id);
+    expandBufAddObjectId(pReq, reported_thread_id);
     expandBufAdd1(pReq, tag);
     expandBufAddRefTypeId(pReq, class_id);
     expandBufAddUtf8String(pReq, signature);
@@ -1323,9 +1365,8 @@ void JdwpState::DdmSendChunkV(uint32_t type, const iovec* iov, int iov_count) {
   }
   if (safe_to_release_mutator_lock_over_send) {
     // Change state to waiting to allow GC, ... while we're sending.
-    self->TransitionFromRunnableToSuspended(kWaitingForDebuggerSend);
+    ScopedThreadSuspension sts(self, kWaitingForDebuggerSend);
     SendBufferedRequest(type, wrapiov);
-    self->TransitionFromSuspendedToRunnable();
   } else {
     // Send and possibly block GC...
     SendBufferedRequest(type, wrapiov);

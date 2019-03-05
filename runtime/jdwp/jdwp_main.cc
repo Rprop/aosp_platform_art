@@ -20,18 +20,135 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "atomic.h"
-#include "base/logging.h"
+#include "android-base/stringprintf.h"
+
+#include "base/atomic.h"
+#include "base/logging.h"  // For VLOG.
 #include "base/time_utils.h"
 #include "debugger.h"
 #include "jdwp/jdwp_priv.h"
-#include "scoped_thread_state_change.h"
+#include "scoped_thread_state_change-inl.h"
 
 namespace art {
 
 namespace JDWP {
 
+using android::base::StringPrintf;
+
 static void* StartJdwpThread(void* arg);
+
+
+static bool ParseJdwpOption(const std::string& name,
+                            const std::string& value,
+                            JdwpOptions* jdwp_options) {
+  if (name == "transport") {
+    if (value == "dt_socket") {
+      jdwp_options->transport = JDWP::kJdwpTransportSocket;
+    } else if (value == "dt_android_adb") {
+      jdwp_options->transport = JDWP::kJdwpTransportAndroidAdb;
+    } else {
+      jdwp_options->transport = JDWP::kJdwpTransportUnknown;
+      LOG(ERROR) << "JDWP transport not supported: " << value;
+      return false;
+    }
+  } else if (name == "server") {
+    if (value == "n") {
+      jdwp_options->server = false;
+    } else if (value == "y") {
+      jdwp_options->server = true;
+    } else {
+      LOG(ERROR) << "JDWP option 'server' must be 'y' or 'n'";
+      return false;
+    }
+  } else if (name == "suspend") {
+    if (value == "n") {
+      jdwp_options->suspend = false;
+    } else if (value == "y") {
+      jdwp_options->suspend = true;
+    } else {
+      LOG(ERROR) << "JDWP option 'suspend' must be 'y' or 'n'";
+      return false;
+    }
+  } else if (name == "address") {
+    /* this is either <port> or <host>:<port> */
+    std::string port_string;
+    jdwp_options->host.clear();
+    std::string::size_type colon = value.find(':');
+    if (colon != std::string::npos) {
+      jdwp_options->host = value.substr(0, colon);
+      port_string = value.substr(colon + 1);
+    } else {
+      port_string = value;
+    }
+    if (port_string.empty()) {
+      LOG(ERROR) << "JDWP address missing port: " << value;
+      return false;
+    }
+    char* end;
+    uint64_t port = strtoul(port_string.c_str(), &end, 10);
+    if (*end != '\0' || port > 0xffff) {
+      LOG(ERROR) << "JDWP address has junk in port field: " << value;
+      return false;
+    }
+    jdwp_options->port = port;
+  } else if (name == "launch" || name == "onthrow" || name == "oncaught" || name == "timeout") {
+    /* valid but unsupported */
+    LOG(INFO) << "Ignoring JDWP option '" << name << "'='" << value << "'";
+  } else {
+    LOG(INFO) << "Ignoring unrecognized JDWP option '" << name << "'='" << value << "'";
+  }
+
+  return true;
+}
+
+bool ParseJdwpOptions(const std::string& options, JdwpOptions* jdwp_options) {
+  VLOG(jdwp) << "ParseJdwpOptions: " << options;
+
+  if (options == "help") {
+    LOG(ERROR) << "Example: -XjdwpOptions:transport=dt_socket,address=8000,server=y\n"
+               << "Example: -Xrunjdwp:transport=dt_socket,address=8000,server=y\n"
+               << "Example: -Xrunjdwp:transport=dt_socket,address=localhost:6500,server=n\n";
+    return false;
+  }
+
+  const std::string s;
+
+  std::vector<std::string> pairs;
+  Split(options, ',', &pairs);
+
+  for (const std::string& jdwp_option : pairs) {
+    std::string::size_type equals_pos = jdwp_option.find('=');
+    if (equals_pos == std::string::npos) {
+      LOG(ERROR) << s << "Can't parse JDWP option '" << jdwp_option << "' in '" << options << "'";
+      return false;
+    }
+
+    bool parse_attempt = ParseJdwpOption(jdwp_option.substr(0, equals_pos),
+                                         jdwp_option.substr(equals_pos + 1),
+                                         jdwp_options);
+    if (!parse_attempt) {
+      // We fail to parse this JDWP option.
+      return parse_attempt;
+    }
+  }
+
+  if (jdwp_options->transport == JDWP::kJdwpTransportUnknown) {
+    LOG(ERROR) << s << "Must specify JDWP transport: " << options;
+    return false;
+  }
+#if ART_TARGET_ANDROID
+  if (jdwp_options->transport == JDWP::kJdwpTransportNone) {
+    jdwp_options->transport = JDWP::kJdwpTransportAndroidAdb;
+    LOG(WARNING) << "no JDWP transport specified. Defaulting to dt_android_adb";
+  }
+#endif
+  if (!jdwp_options->server && (jdwp_options->host.empty() || jdwp_options->port == 0)) {
+    LOG(ERROR) << s << "Must specify JDWP host and port when server=n: " << options;
+    return false;
+  }
+
+  return true;
+}
 
 /*
  * JdwpNetStateBase class implementation
@@ -126,9 +243,12 @@ void JdwpNetStateBase::Close() {
  * Write a packet of "length" bytes. Grabs a mutex to assure atomicity.
  */
 ssize_t JdwpNetStateBase::WritePacket(ExpandBuf* pReply, size_t length) {
-  MutexLock mu(Thread::Current(), socket_lock_);
-  DCHECK(IsConnected()) << "Connection with debugger is closed";
   DCHECK_LE(length, expandBufGetLength(pReply));
+  if (!IsConnected()) {
+    LOG(WARNING) << "Connection with debugger is closed";
+    return -1;
+  }
+  MutexLock mu(Thread::Current(), socket_lock_);
   return TEMP_FAILURE_RETRY(write(clientSock, expandBufGetBuffer(pReply), length));
 }
 
@@ -232,6 +352,7 @@ JdwpState::JdwpState(const JdwpOptions* options)
       shutdown_lock_("JDWP shutdown lock", kJdwpShutdownLock),
       shutdown_cond_("JDWP shutdown condition variable", shutdown_lock_),
       processing_request_(false) {
+  Locks::AddToExpectedMutexesOnWeakRefAccess(&event_list_lock_);
 }
 
 /*
@@ -248,7 +369,7 @@ JdwpState* JdwpState::Create(const JdwpOptions* options) {
     case kJdwpTransportSocket:
       InitSocketTransport(state.get(), options);
       break;
-#ifdef HAVE_ANDROID_OS
+#ifdef ART_TARGET_ANDROID
     case kJdwpTransportAndroidAdb:
       InitAdbTransport(state.get(), options);
       break;
@@ -256,12 +377,12 @@ JdwpState* JdwpState::Create(const JdwpOptions* options) {
     default:
       LOG(FATAL) << "Unknown transport: " << options->transport;
   }
-
   {
     /*
      * Grab a mutex before starting the thread.  This ensures they
      * won't signal the cond var before we're waiting.
      */
+    state->thread_start_lock_.AssertNotHeld(self);
     MutexLock thread_start_locker(self, state->thread_start_lock_);
 
     /*
@@ -374,6 +495,8 @@ JdwpState::~JdwpState() {
   CHECK(netState == nullptr);
 
   ResetState();
+
+  Locks::RemoveFromExpectedMutexesOnWeakRefAccess(&event_list_lock_);
 }
 
 /*
@@ -533,9 +656,8 @@ void JdwpState::Run() {
       ddm_is_active_ = false;
 
       /* broadcast the disconnect; must be in RUNNING state */
-      thread_->TransitionFromSuspendedToRunnable();
+      ScopedObjectAccess soa(thread_);
       Dbg::DdmDisconnected();
-      thread_->TransitionFromRunnableToSuspended(kWaitingInMainDebuggerLoop);
     }
 
     {
@@ -607,7 +729,7 @@ int64_t JdwpState::LastDebuggerActivity() {
     return -1;
   }
 
-  int64_t last = last_activity_time_ms_.LoadSequentiallyConsistent();
+  int64_t last = last_activity_time_ms_.load(std::memory_order_seq_cst);
 
   /* initializing or in the middle of something? */
   if (last == 0) {

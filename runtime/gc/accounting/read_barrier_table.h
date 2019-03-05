@@ -17,11 +17,13 @@
 #ifndef ART_RUNTIME_GC_ACCOUNTING_READ_BARRIER_TABLE_H_
 #define ART_RUNTIME_GC_ACCOUNTING_READ_BARRIER_TABLE_H_
 
+#include <sys/mman.h>  // For the PROT_* and MAP_* constants.
+
 #include "base/bit_utils.h"
+#include "base/globals.h"
+#include "base/mem_map.h"
 #include "base/mutex.h"
 #include "gc/space/space.h"
-#include "globals.h"
-#include "mem_map.h"
 
 namespace art {
 namespace gc {
@@ -51,8 +53,8 @@ class ReadBarrierTable {
   void Clear(uint8_t* start_addr, uint8_t* end_addr) {
     DCHECK(IsValidHeapAddr(start_addr)) << start_addr;
     DCHECK(IsValidHeapAddr(end_addr)) << end_addr;
-    DCHECK(IsAligned<kRegionSize>(start_addr));
-    DCHECK(IsAligned<kRegionSize>(end_addr));
+    DCHECK_ALIGNED(start_addr, kRegionSize);
+    DCHECK_ALIGNED(end_addr, kRegionSize);
     uint8_t* entry_start = EntryFromAddr(start_addr);
     uint8_t* entry_end = EntryFromAddr(end_addr);
     memset(reinterpret_cast<void*>(entry_start), 0, entry_end - entry_start);
@@ -80,7 +82,7 @@ class ReadBarrierTable {
   }
 
   // This should match RegionSpace::kRegionSize. static_assert'ed in concurrent_copying.h.
-  static constexpr size_t kRegionSize = 1 * MB;
+  static constexpr size_t kRegionSize = 256 * KB;
 
  private:
   static constexpr uint64_t kHeapCapacity = 4ULL * GB;  // low 4gb.

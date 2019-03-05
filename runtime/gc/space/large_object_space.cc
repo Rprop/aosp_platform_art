@@ -16,30 +16,38 @@
 
 #include "large_object_space.h"
 
+#include <sys/mman.h>
+
 #include <memory>
 
+#include <android-base/logging.h>
+
+#include "base/macros.h"
+#include "base/memory_tool.h"
+#include "base/mutex-inl.h"
+#include "base/os.h"
+#include "base/stl_util.h"
 #include "gc/accounting/heap_bitmap-inl.h"
 #include "gc/accounting/space_bitmap-inl.h"
-#include "base/logging.h"
-#include "base/mutex-inl.h"
-#include "base/stl_util.h"
+#include "gc/heap.h"
 #include "image.h"
-#include "os.h"
+#include "scoped_thread_state_change-inl.h"
 #include "space-inl.h"
-#include "thread-inl.h"
+#include "thread-current-inl.h"
 
 namespace art {
 namespace gc {
 namespace space {
 
-class ValgrindLargeObjectMapSpace FINAL : public LargeObjectMapSpace {
+class MemoryToolLargeObjectMapSpace FINAL : public LargeObjectMapSpace {
  public:
-  explicit ValgrindLargeObjectMapSpace(const std::string& name) : LargeObjectMapSpace(name) {
+  explicit MemoryToolLargeObjectMapSpace(const std::string& name) : LargeObjectMapSpace(name) {
   }
 
-  ~ValgrindLargeObjectMapSpace() OVERRIDE {
-    // Keep valgrind happy if there is any large objects such as dex cache arrays which aren't
-    // freed since they are held live by the class linker.
+  ~MemoryToolLargeObjectMapSpace() OVERRIDE {
+    // Historical note: We were deleting large objects to keep Valgrind happy if there were
+    // any large objects such as Dex cache arrays which aren't freed since they are held live
+    // by the class linker.
     MutexLock mu(Thread::Current(), lock_);
     for (auto& m : large_objects_) {
       delete m.second.mem_map;
@@ -50,13 +58,14 @@ class ValgrindLargeObjectMapSpace FINAL : public LargeObjectMapSpace {
                         size_t* usable_size, size_t* bytes_tl_bulk_allocated)
       OVERRIDE {
     mirror::Object* obj =
-        LargeObjectMapSpace::Alloc(self, num_bytes + kValgrindRedZoneBytes * 2, bytes_allocated,
+        LargeObjectMapSpace::Alloc(self, num_bytes + kMemoryToolRedZoneBytes * 2, bytes_allocated,
                                    usable_size, bytes_tl_bulk_allocated);
     mirror::Object* object_without_rdz = reinterpret_cast<mirror::Object*>(
-        reinterpret_cast<uintptr_t>(obj) + kValgrindRedZoneBytes);
-    VALGRIND_MAKE_MEM_NOACCESS(reinterpret_cast<void*>(obj), kValgrindRedZoneBytes);
-    VALGRIND_MAKE_MEM_NOACCESS(reinterpret_cast<uint8_t*>(object_without_rdz) + num_bytes,
-                               kValgrindRedZoneBytes);
+        reinterpret_cast<uintptr_t>(obj) + kMemoryToolRedZoneBytes);
+    MEMORY_TOOL_MAKE_NOACCESS(reinterpret_cast<void*>(obj), kMemoryToolRedZoneBytes);
+    MEMORY_TOOL_MAKE_NOACCESS(
+        reinterpret_cast<uint8_t*>(object_without_rdz) + num_bytes,
+        kMemoryToolRedZoneBytes);
     if (usable_size != nullptr) {
       *usable_size = num_bytes;  // Since we have redzones, shrink the usable size.
     }
@@ -73,7 +82,7 @@ class ValgrindLargeObjectMapSpace FINAL : public LargeObjectMapSpace {
 
   size_t Free(Thread* self, mirror::Object* obj) OVERRIDE {
     mirror::Object* object_with_rdz = ObjectWithRedzone(obj);
-    VALGRIND_MAKE_MEM_UNDEFINED(object_with_rdz, AllocationSize(obj, nullptr));
+    MEMORY_TOOL_MAKE_UNDEFINED(object_with_rdz, AllocationSize(obj, nullptr));
     return LargeObjectMapSpace::Free(self, object_with_rdz);
   }
 
@@ -84,15 +93,15 @@ class ValgrindLargeObjectMapSpace FINAL : public LargeObjectMapSpace {
  private:
   static const mirror::Object* ObjectWithRedzone(const mirror::Object* obj) {
     return reinterpret_cast<const mirror::Object*>(
-        reinterpret_cast<uintptr_t>(obj) - kValgrindRedZoneBytes);
+        reinterpret_cast<uintptr_t>(obj) - kMemoryToolRedZoneBytes);
   }
 
   static mirror::Object* ObjectWithRedzone(mirror::Object* obj) {
     return reinterpret_cast<mirror::Object*>(
-        reinterpret_cast<uintptr_t>(obj) - kValgrindRedZoneBytes);
+        reinterpret_cast<uintptr_t>(obj) - kMemoryToolRedZoneBytes);
   }
 
-  static constexpr size_t kValgrindRedZoneBytes = kPageSize;
+  static constexpr size_t kMemoryToolRedZoneBytes = kPageSize;
 };
 
 void LargeObjectSpace::SwapBitmaps() {
@@ -119,8 +128,8 @@ LargeObjectMapSpace::LargeObjectMapSpace(const std::string& name)
       lock_("large object map space lock", kAllocSpaceLock) {}
 
 LargeObjectMapSpace* LargeObjectMapSpace::Create(const std::string& name) {
-  if (Runtime::Current()->RunningOnValgrind()) {
-    return new ValgrindLargeObjectMapSpace(name);
+  if (Runtime::Current()->IsRunningOnMemoryTool()) {
+    return new MemoryToolLargeObjectMapSpace(name);
   } else {
     return new LargeObjectMapSpace(name);
   }
@@ -137,25 +146,16 @@ mirror::Object* LargeObjectMapSpace::Alloc(Thread* self, size_t num_bytes,
     return nullptr;
   }
   mirror::Object* const obj = reinterpret_cast<mirror::Object*>(mem_map->Begin());
-  if (kIsDebugBuild) {
-    ReaderMutexLock mu2(Thread::Current(), *Locks::heap_bitmap_lock_);
-    auto* heap = Runtime::Current()->GetHeap();
-    auto* live_bitmap = heap->GetLiveBitmap();
-    auto* space_bitmap = live_bitmap->GetContinuousSpaceBitmap(obj);
-    CHECK(space_bitmap == nullptr) << obj << " overlaps with bitmap " << *space_bitmap;
-    auto* obj_end = reinterpret_cast<mirror::Object*>(mem_map->End());
-    space_bitmap = live_bitmap->GetContinuousSpaceBitmap(obj_end - 1);
-    CHECK(space_bitmap == nullptr) << obj_end << " overlaps with bitmap " << *space_bitmap;
-  }
   MutexLock mu(self, lock_);
   large_objects_.Put(obj, LargeObject {mem_map, false /* not zygote */});
   const size_t allocation_size = mem_map->BaseSize();
   DCHECK(bytes_allocated != nullptr);
-  begin_ = std::min(begin_, reinterpret_cast<uint8_t*>(obj));
-  uint8_t* obj_end = reinterpret_cast<uint8_t*>(obj) + allocation_size;
-  if (end_ == nullptr || obj_end > end_) {
-    end_ = obj_end;
+
+  if (begin_ == nullptr || begin_ > reinterpret_cast<uint8_t*>(obj)) {
+    begin_ = reinterpret_cast<uint8_t*>(obj);
   }
+  end_ = std::max(end_, reinterpret_cast<uint8_t*>(obj) + allocation_size);
+
   *bytes_allocated = allocation_size;
   if (usable_size != nullptr) {
     *usable_size = allocation_size;
@@ -187,7 +187,8 @@ size_t LargeObjectMapSpace::Free(Thread* self, mirror::Object* ptr) {
   MutexLock mu(self, lock_);
   auto it = large_objects_.find(ptr);
   if (UNLIKELY(it == large_objects_.end())) {
-    Runtime::Current()->GetHeap()->DumpSpaces(LOG(INTERNAL_FATAL));
+    ScopedObjectAccess soa(self);
+    Runtime::Current()->GetHeap()->DumpSpaces(LOG_STREAM(FATAL_WITHOUT_ABORT));
     LOG(FATAL) << "Attempted to free large object " << ptr << " which was not live";
   }
   MemMap* mem_map = it->second.mem_map;
@@ -437,7 +438,7 @@ size_t FreeListSpace::Free(Thread* self, mirror::Object* obj) {
       AllocationInfo* next_next_info = next_info->GetNextInfo();
       // Next next info can't be free since we always coalesce.
       DCHECK(!next_next_info->IsFree());
-      DCHECK(IsAligned<kAlignment>(next_next_info->ByteSize()));
+      DCHECK_ALIGNED(next_next_info->ByteSize(), kAlignment);
       new_free_info = next_next_info;
       new_free_size += next_next_info->GetPrevFreeBytes();
       RemoveFreePrev(next_next_info);
@@ -455,7 +456,7 @@ size_t FreeListSpace::Free(Thread* self, mirror::Object* obj) {
   madvise(obj, allocation_size, MADV_DONTNEED);
   if (kIsDebugBuild) {
     // Can't disallow reads since we use them to find next chunks during coalescing.
-    mprotect(obj, allocation_size, PROT_READ);
+    CheckedCall(mprotect, __FUNCTION__, obj, allocation_size, PROT_READ);
   }
   return allocation_size;
 }
@@ -518,10 +519,10 @@ mirror::Object* FreeListSpace::Alloc(Thread* self, size_t num_bytes, size_t* byt
   num_bytes_allocated_ += allocation_size;
   total_bytes_allocated_ += allocation_size;
   mirror::Object* obj = reinterpret_cast<mirror::Object*>(GetAddressForAllocationInfo(new_info));
-  // We always put our object at the start of the free block, there can not be another free block
+  // We always put our object at the start of the free block, there cannot be another free block
   // before it.
   if (kIsDebugBuild) {
-    mprotect(obj, allocation_size, PROT_READ | PROT_WRITE);
+    CheckedCall(mprotect, __FUNCTION__, obj, allocation_size, PROT_READ | PROT_WRITE);
   }
   new_info->SetPrevFreeBytes(0);
   new_info->SetByteSize(allocation_size, false);
@@ -600,15 +601,28 @@ collector::ObjectBytePair LargeObjectSpace::Sweep(bool swap_bitmaps) {
     std::swap(live_bitmap, mark_bitmap);
   }
   AllocSpace::SweepCallbackContext scc(swap_bitmaps, this);
+  std::pair<uint8_t*, uint8_t*> range = GetBeginEndAtomic();
   accounting::LargeObjectBitmap::SweepWalk(*live_bitmap, *mark_bitmap,
-                                           reinterpret_cast<uintptr_t>(Begin()),
-                                           reinterpret_cast<uintptr_t>(End()), SweepCallback, &scc);
+                                           reinterpret_cast<uintptr_t>(range.first),
+                                           reinterpret_cast<uintptr_t>(range.second),
+                                           SweepCallback,
+                                           &scc);
   return scc.freed;
 }
 
 void LargeObjectSpace::LogFragmentationAllocFailure(std::ostream& /*os*/,
                                                     size_t /*failed_alloc_bytes*/) {
   UNIMPLEMENTED(FATAL);
+}
+
+std::pair<uint8_t*, uint8_t*> LargeObjectMapSpace::GetBeginEndAtomic() const {
+  MutexLock mu(Thread::Current(), lock_);
+  return std::make_pair(Begin(), End());
+}
+
+std::pair<uint8_t*, uint8_t*> FreeListSpace::GetBeginEndAtomic() const {
+  MutexLock mu(Thread::Current(), lock_);
+  return std::make_pair(Begin(), End());
 }
 
 }  // namespace space

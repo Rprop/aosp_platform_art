@@ -18,9 +18,9 @@
 #define ART_RUNTIME_GC_ACCOUNTING_REMEMBERED_SET_H_
 
 #include "base/allocator.h"
-#include "globals.h"
-#include "object_callbacks.h"
-#include "safe_map.h"
+#include "base/globals.h"
+#include "base/mutex.h"
+#include "base/safe_map.h"
 
 #include <set>
 #include <vector>
@@ -29,10 +29,11 @@ namespace art {
 namespace gc {
 
 namespace collector {
-  class MarkSweep;
+class GarbageCollector;
+class MarkSweep;
 }  // namespace collector
 namespace space {
-  class ContinuousSpace;
+class ContinuousSpace;
 }  // namespace space
 
 class Heap;
@@ -53,11 +54,10 @@ class RememberedSet {
   void ClearCards();
 
   // Mark through all references to the target space.
-  void UpdateAndMarkReferences(MarkHeapReferenceCallback* callback,
-                               DelayReferenceReferentCallback* ref_callback,
-                               space::ContinuousSpace* target_space, void* arg)
-      EXCLUSIVE_LOCKS_REQUIRED(Locks::heap_bitmap_lock_)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void UpdateAndMarkReferences(space::ContinuousSpace* target_space,
+                               collector::GarbageCollector* collector)
+      REQUIRES(Locks::heap_bitmap_lock_)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   void Dump(std::ostream& os);
 

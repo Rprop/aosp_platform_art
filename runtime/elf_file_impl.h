@@ -24,13 +24,9 @@
 
 // Explicitly include our own elf.h to avoid Linux and other dependencies.
 #include "./elf.h"
-#include "mem_map.h"
+#include "base/mem_map.h"
 
 namespace art {
-
-extern "C" {
-  struct JITCodeEntry;
-}
 
 template <typename ElfTypes>
 class ElfFileImpl {
@@ -48,13 +44,21 @@ class ElfFileImpl {
   using Elf_Phdr = typename ElfTypes::Phdr;
   using Elf_Dyn = typename ElfTypes::Dyn;
 
-  static ElfFileImpl* Open(File* file, bool writable, bool program_header_only,
-                           std::string* error_msg, uint8_t* requested_base = nullptr);
-  static ElfFileImpl* Open(File* file, int mmap_prot, int mmap_flags, std::string* error_msg);
+  static ElfFileImpl* Open(File* file,
+                           bool writable,
+                           bool program_header_only,
+                           bool low_4gb,
+                           std::string* error_msg,
+                           uint8_t* requested_base = nullptr);
+  static ElfFileImpl* Open(File* file,
+                           int mmap_prot,
+                           int mmap_flags,
+                           bool low_4gb,
+                           std::string* error_msg);
   ~ElfFileImpl();
 
-  const File& GetFile() const {
-    return *file_;
+  const std::string& GetFilePath() const {
+    return file_path_;
   }
 
   uint8_t* Begin() const {
@@ -111,7 +115,7 @@ class ElfFileImpl {
 
   // Load segments into memory based on PT_LOAD program headers.
   // executable is true at run time, false at compile time.
-  bool Load(bool executable, std::string* error_msg);
+  bool Load(File* file, bool executable, bool low_4gb, std::string* error_msg);
 
   bool Fixup(Elf_Addr base_address);
   bool FixupDynamic(Elf_Addr base_address);
@@ -124,14 +128,14 @@ class ElfFileImpl {
   static void ApplyOatPatches(const uint8_t* patches, const uint8_t* patches_end, Elf_Addr delta,
                               uint8_t* to_patch, const uint8_t* to_patch_end);
 
-  bool Strip(std::string* error_msg);
+  bool Strip(File* file, std::string* error_msg);
 
  private:
   ElfFileImpl(File* file, bool writable, bool program_header_only, uint8_t* requested_base);
 
-  bool Setup(int prot, int flags, std::string* error_msg);
+  bool Setup(File* file, int prot, int flags, bool low_4gb, std::string* error_msg);
 
-  bool SetMap(MemMap* map, std::string* error_msg);
+  bool SetMap(File* file, MemMap* map, std::string* error_msg);
 
   uint8_t* GetProgramHeadersStart() const;
   uint8_t* GetSectionHeadersStart() const;
@@ -155,7 +159,7 @@ class ElfFileImpl {
   const Elf_Sym* FindDynamicSymbol(const std::string& symbol_name) const;
 
   // Check that certain sections and their dependencies exist.
-  bool CheckSectionsExist(std::string* error_msg) const;
+  bool CheckSectionsExist(File* file, std::string* error_msg) const;
 
   // Check that the link of the first section links to the second section.
   bool CheckSectionsLinked(const uint8_t* source, const uint8_t* target) const;
@@ -183,7 +187,7 @@ class ElfFileImpl {
   // Lookup a string by section type. Returns null for special 0 offset.
   const char* GetString(Elf_Word section_type, Elf_Word) const;
 
-  const File* const file_;
+  const std::string file_path_;
   const bool writable_;
   const bool program_header_only_;
 
@@ -212,12 +216,6 @@ class ElfFileImpl {
 
   SymbolTable* symtab_symbol_table_;
   SymbolTable* dynsym_symbol_table_;
-
-  // Support for GDB JIT
-  uint8_t* jit_elf_image_;
-  JITCodeEntry* jit_gdb_entry_;
-  std::unique_ptr<ElfFileImpl<ElfTypes>> gdb_file_mapping_;
-  void GdbJITSupport();
 
   // Override the 'base' p_vaddr in the first LOAD segment with this value (if non-null).
   uint8_t* requested_base_;

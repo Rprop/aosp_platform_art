@@ -14,18 +14,18 @@
  * limitations under the License.
  */
 
-
 #include "fault_handler.h"
 
 #include <sys/ucontext.h>
 
-#include "art_method-inl.h"
-#include "base/macros.h"
-#include "globals.h"
-#include "base/logging.h"
+#include "art_method.h"
+#include "base/enums.h"
+#include "base/globals.h"
 #include "base/hex_dump.h"
-#include "thread.h"
-#include "thread-inl.h"
+#include "base/logging.h"  // For VLOG.
+#include "base/macros.h"
+#include "base/safe_copy.h"
+#include "thread-current-inl.h"
 
 #if defined(__APPLE__)
 #define ucontext __darwin_ucontext
@@ -36,6 +36,7 @@
 #define CTX_EIP uc_mcontext->__ss.__rip
 #define CTX_EAX uc_mcontext->__ss.__rax
 #define CTX_METHOD uc_mcontext->__ss.__rdi
+#define CTX_RDI uc_mcontext->__ss.__rdi
 #define CTX_JMP_BUF uc_mcontext->__ss.__rdi
 #else
 // 32 bit mac build.
@@ -69,28 +70,37 @@
 
 namespace art {
 
-#if defined(__APPLE__) && defined(__x86_64__)
-// mac symbols have a prefix of _ on x86_64
-extern "C" void _art_quick_throw_null_pointer_exception();
-extern "C" void _art_quick_throw_stack_overflow();
-extern "C" void _art_quick_test_suspend();
-#define EXT_SYM(sym) _ ## sym
-#else
-extern "C" void art_quick_throw_null_pointer_exception();
+extern "C" void art_quick_throw_null_pointer_exception_from_signal();
 extern "C" void art_quick_throw_stack_overflow();
 extern "C" void art_quick_test_suspend();
-#define EXT_SYM(sym) sym
-#endif
-
-// Note this is different from the others (no underscore on 64 bit mac) due to
-// the way the symbol is defined in the .S file.
-// TODO: fix the symbols for 64 bit mac - there is a double underscore prefix for some
-// of them.
-extern "C" void art_nested_signal_return();
 
 // Get the size of an instruction in bytes.
 // Return 0 if the instruction is not handled.
 static uint32_t GetInstructionSize(const uint8_t* pc) {
+  // Don't segfault if pc points to garbage.
+  char buf[15];  // x86/x86-64 have a maximum instruction length of 15 bytes.
+  ssize_t bytes = SafeCopy(buf, pc, sizeof(buf));
+
+  if (bytes == 0) {
+    // Nothing was readable.
+    return 0;
+  }
+
+  if (bytes == -1) {
+    // SafeCopy not supported, assume that the entire range is readable.
+    bytes = 16;
+  } else {
+    pc = reinterpret_cast<uint8_t*>(buf);
+  }
+
+#define INCREMENT_PC()          \
+  do {                          \
+    pc++;                       \
+    if (pc - startpc > bytes) { \
+      return 0;                 \
+    }                           \
+  } while (0)
+
 #if defined(__x86_64)
   const bool x86_64 = true;
 #else
@@ -99,7 +109,8 @@ static uint32_t GetInstructionSize(const uint8_t* pc) {
 
   const uint8_t* startpc = pc;
 
-  uint8_t opcode = *pc++;
+  uint8_t opcode = *pc;
+  INCREMENT_PC();
   uint8_t modrm;
   bool has_modrm = false;
   bool two_byte = false;
@@ -131,7 +142,8 @@ static uint32_t GetInstructionSize(const uint8_t* pc) {
 
       // Group 4
       case 0x67:
-        opcode = *pc++;
+        opcode = *pc;
+        INCREMENT_PC();
         prefix_present = true;
         break;
     }
@@ -141,13 +153,15 @@ static uint32_t GetInstructionSize(const uint8_t* pc) {
   }
 
   if (x86_64 && opcode >= 0x40 && opcode <= 0x4f) {
-    opcode = *pc++;
+    opcode = *pc;
+    INCREMENT_PC();
   }
 
   if (opcode == 0x0f) {
     // Two byte opcode
     two_byte = true;
-    opcode = *pc++;
+    opcode = *pc;
+    INCREMENT_PC();
   }
 
   bool unhandled_instruction = false;
@@ -160,7 +174,8 @@ static uint32_t GetInstructionSize(const uint8_t* pc) {
       case 0xb7:
       case 0xbe:        // movsx
       case 0xbf:
-        modrm = *pc++;
+        modrm = *pc;
+        INCREMENT_PC();
         has_modrm = true;
         break;
       default:
@@ -179,23 +194,48 @@ static uint32_t GetInstructionSize(const uint8_t* pc) {
       case 0x3c:
       case 0x3d:
       case 0x85:        // test.
-        modrm = *pc++;
+        modrm = *pc;
+        INCREMENT_PC();
         has_modrm = true;
         break;
 
       case 0x80:        // group 1, byte immediate.
       case 0x83:
       case 0xc6:
-        modrm = *pc++;
+        modrm = *pc;
+        INCREMENT_PC();
         has_modrm = true;
         immediate_size = 1;
         break;
 
       case 0x81:        // group 1, word immediate.
       case 0xc7:        // mov
-        modrm = *pc++;
+        modrm = *pc;
+        INCREMENT_PC();
         has_modrm = true;
         immediate_size = operand_size_prefix ? 2 : 4;
+        break;
+
+      case 0xf6:
+      case 0xf7:
+        modrm = *pc;
+        INCREMENT_PC();
+        has_modrm = true;
+        switch ((modrm >> 3) & 7) {  // Extract "reg/opcode" from "modr/m".
+          case 0:  // test
+            immediate_size = (opcode == 0xf6) ? 1 : (operand_size_prefix ? 2 : 4);
+            break;
+          case 2:  // not
+          case 3:  // neg
+          case 4:  // mul
+          case 5:  // imul
+          case 6:  // div
+          case 7:  // idiv
+            break;
+          default:
+            unhandled_instruction = true;
+            break;
+        }
         break;
 
       default:
@@ -214,7 +254,7 @@ static uint32_t GetInstructionSize(const uint8_t* pc) {
 
     // Check for SIB.
     if (mod != 3U /* 0b11 */ && (modrm & 7U /* 0b111 */) == 4) {
-      ++pc;     // SIB
+      INCREMENT_PC();     // SIB
     }
 
     switch (mod) {
@@ -230,22 +270,10 @@ static uint32_t GetInstructionSize(const uint8_t* pc) {
   pc += displacement_size + immediate_size;
 
   VLOG(signals) << "x86 instruction length calculated as " << (pc - startpc);
+  if (pc - startpc > bytes) {
+    return 0;
+  }
   return pc - startpc;
-}
-
-void FaultManager::HandleNestedSignal(int, siginfo_t*, void* context) {
-  // For the Intel architectures we need to go to an assembly language
-  // stub.  This is because the 32 bit call to longjmp is much different
-  // from the 64 bit ABI call and pushing things onto the stack inside this
-  // handler was unwieldy and ugly.  The use of the stub means we can keep
-  // this code the same for both 32 and 64 bit.
-
-  Thread* self = Thread::Current();
-  CHECK(self != nullptr);  // This will cause a SIGABRT if self is null.
-
-  struct ucontext* uc = reinterpret_cast<struct ucontext*>(context);
-  uc->CTX_JMP_BUF = reinterpret_cast<uintptr_t>(*self->GetNestedSignalState());
-  uc->CTX_EIP = reinterpret_cast<uintptr_t>(art_nested_signal_return);
 }
 
 void FaultManager::GetMethodAndReturnPcAndSp(siginfo_t* siginfo, void* context,
@@ -263,9 +291,9 @@ void FaultManager::GetMethodAndReturnPcAndSp(siginfo_t* siginfo, void* context,
   uintptr_t* fault_addr = reinterpret_cast<uintptr_t*>(siginfo->si_addr);
   uintptr_t* overflow_addr = reinterpret_cast<uintptr_t*>(
 #if defined(__x86_64__)
-      reinterpret_cast<uint8_t*>(*out_sp) - GetStackOverflowReservedBytes(kX86_64));
+      reinterpret_cast<uint8_t*>(*out_sp) - GetStackOverflowReservedBytes(InstructionSet::kX86_64));
 #else
-      reinterpret_cast<uint8_t*>(*out_sp) - GetStackOverflowReservedBytes(kX86));
+      reinterpret_cast<uint8_t*>(*out_sp) - GetStackOverflowReservedBytes(InstructionSet::kX86));
 #endif
   if (overflow_addr == fault_addr) {
     *out_method = reinterpret_cast<ArtMethod*>(uc->CTX_METHOD);
@@ -292,7 +320,10 @@ void FaultManager::GetMethodAndReturnPcAndSp(siginfo_t* siginfo, void* context,
   *out_return_pc = reinterpret_cast<uintptr_t>(pc + instr_size);
 }
 
-bool NullPointerHandler::Action(int, siginfo_t*, void* context) {
+bool NullPointerHandler::Action(int, siginfo_t* sig, void* context) {
+  if (!IsValidImplicitCheck(sig)) {
+    return false;
+  }
   struct ucontext *uc = reinterpret_cast<struct ucontext*>(context);
   uint8_t* pc = reinterpret_cast<uint8_t*>(uc->CTX_EIP);
   uint8_t* sp = reinterpret_cast<uint8_t*>(uc->CTX_ESP);
@@ -308,13 +339,15 @@ bool NullPointerHandler::Action(int, siginfo_t*, void* context) {
   // next instruction (this instruction + instruction size).  The return address
   // is on the stack at the top address of the current frame.
 
-  // Push the return address onto the stack.
+  // Push the return address and fault address onto the stack.
   uintptr_t retaddr = reinterpret_cast<uintptr_t>(pc + instr_size);
-  uintptr_t* next_sp = reinterpret_cast<uintptr_t*>(sp - sizeof(uintptr_t));
-  *next_sp = retaddr;
+  uintptr_t* next_sp = reinterpret_cast<uintptr_t*>(sp - 2 * sizeof(uintptr_t));
+  next_sp[1] = retaddr;
+  next_sp[0] = reinterpret_cast<uintptr_t>(sig->si_addr);
   uc->CTX_ESP = reinterpret_cast<uintptr_t>(next_sp);
 
-  uc->CTX_EIP = reinterpret_cast<uintptr_t>(EXT_SYM(art_quick_throw_null_pointer_exception));
+  uc->CTX_EIP = reinterpret_cast<uintptr_t>(
+      art_quick_throw_null_pointer_exception_from_signal);
   VLOG(signals) << "Generating null pointer exception";
   return true;
 }
@@ -335,11 +368,7 @@ bool NullPointerHandler::Action(int, siginfo_t*, void* context) {
 bool SuspensionHandler::Action(int, siginfo_t*, void* context) {
   // These are the instructions to check for.  The first one is the mov eax, fs:[xxx]
   // where xxx is the offset of the suspend trigger.
-#if defined(__x86_64__)
-  uint32_t trigger = Thread::ThreadSuspendTriggerOffset<8>().Int32Value();
-#else
-  uint32_t trigger = Thread::ThreadSuspendTriggerOffset<4>().Int32Value();
-#endif
+  uint32_t trigger = Thread::ThreadSuspendTriggerOffset<kRuntimePointerSize>().Int32Value();
 
   VLOG(signals) << "Checking for suspension point";
 #if defined(__x86_64__)
@@ -388,7 +417,7 @@ bool SuspensionHandler::Action(int, siginfo_t*, void* context) {
     *next_sp = retaddr;
     uc->CTX_ESP = reinterpret_cast<uintptr_t>(next_sp);
 
-    uc->CTX_EIP = reinterpret_cast<uintptr_t>(EXT_SYM(art_quick_test_suspend));
+    uc->CTX_EIP = reinterpret_cast<uintptr_t>(art_quick_test_suspend);
 
     // Now remove the suspend trigger that caused this fault.
     Thread::Current()->RemoveSuspendTrigger();
@@ -416,9 +445,9 @@ bool StackOverflowHandler::Action(int, siginfo_t* info, void* context) {
     ", fault_addr: " << fault_addr;
 
 #if defined(__x86_64__)
-  uintptr_t overflow_addr = sp - GetStackOverflowReservedBytes(kX86_64);
+  uintptr_t overflow_addr = sp - GetStackOverflowReservedBytes(InstructionSet::kX86_64);
 #else
-  uintptr_t overflow_addr = sp - GetStackOverflowReservedBytes(kX86);
+  uintptr_t overflow_addr = sp - GetStackOverflowReservedBytes(InstructionSet::kX86);
 #endif
 
   // Check that the fault address is the value expected for a stack overflow.
@@ -434,7 +463,7 @@ bool StackOverflowHandler::Action(int, siginfo_t* info, void* context) {
   // the previous frame.
 
   // Now arrange for the signal handler to return to art_quick_throw_stack_overflow.
-  uc->CTX_EIP = reinterpret_cast<uintptr_t>(EXT_SYM(art_quick_throw_stack_overflow));
+  uc->CTX_EIP = reinterpret_cast<uintptr_t>(art_quick_throw_stack_overflow);
 
   return true;
 }

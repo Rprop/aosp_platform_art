@@ -14,19 +14,22 @@
  * limitations under the License.
  */
 
+#include "sticky_mark_sweep.h"
+
+#include "gc/accounting/atomic_stack.h"
+#include "gc/accounting/card_table.h"
 #include "gc/heap.h"
 #include "gc/space/large_object_space.h"
 #include "gc/space/space-inl.h"
-#include "sticky_mark_sweep.h"
-#include "thread-inl.h"
+#include "runtime.h"
+#include "thread-current-inl.h"
 
 namespace art {
 namespace gc {
 namespace collector {
 
 StickyMarkSweep::StickyMarkSweep(Heap* heap, bool is_concurrent, const std::string& name_prefix)
-    : PartialMarkSweep(heap, is_concurrent,
-                       name_prefix.empty() ? "sticky " : name_prefix) {
+    : PartialMarkSweep(heap, is_concurrent, name_prefix.empty() ? "sticky " : name_prefix) {
   cumulative_timings_.SetName(GetName());
 }
 
@@ -51,14 +54,26 @@ void StickyMarkSweep::BindBitmaps() {
 
 void StickyMarkSweep::MarkReachableObjects() {
   // All reachable objects must be referenced by a root or a dirty card, so we can clear the mark
-  // stack here since all objects in the mark stack will Get scanned by the card scanning anyways.
+  // stack here since all objects in the mark stack will get scanned by the card scanning anyways.
   // TODO: Not put these objects in the mark stack in the first place.
   mark_stack_->Reset();
   RecursiveMarkDirtyObjects(false, accounting::CardTable::kCardDirty - 1);
 }
 
-void StickyMarkSweep::Sweep(bool swap_bitmaps) {
-  UNUSED(swap_bitmaps);
+void StickyMarkSweep::MarkConcurrentRoots(VisitRootFlags flags) {
+  TimingLogger::ScopedTiming t(__FUNCTION__, GetTimings());
+  // Visit all runtime roots and clear dirty flags including class loader. This is done to prevent
+  // incorrect class unloading since the GC does not card mark when storing the class during
+  // object allocation. Doing this for each allocation would be slow.
+  // Since the card is not dirty, it means the object may not get scanned. This can cause class
+  // unloading to occur even though the class and class loader are reachable through the object's
+  // class.
+  Runtime::Current()->VisitConcurrentRoots(
+      this,
+      static_cast<VisitRootFlags>(flags | kVisitRootFlagClassLoader));
+}
+
+void StickyMarkSweep::Sweep(bool swap_bitmaps ATTRIBUTE_UNUSED) {
   SweepArray(GetHeap()->GetLiveStack(), false);
 }
 

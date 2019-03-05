@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-#include "gtest/gtest.h"
 #include "memcmp16.h"
+
+#include "gtest/gtest.h"
 
 class RandGen {
  public:
@@ -99,7 +100,7 @@ static void CheckSeparate(size_t max_length, size_t min_length) {
     }
 
     size_t min = count1 < count2 ? count1 : count2;
-    bool fill_same = r.next() % 1 == 1;
+    bool fill_same = r.next() % 2 == 1;
 
     if (fill_same) {
       for (size_t i = 0; i < min; ++i) {
@@ -144,10 +145,10 @@ static void CheckSeparate(size_t max_length, size_t min_length) {
     ASSERT_EQ(expected, computed) << "Run " << round << ", c1=" << count1 << " c2=" << count2;
 
     if (count1 > 0U) {
-      delete s1;
+      delete[] s1;
     }
     if (count2 > 0U) {
-      delete s2;
+      delete[] s2;
     }
   }
 }

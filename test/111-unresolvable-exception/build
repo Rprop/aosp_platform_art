@@ -17,14 +17,22 @@
 # Stop if something fails.
 set -e
 
-mkdir classes
-${JAVAC} -d classes `find src -name '*.java'`
-rm classes/TestException.class
+export ORIGINAL_JAVAC="$JAVAC"
 
-if [ ${USE_JACK} = "true" ]; then
-  ${JILL} classes --output classes.jack
-  ${JACK} --import classes.jack --output-dex .
-else
-  ${DX} -JXmx256m --debug --dex --dump-to=classes.lst --output=classes.dex classes
-fi
-zip $TEST_NAME.jar classes.dex
+# Wrapper function for javac which invokes the compiler and applies
+# additional setup steps for the test.
+function javac_wrapper {
+  set -e # Stop on error - the caller script may not have this set.
+
+  $ORIGINAL_JAVAC "$@"
+
+  # Remove class available at compile time but not at run time.
+  rm classes/TestException.class
+}
+
+export -f javac_wrapper
+export JAVAC=javac_wrapper
+
+######################################################################
+
+./default-build "$@"

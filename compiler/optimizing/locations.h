@@ -17,11 +17,12 @@
 #ifndef ART_COMPILER_OPTIMIZING_LOCATIONS_H_
 #define ART_COMPILER_OPTIMIZING_LOCATIONS_H_
 
+#include "base/arena_containers.h"
 #include "base/arena_object.h"
 #include "base/bit_field.h"
+#include "base/bit_utils.h"
 #include "base/bit_vector.h"
 #include "base/value_object.h"
-#include "utils/growable_array.h"
 
 namespace art {
 
@@ -38,7 +39,13 @@ std::ostream& operator<<(std::ostream& os, const Location& location);
 class Location : public ValueObject {
  public:
   enum OutputOverlap {
+    // The liveness of the output overlaps the liveness of one or
+    // several input(s); the register allocator cannot reuse an
+    // input's location for the output's location.
     kOutputOverlap,
+    // The liveness of the output does not overlap the liveness of any
+    // input; the register allocator is allowed to reuse an input's
+    // location for the output's location.
     kNoOutputOverlap
   };
 
@@ -62,19 +69,22 @@ class Location : public ValueObject {
     // We do not use the value 9 because it conflicts with kLocationConstantMask.
     kDoNotUse9 = 9,
 
+    kSIMDStackSlot = 10,  // 128bit stack slot. TODO: generalize with encoded #bytes?
+
     // Unallocated location represents a location that is not fixed and can be
     // allocated by a register allocator.  Each unallocated location has
     // a policy that specifies what kind of location is suitable. Payload
     // contains register allocation policy.
-    kUnallocated = 10,
+    kUnallocated = 11,
   };
 
-  Location() : value_(kInvalid) {
+  Location() : ValueObject(), value_(kInvalid) {
     // Verify that non-constant location kinds do not interfere with kConstant.
     static_assert((kInvalid & kLocationConstantMask) != kConstant, "TagError");
     static_assert((kUnallocated & kLocationConstantMask) != kConstant, "TagError");
     static_assert((kStackSlot & kLocationConstantMask) != kConstant, "TagError");
     static_assert((kDoubleStackSlot & kLocationConstantMask) != kConstant, "TagError");
+    static_assert((kSIMDStackSlot & kLocationConstantMask) != kConstant, "TagError");
     static_assert((kRegister & kLocationConstantMask) != kConstant, "TagError");
     static_assert((kFpuRegister & kLocationConstantMask) != kConstant, "TagError");
     static_assert((kRegisterPair & kLocationConstantMask) != kConstant, "TagError");
@@ -84,12 +94,9 @@ class Location : public ValueObject {
     DCHECK(!IsValid());
   }
 
-  Location(const Location& other) : ValueObject(), value_(other.value_) {}
+  Location(const Location& other) = default;
 
-  Location& operator=(const Location& other) {
-    value_ = other.value_;
-    return *this;
-  }
+  Location& operator=(const Location& other) = default;
 
   bool IsConstant() const {
     return (value_ & kLocationConstantMask) == kConstant;
@@ -262,8 +269,20 @@ class Location : public ValueObject {
     return GetKind() == kDoubleStackSlot;
   }
 
+  static Location SIMDStackSlot(intptr_t stack_index) {
+    uintptr_t payload = EncodeStackIndex(stack_index);
+    Location loc(kSIMDStackSlot, payload);
+    // Ensure that sign is preserved.
+    DCHECK_EQ(loc.GetStackIndex(), stack_index);
+    return loc;
+  }
+
+  bool IsSIMDStackSlot() const {
+    return GetKind() == kSIMDStackSlot;
+  }
+
   intptr_t GetStackIndex() const {
-    DCHECK(IsStackSlot() || IsDoubleStackSlot());
+    DCHECK(IsStackSlot() || IsDoubleStackSlot() || IsSIMDStackSlot());
     // Decode stack index manually to preserve sign.
     return GetPayload() - kStackIndexBias;
   }
@@ -311,6 +330,7 @@ class Location : public ValueObject {
       case kRegister: return "R";
       case kStackSlot: return "S";
       case kDoubleStackSlot: return "DS";
+      case kSIMDStackSlot: return "SIMD";
       case kUnallocated: return "U";
       case kConstant: return "C";
       case kFpuRegister: return "F";
@@ -321,7 +341,6 @@ class Location : public ValueObject {
         LOG(FATAL) << "Should not use this location kind";
     }
     UNREACHABLE();
-    return "?";
   }
 
   // Unallocated locations.
@@ -354,8 +373,10 @@ class Location : public ValueObject {
   }
 
   static Location RegisterOrConstant(HInstruction* instruction);
-  static Location RegisterOrInt32LongConstant(HInstruction* instruction);
+  static Location RegisterOrInt32Constant(HInstruction* instruction);
   static Location ByteRegisterOrConstant(int reg, HInstruction* instruction);
+  static Location FpuRegisterOrConstant(HInstruction* instruction);
+  static Location FpuRegisterOrInt32Constant(HInstruction* instruction);
 
   // The location of the first input to the instruction will be
   // used to replace this unallocated location.
@@ -366,6 +387,10 @@ class Location : public ValueObject {
   Policy GetPolicy() const {
     DCHECK(IsUnallocated());
     return PolicyField::Decode(GetPayload());
+  }
+
+  bool RequiresRegisterKind() const {
+    return GetPolicy() == kRequiresRegister || GetPolicy() == kRequiresFpuRegister;
   }
 
   uintptr_t GetEncoding() const {
@@ -407,7 +432,8 @@ std::ostream& operator<<(std::ostream& os, const Location::Policy& rhs);
 
 class RegisterSet : public ValueObject {
  public:
-  RegisterSet() : core_registers_(0), floating_point_registers_(0) {}
+  static RegisterSet Empty() { return RegisterSet(); }
+  static RegisterSet AllFpu() { return RegisterSet(0, -1); }
 
   void Add(Location loc) {
     if (loc.IsRegister()) {
@@ -427,11 +453,11 @@ class RegisterSet : public ValueObject {
     }
   }
 
-  bool ContainsCoreRegister(uint32_t id) {
+  bool ContainsCoreRegister(uint32_t id) const {
     return Contains(core_registers_, id);
   }
 
-  bool ContainsFloatingPointRegister(uint32_t id) {
+  bool ContainsFloatingPointRegister(uint32_t id) const {
     return Contains(floating_point_registers_, id);
   }
 
@@ -440,7 +466,7 @@ class RegisterSet : public ValueObject {
   }
 
   size_t GetNumberOfRegisters() const {
-    return __builtin_popcount(core_registers_) + __builtin_popcount(floating_point_registers_);
+    return POPCOUNT(core_registers_) + POPCOUNT(floating_point_registers_);
   }
 
   uint32_t GetCoreRegisters() const {
@@ -452,10 +478,11 @@ class RegisterSet : public ValueObject {
   }
 
  private:
+  RegisterSet() : core_registers_(0), floating_point_registers_(0) {}
+  RegisterSet(uint32_t core, uint32_t fp) : core_registers_(core), floating_point_registers_(fp) {}
+
   uint32_t core_registers_;
   uint32_t floating_point_registers_;
-
-  DISALLOW_COPY_AND_ASSIGN(RegisterSet);
 };
 
 static constexpr bool kIntrinsified = true;
@@ -468,31 +495,35 @@ static constexpr bool kIntrinsified = true;
  * The intent is to have the code for generating the instruction independent of
  * register allocation. A register allocator just has to provide a LocationSummary.
  */
-class LocationSummary : public ArenaObject<kArenaAllocMisc> {
+class LocationSummary : public ArenaObject<kArenaAllocLocationSummary> {
  public:
   enum CallKind {
     kNoCall,
+    kCallOnMainAndSlowPath,
     kCallOnSlowPath,
-    kCall
+    kCallOnMainOnly
   };
 
-  LocationSummary(HInstruction* instruction,
-                  CallKind call_kind = kNoCall,
-                  bool intrinsified = false);
+  explicit LocationSummary(HInstruction* instruction,
+                           CallKind call_kind = kNoCall,
+                           bool intrinsified = false);
 
   void SetInAt(uint32_t at, Location location) {
-    DCHECK(inputs_.Get(at).IsUnallocated() || inputs_.Get(at).IsInvalid());
-    inputs_.Put(at, location);
+    inputs_[at] = location;
   }
 
   Location InAt(uint32_t at) const {
-    return inputs_.Get(at);
+    return inputs_[at];
   }
 
   size_t GetInputCount() const {
-    return inputs_.Size();
+    return inputs_.size();
   }
 
+  // Set the output location.  Argument `overlaps` tells whether the
+  // output overlaps any of the inputs (if so, it cannot share the
+  // same register as one of the inputs); it is set to
+  // `Location::kOutputOverlap` by default for safety.
   void SetOut(Location location, Location::OutputOverlap overlaps = Location::kOutputOverlap) {
     DCHECK(output_.IsInvalid());
     output_overlaps_ = overlaps;
@@ -509,28 +540,70 @@ class LocationSummary : public ArenaObject<kArenaAllocMisc> {
   }
 
   void AddTemp(Location location) {
-    temps_.Add(location);
+    temps_.push_back(location);
+  }
+
+  void AddRegisterTemps(size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+      AddTemp(Location::RequiresRegister());
+    }
   }
 
   Location GetTemp(uint32_t at) const {
-    return temps_.Get(at);
+    return temps_[at];
   }
 
   void SetTempAt(uint32_t at, Location location) {
-    DCHECK(temps_.Get(at).IsUnallocated() || temps_.Get(at).IsInvalid());
-    temps_.Put(at, location);
+    DCHECK(temps_[at].IsUnallocated() || temps_[at].IsInvalid());
+    temps_[at] = location;
   }
 
   size_t GetTempCount() const {
-    return temps_.Size();
+    return temps_.size();
   }
+
+  bool HasTemps() const { return !temps_.empty(); }
 
   Location Out() const { return output_; }
 
-  bool CanCall() const { return call_kind_ != kNoCall; }
-  bool WillCall() const { return call_kind_ == kCall; }
-  bool OnlyCallsOnSlowPath() const { return call_kind_ == kCallOnSlowPath; }
-  bool NeedsSafepoint() const { return CanCall(); }
+  bool CanCall() const {
+    return call_kind_ != kNoCall;
+  }
+
+  bool WillCall() const {
+    return call_kind_ == kCallOnMainOnly || call_kind_ == kCallOnMainAndSlowPath;
+  }
+
+  bool CallsOnSlowPath() const {
+    return call_kind_ == kCallOnSlowPath || call_kind_ == kCallOnMainAndSlowPath;
+  }
+
+  bool OnlyCallsOnSlowPath() const {
+    return call_kind_ == kCallOnSlowPath;
+  }
+
+  bool CallsOnMainAndSlowPath() const {
+    return call_kind_ == kCallOnMainAndSlowPath;
+  }
+
+  bool NeedsSafepoint() const {
+    return CanCall();
+  }
+
+  void SetCustomSlowPathCallerSaves(const RegisterSet& caller_saves) {
+    DCHECK(OnlyCallsOnSlowPath());
+    has_custom_slow_path_calling_convention_ = true;
+    custom_slow_path_caller_saves_ = caller_saves;
+  }
+
+  bool HasCustomSlowPathCallingConvention() const {
+    return has_custom_slow_path_calling_convention_;
+  }
+
+  const RegisterSet& GetCustomSlowPathCallerSaves() const {
+    DCHECK(HasCustomSlowPathCallingConvention());
+    return custom_slow_path_caller_saves_;
+  }
 
   void SetStackBit(uint32_t index) {
     stack_mask_->SetBit(index);
@@ -575,7 +648,7 @@ class LocationSummary : public ArenaObject<kArenaAllocMisc> {
   }
 
   bool IsFixedInput(uint32_t input_index) const {
-    Location input = inputs_.Get(input_index);
+    Location input = inputs_[input_index];
     return input.IsRegister()
         || input.IsFpuRegister()
         || input.IsPair()
@@ -592,13 +665,22 @@ class LocationSummary : public ArenaObject<kArenaAllocMisc> {
   }
 
  private:
-  GrowableArray<Location> inputs_;
-  GrowableArray<Location> temps_;
+  LocationSummary(HInstruction* instruction,
+                  CallKind call_kind,
+                  bool intrinsified,
+                  ArenaAllocator* allocator);
+
+  ArenaVector<Location> inputs_;
+  ArenaVector<Location> temps_;
+  const CallKind call_kind_;
+  // Whether these are locations for an intrinsified call.
+  const bool intrinsified_;
+  // Whether the slow path has default or custom calling convention.
+  bool has_custom_slow_path_calling_convention_;
   // Whether the output overlaps with any of the inputs. If it overlaps, then it cannot
   // share the same register as the inputs.
   Location::OutputOverlap output_overlaps_;
   Location output_;
-  const CallKind call_kind_;
 
   // Mask of objects that live in the stack.
   BitVector* stack_mask_;
@@ -609,11 +691,10 @@ class LocationSummary : public ArenaObject<kArenaAllocMisc> {
   // Registers that are in use at this position.
   RegisterSet live_registers_;
 
-  // Whether these are locations for an intrinsified call.
-  const bool intrinsified_;
+  // Custom slow path caller saves. Valid only if indicated by slow_path_calling_convention_.
+  RegisterSet custom_slow_path_caller_saves_;
 
-  ART_FRIEND_TEST(RegisterAllocatorTest, ExpectedInRegisterHint);
-  ART_FRIEND_TEST(RegisterAllocatorTest, SameAsFirstInputHint);
+  friend class RegisterAllocatorTest;
   DISALLOW_COPY_AND_ASSIGN(LocationSummary);
 };
 

@@ -157,10 +157,28 @@ class Main {
     System.out.println(o + " (" + (o != null ? o.getClass() : "null") + ")");
   }
 
+  /**
+   * Sorts the input array using the comparator and returns the sorted array.
+   */
+  private static Object[] sort(Object[] objects, Comparator<Object> comp) {
+    Arrays.sort(objects, comp);
+    return objects;
+  }
+
   public static void testMethodReflection() throws Exception {
-    System.out.println(Arrays.toString(String.class.getDeclaredConstructors()));
-    System.out.println(Arrays.toString(String.class.getDeclaredFields()));
-    System.out.println(Arrays.toString(String.class.getDeclaredMethods()));
+    Comparator<Object> comp = new Comparator<Object>() {
+      public int compare(Object a, Object b) {
+        return a.toString().compareTo(b.toString());
+      }
+      public boolean equals(Object b) {
+        return this == b;
+      }
+    };
+
+    // Sort the return values by their string values since the order is undefined by the spec.
+    System.out.println(Arrays.toString(sort(String.class.getDeclaredConstructors(), comp)));
+    System.out.println(Arrays.toString(sort(String.class.getDeclaredFields(), comp)));
+    System.out.println(Arrays.toString(sort(String.class.getDeclaredMethods(), comp)));
 
     System.out.println(Arrays.toString(Main.class.getInterfaces()));
     System.out.println(Arrays.toString(String.class.getInterfaces()));
@@ -257,10 +275,8 @@ class Main {
   }
 
   public static void testConstructorReflection() throws Exception {
-    Constructor<?> ctor;
-
-    ctor = String.class.getConstructor(new Class[0]);
-    show(ctor.newInstance((Object[]) null));
+    Constructor<String> ctor = String.class.getConstructor();
+    show(ctor.newInstance());
 
     ctor = String.class.getConstructor(char[].class, int.class, int.class);
     show(ctor.newInstance(new char[] { '\u2714', 'y', 'z', '!' }, 1, 2));
@@ -269,26 +285,26 @@ class Main {
   private static void testPackagePrivateConstructor() {
     try {
       Class<?> c = Class.forName("sub.PPClass");
-      Constructor cons = c.getConstructor();
+      Constructor<?> cons = c.getConstructor();
       cons.newInstance();
       throw new RuntimeException("Expected IllegalAccessException.");
     } catch (IllegalAccessException e) {
       // Expected.
     } catch (Exception e) {
       // Error.
-      e.printStackTrace();
+      e.printStackTrace(System.out);
     }
   }
 
   private static void testPackagePrivateAccessibleConstructor() {
     try {
       Class<?> c = Class.forName("sub.PPClass");
-      Constructor cons = c.getConstructor();
+      Constructor<?> cons = c.getConstructor();
       cons.setAccessible(true);  // ensure we prevent IllegalAccessException
       cons.newInstance();
     } catch (Exception e) {
       // Error.
-      e.printStackTrace();
+      e.printStackTrace(System.out);
     }
   }
 

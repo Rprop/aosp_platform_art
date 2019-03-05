@@ -18,13 +18,18 @@
 
 #include <sstream>
 
+#include <android-base/logging.h>
+
+#include "base/file_utils.h"
+#include "base/macros.h"
 #include "base/stringpiece.h"
+#include "base/utils.h"
 #include "debugger.h"
 #include "gc/heap.h"
 #include "monitor.h"
 #include "runtime.h"
+#include "ti/agent.h"
 #include "trace.h"
-#include "utils.h"
 
 #include "cmdline_parser.h"
 #include "runtime_options.h"
@@ -41,15 +46,13 @@ ParsedOptions::ParsedOptions()
                                                     // Runtime::Abort
 }
 
-ParsedOptions* ParsedOptions::Create(const RuntimeOptions& options, bool ignore_unrecognized,
-                                     RuntimeArgumentMap* runtime_options) {
+bool ParsedOptions::Parse(const RuntimeOptions& options,
+                          bool ignore_unrecognized,
+                          RuntimeArgumentMap* runtime_options) {
   CHECK(runtime_options != nullptr);
 
-  std::unique_ptr<ParsedOptions> parsed(new ParsedOptions());
-  if (parsed->Parse(options, ignore_unrecognized, runtime_options)) {
-    return parsed.release();
-  }
-  return nullptr;
+  ParsedOptions parser;
+  return parser.DoParse(options, ignore_unrecognized, runtime_options);
 }
 
 using RuntimeParser = CmdlineParser<RuntimeArgumentMap, RuntimeArgumentMap::Key>;
@@ -89,9 +92,19 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
           .IntoKey(M::CheckJni)
       .Define("-Xjniopts:forcecopy")
           .IntoKey(M::JniOptsForceCopy)
-      .Define({"-Xrunjdwp:_", "-agentlib:jdwp=_"})
-          .WithType<JDWP::JdwpOptions>()
+      .Define("-XjdwpProvider:_")
+          .WithType<JdwpProvider>()
+          .IntoKey(M::JdwpProvider)
+      .Define({"-Xrunjdwp:_", "-agentlib:jdwp=_", "-XjdwpOptions:_"})
+          .WithType<std::string>()
           .IntoKey(M::JdwpOptions)
+      // TODO Re-enable -agentlib: once I have a good way to transform the values.
+      // .Define("-agentlib:_")
+      //     .WithType<std::vector<ti::Agent>>().AppendValues()
+      //     .IntoKey(M::AgentLib)
+      .Define("-agentpath:_")
+          .WithType<std::list<ti::AgentSpec>>().AppendValues()
+          .IntoKey(M::AgentPath)
       .Define("-Xms_")
           .WithType<MemoryKiB>()
           .IntoKey(M::MemoryInitialSize)
@@ -114,7 +127,7 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
           .WithType<double>().WithRange(0.1, 0.9)
           .IntoKey(M::HeapTargetUtilization)
       .Define("-XX:ForegroundHeapGrowthMultiplier=_")
-          .WithType<double>().WithRange(0.1, 1.0)
+          .WithType<double>().WithRange(0.1, 5.0)
           .IntoKey(M::ForegroundHeapGrowthMultiplier)
       .Define("-XX:ParallelGCThreads=_")
           .WithType<unsigned int>()
@@ -148,16 +161,50 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
       .Define({"-XX:EnableHSpaceCompactForOOM", "-XX:DisableHSpaceCompactForOOM"})
           .WithValues({true, false})
           .IntoKey(M::EnableHSpaceCompactForOOM)
+      .Define("-XX:DumpNativeStackOnSigQuit:_")
+          .WithType<bool>()
+          .WithValueMap({{"false", false}, {"true", true}})
+          .IntoKey(M::DumpNativeStackOnSigQuit)
+      .Define("-XX:MadviseRandomAccess:_")
+          .WithType<bool>()
+          .WithValueMap({{"false", false}, {"true", true}})
+          .IntoKey(M::MadviseRandomAccess)
       .Define("-Xusejit:_")
           .WithType<bool>()
           .WithValueMap({{"false", false}, {"true", true}})
-          .IntoKey(M::UseJIT)
-      .Define("-Xjitcodecachesize:_")
+          .IntoKey(M::UseJitCompilation)
+      .Define("-Xjitinitialsize:_")
           .WithType<MemoryKiB>()
-          .IntoKey(M::JITCodeCacheCapacity)
+          .IntoKey(M::JITCodeCacheInitialCapacity)
+      .Define("-Xjitmaxsize:_")
+          .WithType<MemoryKiB>()
+          .IntoKey(M::JITCodeCacheMaxCapacity)
       .Define("-Xjitthreshold:_")
           .WithType<unsigned int>()
           .IntoKey(M::JITCompileThreshold)
+      .Define("-Xjitwarmupthreshold:_")
+          .WithType<unsigned int>()
+          .IntoKey(M::JITWarmupThreshold)
+      .Define("-Xjitosrthreshold:_")
+          .WithType<unsigned int>()
+          .IntoKey(M::JITOsrThreshold)
+      .Define("-Xjitprithreadweight:_")
+          .WithType<unsigned int>()
+          .IntoKey(M::JITPriorityThreadWeight)
+      .Define("-Xjittransitionweight:_")
+          .WithType<unsigned int>()
+          .IntoKey(M::JITInvokeTransitionWeight)
+      .Define("-Xjitpthreadpriority:_")
+          .WithType<int>()
+          .IntoKey(M::JITPoolThreadPthreadPriority)
+      .Define("-Xjitsaveprofilinginfo")
+          .WithType<ProfileSaverOptions>()
+          .AppendValues()
+          .IntoKey(M::ProfileSaverOpts)
+      .Define("-Xps-_")  // profile saver options -Xps-<key>:<value>
+          .WithType<ProfileSaverOptions>()
+          .AppendValues()
+          .IntoKey(M::ProfileSaverOpts)  // NOTE: Appends into same key as -Xjitsaveprofilinginfo
       .Define("-XX:HspaceCompactForOOMMinIntervalMs=_")  // in ms
           .WithType<MillisecondsToNanoseconds>()  // store as ns
           .IntoKey(M::HSpaceCompactForOOMMinIntervalsMs)
@@ -205,9 +252,9 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
       .Define("-Xlockprofthreshold:_")
           .WithType<unsigned int>()
           .IntoKey(M::LockProfThreshold)
-      .Define("-Xstacktracefile:_")
-          .WithType<std::string>()
-          .IntoKey(M::StackTraceFile)
+      .Define("-Xstackdumplockprofthreshold:_")
+          .WithType<unsigned int>()
+          .IntoKey(M::StackDumpLockProfThreshold)
       .Define("-Xmethod-trace")
           .IntoKey(M::MethodTrace)
       .Define("-Xmethod-trace-file:_")
@@ -224,14 +271,6 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
                          {"wallclock",      TraceClockSource::kWall},
                          {"dualclock",      TraceClockSource::kDual}})
           .IntoKey(M::ProfileClock)
-      .Define("-Xenable-profiler")
-          .WithType<TestProfilerOptions>()
-          .AppendValues()
-          .IntoKey(M::ProfilerOpts)  // NOTE: Appends into same key as -Xprofile-*
-      .Define("-Xprofile-_")  // -Xprofile-<key>:<value>
-          .WithType<TestProfilerOptions>()
-          .AppendValues()
-          .IntoKey(M::ProfilerOpts)  // NOTE: Appends into same key as -Xenable-profiler
       .Define("-Xcompiler:_")
           .WithType<std::string>()
           .IntoKey(M::Compiler)
@@ -244,10 +283,11 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
           .AppendValues()
           .IntoKey(M::ImageCompilerOptions)
       .Define("-Xverify:_")
-          .WithType<bool>()
-          .WithValueMap({{"none", false},
-                         {"remote", true},
-                         {"all", true}})
+          .WithType<verifier::VerifyMode>()
+          .WithValueMap({{"none",     verifier::VerifyMode::kNone},
+                         {"remote",   verifier::VerifyMode::kEnable},
+                         {"all",      verifier::VerifyMode::kEnable},
+                         {"softfail", verifier::VerifyMode::kSoftFail}})
           .IntoKey(M::Verify)
       .Define("-XX:NativeBridge=_")
           .WithType<std::string>()
@@ -257,12 +297,42 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
           .IntoKey(M::ZygoteMaxFailedBoots)
       .Define("-Xno-dex-file-fallback")
           .IntoKey(M::NoDexFileFallback)
+      .Define("-Xno-sig-chain")
+          .IntoKey(M::NoSigChain)
       .Define("--cpu-abilist=_")
           .WithType<std::string>()
           .IntoKey(M::CpuAbiList)
       .Define("-Xfingerprint:_")
           .WithType<std::string>()
           .IntoKey(M::Fingerprint)
+      .Define("-Xexperimental:_")
+          .WithType<ExperimentalFlags>()
+          .AppendValues()
+          .IntoKey(M::Experimental)
+      .Define("-Xforce-nb-testing")
+          .IntoKey(M::ForceNativeBridge)
+      .Define("-Xplugin:_")
+          .WithType<std::vector<Plugin>>().AppendValues()
+          .IntoKey(M::Plugins)
+      .Define("-XX:ThreadSuspendTimeout=_")  // in ms
+          .WithType<MillisecondsToNanoseconds>()  // store as ns
+          .IntoKey(M::ThreadSuspendTimeout)
+      .Define("-XX:GlobalRefAllocStackTraceLimit=_")  // Number of free slots to enable tracing.
+          .WithType<unsigned int>()
+          .IntoKey(M::GlobalRefAllocStackTraceLimit)
+      .Define("-XX:SlowDebug=_")
+          .WithType<bool>()
+          .WithValueMap({{"false", false}, {"true", true}})
+          .IntoKey(M::SlowDebug)
+      .Define("-Xtarget-sdk-version:_")
+          .WithType<int>()
+          .IntoKey(M::TargetSdkVersion)
+      .Define("-Xhidden-api-checks")
+          .IntoKey(M::HiddenApiChecks)
+      .Define("-Xuse-stderr-logger")
+          .IntoKey(M::UseStderrLogger)
+      .Define("-Xonly-use-system-oat-files")
+          .IntoKey(M::OnlyUseSystemOatFiles)
       .Ignore({
           "-ea", "-da", "-enableassertions", "-disableassertions", "--runtime-arg", "-esa",
           "-dsa", "-enablesystemassertions", "-disablesystemassertions", "-Xrs", "-Xint:_",
@@ -295,8 +365,8 @@ bool ParsedOptions::ProcessSpecialOptions(const RuntimeOptions& options,
     const std::string option(options[i].first);
       // TODO: support -Djava.class.path
     if (option == "bootclasspath") {
-      auto boot_class_path
-          = reinterpret_cast<const std::vector<const DexFile*>*>(options[i].second);
+      auto boot_class_path = static_cast<std::vector<std::unique_ptr<const DexFile>>*>(
+          const_cast<void*>(options[i].second));
 
       if (runtime_options != nullptr) {
         runtime_options->Set(M::BootClassPathDexList, boot_class_path);
@@ -310,7 +380,7 @@ bool ParsedOptions::ProcessSpecialOptions(const RuntimeOptions& options,
     } else if (option == "imageinstructionset") {
       const char* isa_str = reinterpret_cast<const char*>(options[i].second);
       auto&& image_isa = GetInstructionSetFromString(isa_str);
-      if (image_isa == kNone) {
+      if (image_isa == InstructionSet::kNone) {
         Usage("%s is not a valid instruction set.", isa_str);
         return false;
       }
@@ -371,23 +441,31 @@ bool ParsedOptions::ProcessSpecialOptions(const RuntimeOptions& options,
   return true;
 }
 
-bool ParsedOptions::Parse(const RuntimeOptions& options, bool ignore_unrecognized,
-                          RuntimeArgumentMap* runtime_options) {
+// Intended for local changes only.
+static void MaybeOverrideVerbosity() {
   //  gLogVerbosity.class_linker = true;  // TODO: don't check this in!
+  //  gLogVerbosity.collector = true;  // TODO: don't check this in!
   //  gLogVerbosity.compiler = true;  // TODO: don't check this in!
+  //  gLogVerbosity.deopt = true;  // TODO: don't check this in!
   //  gLogVerbosity.gc = true;  // TODO: don't check this in!
   //  gLogVerbosity.heap = true;  // TODO: don't check this in!
   //  gLogVerbosity.jdwp = true;  // TODO: don't check this in!
   //  gLogVerbosity.jit = true;  // TODO: don't check this in!
   //  gLogVerbosity.jni = true;  // TODO: don't check this in!
   //  gLogVerbosity.monitor = true;  // TODO: don't check this in!
+  //  gLogVerbosity.oat = true;  // TODO: don't check this in!
   //  gLogVerbosity.profiler = true;  // TODO: don't check this in!
   //  gLogVerbosity.signals = true;  // TODO: don't check this in!
+  //  gLogVerbosity.simulator = true; // TODO: don't check this in!
   //  gLogVerbosity.startup = true;  // TODO: don't check this in!
   //  gLogVerbosity.third_party_jni = true;  // TODO: don't check this in!
   //  gLogVerbosity.threads = true;  // TODO: don't check this in!
   //  gLogVerbosity.verifier = true;  // TODO: don't check this in!
+}
 
+bool ParsedOptions::DoParse(const RuntimeOptions& options,
+                            bool ignore_unrecognized,
+                            RuntimeArgumentMap* runtime_options) {
   for (size_t i = 0; i < options.size(); ++i) {
     if (true && options[0].first == "-Xzygote") {
       LOG(INFO) << "option[" << i << "]=" << options[i].first;
@@ -428,10 +506,18 @@ bool ParsedOptions::Parse(const RuntimeOptions& options, bool ignore_unrecognize
     Usage(nullptr);
     return false;
   } else if (args.Exists(M::ShowVersion)) {
-    UsageMessage(stdout, "ART version %s\n", Runtime::GetVersion());
+    UsageMessage(stdout,
+                 "ART version %s %s\n",
+                 Runtime::GetVersion(),
+                 GetInstructionSetString(kRuntimeISA));
     Exit(0);
   } else if (args.Exists(M::BootClassPath)) {
     LOG(INFO) << "setting boot class path to " << *args.Get(M::BootClassPath);
+  }
+
+  if (args.GetOrDefault(M::UseJitCompilation) && args.GetOrDefault(M::Interpret)) {
+    Usage("-Xusejit:true and -Xint cannot be specified together");
+    Exit(0);
   }
 
   // Set a default boot class path if we didn't get an explicit one via command line.
@@ -448,13 +534,17 @@ bool ParsedOptions::Parse(const RuntimeOptions& options, bool ignore_unrecognize
   args.SetIfMissing(M::ParallelGCThreads, gc::Heap::kDefaultEnableParallelGC ?
       static_cast<unsigned int>(sysconf(_SC_NPROCESSORS_CONF) - 1u) : 0u);
 
-  // -Xverbose:
+  // -verbose:
   {
     LogVerbosity *log_verbosity = args.Get(M::Verbose);
     if (log_verbosity != nullptr) {
       gLogVerbosity = *log_verbosity;
     }
   }
+
+  MaybeOverrideVerbosity();
+
+  SetRuntimeDebugFlagsEnabled(args.Get(M::SlowDebug));
 
   // -Xprofile:
   Trace::SetDefaultClockSource(args.GetOrDefault(M::ProfileClock));
@@ -469,7 +559,7 @@ bool ParsedOptions::Parse(const RuntimeOptions& options, bool ignore_unrecognize
     // If not low memory mode, semispace otherwise.
 
     gc::CollectorType background_collector_type_;
-    gc::CollectorType collector_type_ = (XGcOption{}).collector_type_;  // NOLINT [whitespace/braces] [5]
+    gc::CollectorType collector_type_ = (XGcOption{}).collector_type_;
     bool low_memory_mode_ = args.Exists(M::LowMemoryMode);
 
     background_collector_type_ = args.GetOrDefault(M::BackgroundGc);
@@ -536,7 +626,9 @@ bool ParsedOptions::Parse(const RuntimeOptions& options, bool ignore_unrecognize
     args.Set(M::Image, image);
   }
 
-  if (args.GetOrDefault(M::HeapGrowthLimit) == 0u) {  // 0 means no growth limit
+  // 0 means no growth limit, and growth limit should be always <= heap size
+  if (args.GetOrDefault(M::HeapGrowthLimit) <= 0u ||
+      args.GetOrDefault(M::HeapGrowthLimit) > args.GetOrDefault(M::MemoryMaximumSize)) {
     args.Set(M::HeapGrowthLimit, args.GetOrDefault(M::MemoryMaximumSize));
   }
 
@@ -584,6 +676,11 @@ void ParsedOptions::Usage(const char* fmt, ...) {
   UsageMessage(stream, "  -showversion\n");
   UsageMessage(stream, "  -help\n");
   UsageMessage(stream, "  -agentlib:jdwp=options\n");
+  // TODO add back in once -agentlib actually does something.
+  // UsageMessage(stream, "  -agentlib:library=options (Experimental feature, "
+  //                      "requires -Xexperimental:agent, some features might not be supported)\n");
+  UsageMessage(stream, "  -agentpath:library_path=options (Experimental feature, "
+                       "requires -Xexperimental:agent, some features might not be supported)\n");
   UsageMessage(stream, "\n");
 
   UsageMessage(stream, "The following extended options are supported:\n");
@@ -599,7 +696,6 @@ void ParsedOptions::Usage(const char* fmt, ...) {
   UsageMessage(stream, "The following Dalvik options are supported:\n");
   UsageMessage(stream, "  -Xzygote\n");
   UsageMessage(stream, "  -Xjnitrace:substring (eg NativeClass or nativeMethod)\n");
-  UsageMessage(stream, "  -Xstacktracefile:<filename>\n");
   UsageMessage(stream, "  -Xgc:[no]preverify\n");
   UsageMessage(stream, "  -Xgc:[no]postverify\n");
   UsageMessage(stream, "  -XX:HeapGrowthLimit=N\n");
@@ -610,7 +706,6 @@ void ParsedOptions::Usage(const char* fmt, ...) {
   UsageMessage(stream, "  -XX:ForegroundHeapGrowthMultiplier=doublevalue\n");
   UsageMessage(stream, "  -XX:LowMemoryMode\n");
   UsageMessage(stream, "  -Xprofile:{threadcpuclock,wallclock,dualclock}\n");
-  UsageMessage(stream, "  -Xjitcodecachesize:N\n");
   UsageMessage(stream, "  -Xjitthreshold:integervalue\n");
   UsageMessage(stream, "\n");
 
@@ -628,6 +723,7 @@ void ParsedOptions::Usage(const char* fmt, ...) {
   UsageMessage(stream, "  -XX:MaxSpinsBeforeThinLockInflation=integervalue\n");
   UsageMessage(stream, "  -XX:LongPauseLogThreshold=integervalue\n");
   UsageMessage(stream, "  -XX:LongGCLogThreshold=integervalue\n");
+  UsageMessage(stream, "  -XX:ThreadSuspendTimeout=integervalue\n");
   UsageMessage(stream, "  -XX:DumpGCPerformanceOnShutdown\n");
   UsageMessage(stream, "  -XX:DumpJITInfoOnShutdown\n");
   UsageMessage(stream, "  -XX:IgnoreMaxFootprint\n");
@@ -635,30 +731,41 @@ void ParsedOptions::Usage(const char* fmt, ...) {
   UsageMessage(stream, "  -XX:BackgroundGC=none\n");
   UsageMessage(stream, "  -XX:LargeObjectSpace={disabled,map,freelist}\n");
   UsageMessage(stream, "  -XX:LargeObjectThreshold=N\n");
+  UsageMessage(stream, "  -XX:DumpNativeStackOnSigQuit=booleanvalue\n");
+  UsageMessage(stream, "  -XX:MadviseRandomAccess:booleanvalue\n");
+  UsageMessage(stream, "  -XX:SlowDebug={false,true}\n");
   UsageMessage(stream, "  -Xmethod-trace\n");
   UsageMessage(stream, "  -Xmethod-trace-file:filename");
   UsageMessage(stream, "  -Xmethod-trace-file-size:integervalue\n");
-  UsageMessage(stream, "  -Xenable-profiler\n");
-  UsageMessage(stream, "  -Xprofile-filename:filename\n");
-  UsageMessage(stream, "  -Xprofile-period:integervalue\n");
-  UsageMessage(stream, "  -Xprofile-duration:integervalue\n");
-  UsageMessage(stream, "  -Xprofile-interval:integervalue\n");
-  UsageMessage(stream, "  -Xprofile-backoff:doublevalue\n");
-  UsageMessage(stream, "  -Xprofile-start-immediately\n");
-  UsageMessage(stream, "  -Xprofile-top-k-threshold:doublevalue\n");
-  UsageMessage(stream, "  -Xprofile-top-k-change-threshold:doublevalue\n");
-  UsageMessage(stream, "  -Xprofile-type:{method,stack}\n");
-  UsageMessage(stream, "  -Xprofile-max-stack-depth:integervalue\n");
+  UsageMessage(stream, "  -Xps-min-save-period-ms:integervalue\n");
+  UsageMessage(stream, "  -Xps-save-resolved-classes-delay-ms:integervalue\n");
+  UsageMessage(stream, "  -Xps-hot-startup-method-samples:integervalue\n");
+  UsageMessage(stream, "  -Xps-min-methods-to-save:integervalue\n");
+  UsageMessage(stream, "  -Xps-min-classes-to-save:integervalue\n");
+  UsageMessage(stream, "  -Xps-min-notification-before-wake:integervalue\n");
+  UsageMessage(stream, "  -Xps-max-notification-before-wake:integervalue\n");
+  UsageMessage(stream, "  -Xps-profile-path:file-path\n");
   UsageMessage(stream, "  -Xcompiler:filename\n");
   UsageMessage(stream, "  -Xcompiler-option dex2oat-option\n");
   UsageMessage(stream, "  -Ximage-compiler-option dex2oat-option\n");
   UsageMessage(stream, "  -Xpatchoat:filename\n");
   UsageMessage(stream, "  -Xusejit:booleanvalue\n");
+  UsageMessage(stream, "  -Xjitinitialsize:N\n");
+  UsageMessage(stream, "  -Xjitmaxsize:N\n");
+  UsageMessage(stream, "  -Xjitwarmupthreshold:integervalue\n");
+  UsageMessage(stream, "  -Xjitosrthreshold:integervalue\n");
+  UsageMessage(stream, "  -Xjitprithreadweight:integervalue\n");
   UsageMessage(stream, "  -X[no]relocate\n");
   UsageMessage(stream, "  -X[no]dex2oat (Whether to invoke dex2oat on the application)\n");
   UsageMessage(stream, "  -X[no]image-dex2oat (Whether to create and use a boot image)\n");
   UsageMessage(stream, "  -Xno-dex-file-fallback "
                        "(Don't fall back to dex files without oat files)\n");
+  UsageMessage(stream, "  -Xplugin:<library.so> "
+                       "(Load a runtime plugin, requires -Xexperimental:runtime-plugins)\n");
+  UsageMessage(stream, "  -Xexperimental:runtime-plugins"
+                       "(Enable new and experimental agent support)\n");
+  UsageMessage(stream, "  -Xexperimental:agents"
+                       "(Enable new and experimental agent support)\n");
   UsageMessage(stream, "\n");
 
   UsageMessage(stream, "The following previously supported Dalvik options are ignored:\n");
@@ -668,7 +775,7 @@ void ParsedOptions::Usage(const char* fmt, ...) {
   UsageMessage(stream, "  -esa\n");
   UsageMessage(stream, "  -dsa\n");
   UsageMessage(stream, "   (-enablesystemassertions, -disablesystemassertions)\n");
-  UsageMessage(stream, "  -Xverify:{none,remote,all}\n");
+  UsageMessage(stream, "  -Xverify:{none,remote,all,softfail}\n");
   UsageMessage(stream, "  -Xrs\n");
   UsageMessage(stream, "  -Xint:portable, -Xint:fast, -Xint:jit\n");
   UsageMessage(stream, "  -Xdexopt:{none,verified,all,full}\n");
@@ -686,6 +793,7 @@ void ParsedOptions::Usage(const char* fmt, ...) {
   UsageMessage(stream, "  -Xjitblocking\n");
   UsageMessage(stream, "  -Xjitmethod:signature[,signature]* (eg Ljava/lang/String\\;replace)\n");
   UsageMessage(stream, "  -Xjitclass:classname[,classname]*\n");
+  UsageMessage(stream, "  -Xjitcodecachesize:N\n");
   UsageMessage(stream, "  -Xjitoffset:offset[,offset]\n");
   UsageMessage(stream, "  -Xjitconfig:filename\n");
   UsageMessage(stream, "  -Xjitcheckcg\n");

@@ -16,8 +16,9 @@
 
 #include "dlmalloc.h"
 
+#include <android-base/logging.h>
+
 #include "base/bit_utils.h"
-#include "base/logging.h"
 
 // ART specific morecore implementation defined in space.cc.
 static void* art_heap_morecore(void* m, intptr_t increment);
@@ -36,7 +37,11 @@ static void art_heap_usage_error(const char* function, void* p);
 #pragma GCC diagnostic ignored "-Wredundant-decls"
 #pragma GCC diagnostic ignored "-Wempty-body"
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
-#include "../../../bionic/libc/upstream-dlmalloc/malloc.c"
+#pragma GCC diagnostic ignored "-Wnull-pointer-arithmetic"
+#include "../../../external/dlmalloc/malloc.c"
+// Note: malloc.c uses a DEBUG define to drive debug code. This interferes with the DEBUG severity
+//       of libbase, so undefine it now.
+#undef DEBUG
 #pragma GCC diagnostic pop
 
 static void* art_heap_morecore(void* m, intptr_t increment) {
@@ -44,17 +49,18 @@ static void* art_heap_morecore(void* m, intptr_t increment) {
 }
 
 static void art_heap_corruption(const char* function) {
-  LOG(::art::FATAL) << "Corrupt heap detected in: " << function;
+  LOG(FATAL) << "Corrupt heap detected in: " << function;
 }
 
 static void art_heap_usage_error(const char* function, void* p) {
-  LOG(::art::FATAL) << "Incorrect use of function '" << function << "' argument " << p
+  LOG(FATAL) << "Incorrect use of function '" << function << "' argument " << p
       << " not expected";
 }
 
-#include "globals.h"
-#include "utils.h"
 #include <sys/mman.h>
+
+#include "base/globals.h"
+#include "base/utils.h"
 
 extern "C" void DlmallocMadviseCallback(void* start, void* end, size_t used_bytes, void* arg) {
   // Is this chunk in use?
@@ -69,7 +75,7 @@ extern "C" void DlmallocMadviseCallback(void* start, void* end, size_t used_byte
     int rc = madvise(start, length, MADV_DONTNEED);
     if (UNLIKELY(rc != 0)) {
       errno = rc;
-      PLOG(::art::FATAL) << "madvise failed during heap trimming";
+      PLOG(FATAL) << "madvise failed during heap trimming";
     }
     size_t* reclaimed = reinterpret_cast<size_t*>(arg);
     *reclaimed += length;
@@ -77,7 +83,8 @@ extern "C" void DlmallocMadviseCallback(void* start, void* end, size_t used_byte
 }
 
 extern "C" void DlmallocBytesAllocatedCallback(void* start ATTRIBUTE_UNUSED,
-                                               void* end ATTRIBUTE_UNUSED, size_t used_bytes,
+                                               void* end ATTRIBUTE_UNUSED,
+                                               size_t used_bytes,
                                                void* arg) {
   if (used_bytes == 0) {
     return;
@@ -86,10 +93,10 @@ extern "C" void DlmallocBytesAllocatedCallback(void* start ATTRIBUTE_UNUSED,
   *bytes_allocated += used_bytes + sizeof(size_t);
 }
 
-extern "C" void DlmallocObjectsAllocatedCallback(void* start, void* end, size_t used_bytes,
+extern "C" void DlmallocObjectsAllocatedCallback(void* start ATTRIBUTE_UNUSED,
+                                                 void* end ATTRIBUTE_UNUSED,
+                                                 size_t used_bytes,
                                                  void* arg) {
-  UNUSED(start);
-  UNUSED(end);
   if (used_bytes == 0) {
     return;
   }

@@ -30,6 +30,8 @@
 // If a default value is omitted here, T{} is used as the default value, which is
 // almost-always the value of the type as if it was memset to all 0.
 //
+// Please keep the columns aligned if possible when adding new rows.
+//
 
 // Parse-able keys from the command line.
 RUNTIME_OPTIONS_KEY (Unit,                Zygote)
@@ -41,7 +43,8 @@ RUNTIME_OPTIONS_KEY (std::string,         ClassPath)
 RUNTIME_OPTIONS_KEY (std::string,         Image)
 RUNTIME_OPTIONS_KEY (Unit,                CheckJni)
 RUNTIME_OPTIONS_KEY (Unit,                JniOptsForceCopy)
-RUNTIME_OPTIONS_KEY (JDWP::JdwpOptions,   JdwpOptions)
+RUNTIME_OPTIONS_KEY (std::string,         JdwpOptions, "")
+RUNTIME_OPTIONS_KEY (JdwpProvider,        JdwpProvider,                   JdwpProvider::kUnset)
 RUNTIME_OPTIONS_KEY (MemoryKiB,           MemoryMaximumSize,              gc::Heap::kDefaultMaximumSize)  // -Xmx
 RUNTIME_OPTIONS_KEY (MemoryKiB,           MemoryInitialSize,              gc::Heap::kDefaultInitialSize)  // -Xms
 RUNTIME_OPTIONS_KEY (MemoryKiB,           HeapGrowthLimit)                // Default is 0 for unlimited
@@ -58,15 +61,25 @@ RUNTIME_OPTIONS_KEY (MillisecondsToNanoseconds, \
                                           LongPauseLogThreshold,          gc::Heap::kDefaultLongPauseLogThreshold)
 RUNTIME_OPTIONS_KEY (MillisecondsToNanoseconds, \
                                           LongGCLogThreshold,             gc::Heap::kDefaultLongGCLogThreshold)
+RUNTIME_OPTIONS_KEY (MillisecondsToNanoseconds, \
+                                          ThreadSuspendTimeout,           ThreadList::kDefaultThreadSuspendTimeout)
 RUNTIME_OPTIONS_KEY (Unit,                DumpGCPerformanceOnShutdown)
 RUNTIME_OPTIONS_KEY (Unit,                DumpJITInfoOnShutdown)
 RUNTIME_OPTIONS_KEY (Unit,                IgnoreMaxFootprint)
 RUNTIME_OPTIONS_KEY (Unit,                LowMemoryMode)
-RUNTIME_OPTIONS_KEY (bool,                UseTLAB,                        kUseTlab)
+RUNTIME_OPTIONS_KEY (bool,                UseTLAB,                        (kUseTlab || kUseReadBarrier))
 RUNTIME_OPTIONS_KEY (bool,                EnableHSpaceCompactForOOM,      true)
-RUNTIME_OPTIONS_KEY (bool,                UseJIT,      false)
-RUNTIME_OPTIONS_KEY (unsigned int,        JITCompileThreshold, jit::Jit::kDefaultCompileThreshold)
-RUNTIME_OPTIONS_KEY (MemoryKiB,           JITCodeCacheCapacity, jit::JitCodeCache::kDefaultCapacity)
+RUNTIME_OPTIONS_KEY (bool,                UseJitCompilation,              false)
+RUNTIME_OPTIONS_KEY (bool,                DumpNativeStackOnSigQuit,       true)
+RUNTIME_OPTIONS_KEY (bool,                MadviseRandomAccess,            false)
+RUNTIME_OPTIONS_KEY (unsigned int,        JITCompileThreshold)
+RUNTIME_OPTIONS_KEY (unsigned int,        JITWarmupThreshold)
+RUNTIME_OPTIONS_KEY (unsigned int,        JITOsrThreshold)
+RUNTIME_OPTIONS_KEY (unsigned int,        JITPriorityThreadWeight)
+RUNTIME_OPTIONS_KEY (unsigned int,        JITInvokeTransitionWeight)
+RUNTIME_OPTIONS_KEY (int,                 JITPoolThreadPthreadPriority,   jit::kJitPoolThreadPthreadDefaultPriority)
+RUNTIME_OPTIONS_KEY (MemoryKiB,           JITCodeCacheInitialCapacity,    jit::JitCodeCache::kInitialCapacity)
+RUNTIME_OPTIONS_KEY (MemoryKiB,           JITCodeCacheMaxCapacity,        jit::JitCodeCache::kMaxCapacity)
 RUNTIME_OPTIONS_KEY (MillisecondsToNanoseconds, \
                                           HSpaceCompactForOOMMinIntervalsMs,\
                                                                           MsToNs(100 * 1000))  // 100s
@@ -77,10 +90,7 @@ RUNTIME_OPTIONS_KEY (std::string,         PatchOat)
 RUNTIME_OPTIONS_KEY (bool,                Relocate,                       kDefaultMustRelocate)
 RUNTIME_OPTIONS_KEY (bool,                Dex2Oat,                        true)
 RUNTIME_OPTIONS_KEY (bool,                ImageDex2Oat,                   true)
-                                                        // kPoisonHeapReferences currently works with
-                                                        // the interpreter only.
-                                                        // TODO: make it work with the compiler.
-RUNTIME_OPTIONS_KEY (bool,                Interpret,                      (kPoisonHeapReferences || kUseReadBarrier)) // -Xint
+RUNTIME_OPTIONS_KEY (bool,                Interpret,                      false) // -Xint
                                                         // Disable the compiler for CC (for now).
 RUNTIME_OPTIONS_KEY (XGcOption,           GcOption)  // -Xgc:
 RUNTIME_OPTIONS_KEY (gc::space::LargeObjectSpaceType, \
@@ -89,39 +99,58 @@ RUNTIME_OPTIONS_KEY (Memory<1>,           LargeObjectThreshold,           gc::He
 RUNTIME_OPTIONS_KEY (BackgroundGcOption,  BackgroundGc)
 
 RUNTIME_OPTIONS_KEY (Unit,                DisableExplicitGC)
+RUNTIME_OPTIONS_KEY (Unit,                NoSigChain)
+RUNTIME_OPTIONS_KEY (Unit,                ForceNativeBridge)
 RUNTIME_OPTIONS_KEY (LogVerbosity,        Verbose)
 RUNTIME_OPTIONS_KEY (unsigned int,        LockProfThreshold)
-RUNTIME_OPTIONS_KEY (std::string,         StackTraceFile)
+RUNTIME_OPTIONS_KEY (unsigned int,        StackDumpLockProfThreshold)
 RUNTIME_OPTIONS_KEY (Unit,                MethodTrace)
-RUNTIME_OPTIONS_KEY (std::string,         MethodTraceFile,                "/data/method-trace-file.bin")
+RUNTIME_OPTIONS_KEY (std::string,         MethodTraceFile,                "/data/misc/trace/method-trace-file.bin")
 RUNTIME_OPTIONS_KEY (unsigned int,        MethodTraceFileSize,            10 * MB)
 RUNTIME_OPTIONS_KEY (Unit,                MethodTraceStreaming)
 RUNTIME_OPTIONS_KEY (TraceClockSource,    ProfileClock,                   kDefaultTraceClockSource)  // -Xprofile:
-RUNTIME_OPTIONS_KEY (TestProfilerOptions, ProfilerOpts)  // -Xenable-profiler, -Xprofile-*
+RUNTIME_OPTIONS_KEY (ProfileSaverOptions, ProfileSaverOpts)  // -Xjitsaveprofilinginfo, -Xps-*
 RUNTIME_OPTIONS_KEY (std::string,         Compiler)
 RUNTIME_OPTIONS_KEY (std::vector<std::string>, \
                                           CompilerOptions)  // -Xcompiler-option ...
 RUNTIME_OPTIONS_KEY (std::vector<std::string>, \
                                           ImageCompilerOptions)  // -Ximage-compiler-option ...
-RUNTIME_OPTIONS_KEY (bool,                Verify,                         true)
+RUNTIME_OPTIONS_KEY (verifier::VerifyMode, \
+                                          Verify,                         verifier::VerifyMode::kEnable)
+RUNTIME_OPTIONS_KEY (int,                 TargetSdkVersion,               Runtime::kUnsetSdkVersion)
+RUNTIME_OPTIONS_KEY (Unit,                HiddenApiChecks)
 RUNTIME_OPTIONS_KEY (std::string,         NativeBridge)
+RUNTIME_OPTIONS_KEY (unsigned int,        ZygoteMaxFailedBoots,           10)
+RUNTIME_OPTIONS_KEY (Unit,                NoDexFileFallback)
 RUNTIME_OPTIONS_KEY (std::string,         CpuAbiList)
+RUNTIME_OPTIONS_KEY (std::string,         Fingerprint)
+RUNTIME_OPTIONS_KEY (ExperimentalFlags,   Experimental,     ExperimentalFlags::kNone) // -Xexperimental:{...}
+RUNTIME_OPTIONS_KEY (std::list<ti::AgentSpec>,         AgentLib)  // -agentlib:<libname>=<options>
+RUNTIME_OPTIONS_KEY (std::list<ti::AgentSpec>,         AgentPath)  // -agentpath:<libname>=<options>
+RUNTIME_OPTIONS_KEY (std::vector<Plugin>,            Plugins)  // -Xplugin:<library>
 
 // Not parse-able from command line, but can be provided explicitly.
-RUNTIME_OPTIONS_KEY (const std::vector<const DexFile*>*, \
-                                          BootClassPathDexList)  // TODO: make unique_ptr
+// (Do not add anything here that is defined in ParsedOptions::MakeParser)
+RUNTIME_OPTIONS_KEY (std::vector<std::unique_ptr<const DexFile>>*, \
+                                          BootClassPathDexList)
 RUNTIME_OPTIONS_KEY (InstructionSet,      ImageInstructionSet,            kRuntimeISA)
 RUNTIME_OPTIONS_KEY (CompilerCallbacks*,  CompilerCallbacksPtr)  // TDOO: make unique_ptr
 RUNTIME_OPTIONS_KEY (bool (*)(),          HookIsSensitiveThread)
 RUNTIME_OPTIONS_KEY (int32_t (*)(FILE* stream, const char* format, va_list ap), \
                                           HookVfprintf,                   vfprintf)
+// Use _exit instead of exit so that we won't get DCHECK failures in global data
+// destructors. b/28106055.
 RUNTIME_OPTIONS_KEY (void (*)(int32_t status), \
-                                          HookExit,                       exit)
+                                          HookExit,                       _exit)
                                                                           // We don't call abort(3) by default; see
                                                                           // Runtime::Abort.
 RUNTIME_OPTIONS_KEY (void (*)(),          HookAbort,                      nullptr)
-RUNTIME_OPTIONS_KEY (unsigned int,        ZygoteMaxFailedBoots,           10)
-RUNTIME_OPTIONS_KEY (Unit,                NoDexFileFallback)
-RUNTIME_OPTIONS_KEY (std::string,         Fingerprint)
+
+RUNTIME_OPTIONS_KEY (bool,                SlowDebug,                      false)
+
+RUNTIME_OPTIONS_KEY (unsigned int,        GlobalRefAllocStackTraceLimit,  0)  // 0 = off
+RUNTIME_OPTIONS_KEY (Unit,                UseStderrLogger)
+
+RUNTIME_OPTIONS_KEY (Unit,                OnlyUseSystemOatFiles)
 
 #undef RUNTIME_OPTIONS_KEY

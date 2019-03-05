@@ -21,34 +21,36 @@
 
 namespace art {
 
+class Arm64InstructionSetFeatures;
+using Arm64FeaturesUniquePtr = std::unique_ptr<const Arm64InstructionSetFeatures>;
+
 // Instruction set features relevant to the ARM64 architecture.
 class Arm64InstructionSetFeatures FINAL : public InstructionSetFeatures {
  public:
   // Process a CPU variant string like "krait" or "cortex-a15" and create InstructionSetFeatures.
-  static const Arm64InstructionSetFeatures* FromVariant(const std::string& variant,
-                                                        std::string* error_msg);
+  static Arm64FeaturesUniquePtr FromVariant(const std::string& variant, std::string* error_msg);
 
   // Parse a bitmap and create an InstructionSetFeatures.
-  static const Arm64InstructionSetFeatures* FromBitmap(uint32_t bitmap);
+  static Arm64FeaturesUniquePtr FromBitmap(uint32_t bitmap);
 
   // Turn C pre-processor #defines into the equivalent instruction set features.
-  static const Arm64InstructionSetFeatures* FromCppDefines();
+  static Arm64FeaturesUniquePtr FromCppDefines();
 
   // Process /proc/cpuinfo and use kRuntimeISA to produce InstructionSetFeatures.
-  static const Arm64InstructionSetFeatures* FromCpuInfo();
+  static Arm64FeaturesUniquePtr FromCpuInfo();
 
   // Process the auxiliary vector AT_HWCAP entry and use kRuntimeISA to produce
   // InstructionSetFeatures.
-  static const Arm64InstructionSetFeatures* FromHwcap();
+  static Arm64FeaturesUniquePtr FromHwcap();
 
   // Use assembly tests of the current runtime (ie kRuntimeISA) to determine the
   // InstructionSetFeatures. This works around kernel bugs in AT_HWCAP and /proc/cpuinfo.
-  static const Arm64InstructionSetFeatures* FromAssembly();
+  static Arm64FeaturesUniquePtr FromAssembly();
 
   bool Equals(const InstructionSetFeatures* other) const OVERRIDE;
 
   InstructionSet GetInstructionSet() const OVERRIDE {
-    return kArm64;
+    return InstructionSet::kArm64;
   }
 
   uint32_t AsBitmap() const OVERRIDE;
@@ -66,35 +68,24 @@ class Arm64InstructionSetFeatures FINAL : public InstructionSetFeatures {
       return fix_cortex_a53_843419_;
   }
 
-  // NOTE: This flag can be tunned on a CPU basis. In general all ARMv8 CPUs
-  // should prefer the Acquire-Release semantics over the explicit DMBs when
-  // handling load/store-volatile. For a specific use case see the ARM64
-  // Optimizing backend.
-  bool PreferAcquireRelease() const {
-    return true;
-  }
-
   virtual ~Arm64InstructionSetFeatures() {}
 
  protected:
   // Parse a vector of the form "a53" adding these to a new ArmInstructionSetFeatures.
-  const InstructionSetFeatures*
-      AddFeaturesFromSplitString(const bool smp, const std::vector<std::string>& features,
+  std::unique_ptr<const InstructionSetFeatures>
+      AddFeaturesFromSplitString(const std::vector<std::string>& features,
                                  std::string* error_msg) const OVERRIDE;
 
  private:
-  explicit Arm64InstructionSetFeatures(bool smp,
-                                       bool needs_a53_835769_fix,
-                                       bool needs_a53_843419_fix)
-      : InstructionSetFeatures(smp),
+  Arm64InstructionSetFeatures(bool needs_a53_835769_fix, bool needs_a53_843419_fix)
+      : InstructionSetFeatures(),
         fix_cortex_a53_835769_(needs_a53_835769_fix),
         fix_cortex_a53_843419_(needs_a53_843419_fix) {
   }
 
   // Bitmap positions for encoding features as a bitmap.
   enum {
-    kSmpBitfield = 1,
-    kA53Bitfield = 2,
+    kA53Bitfield = 1 << 0,
   };
 
   const bool fix_cortex_a53_835769_;

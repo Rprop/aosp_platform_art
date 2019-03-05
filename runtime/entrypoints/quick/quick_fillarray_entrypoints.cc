@@ -16,8 +16,8 @@
 
 #include "art_method-inl.h"
 #include "callee_save_frame.h"
-#include "mirror/array.h"
 #include "entrypoints/entrypoint_utils.h"
+#include "mirror/array.h"
 
 namespace art {
 
@@ -26,9 +26,9 @@ namespace art {
  */
 extern "C" int artHandleFillArrayDataFromCode(uint32_t payload_offset, mirror::Array* array,
                                               ArtMethod* method, Thread* self)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   ScopedQuickEntrypointChecks sqec(self);
-  const uint16_t* const insns = method->GetCodeItem()->insns_;
+  const uint16_t* const insns = method->DexInstructions().Insns();
   const Instruction::ArrayDataPayload* payload =
       reinterpret_cast<const Instruction::ArrayDataPayload*>(insns + payload_offset);
   bool success = FillArrayData(array, payload);

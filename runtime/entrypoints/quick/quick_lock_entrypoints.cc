@@ -21,28 +21,37 @@
 namespace art {
 
 extern "C" int artLockObjectFromCode(mirror::Object* obj, Thread* self)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
-    NO_THREAD_SAFETY_ANALYSIS /* EXCLUSIVE_LOCK_FUNCTION(Monitor::monitor_lock_) */ {
+    NO_THREAD_SAFETY_ANALYSIS
+    REQUIRES(!Roles::uninterruptible_)
+    REQUIRES_SHARED(Locks::mutator_lock_) /* EXCLUSIVE_LOCK_FUNCTION(Monitor::monitor_lock_) */ {
   ScopedQuickEntrypointChecks sqec(self);
   if (UNLIKELY(obj == nullptr)) {
     ThrowNullPointerException("Null reference used for synchronization (monitor-enter)");
     return -1;  // Failure.
   } else {
-    if (kIsDebugBuild) {
-      obj = obj->MonitorEnter(self);  // May block
-      CHECK(self->HoldsLock(obj));
-      CHECK(!self->IsExceptionPending());
+    obj = obj->MonitorEnter(self);  // May block
+    DCHECK(self->HoldsLock(obj));
+    // Exceptions can be thrown by monitor event listeners. This is expected to be rare however.
+    if (UNLIKELY(self->IsExceptionPending())) {
+      // TODO Remove this DCHECK if we expand the use of monitor callbacks.
+      DCHECK(Runtime::Current()->HasLoadedPlugins())
+          << "Exceptions are only expected to be thrown by plugin code which doesn't seem to be "
+          << "loaded.";
+      // We need to get rid of the lock
+      bool unlocked = obj->MonitorExit(self);
+      DCHECK(unlocked);
+      return -1;  // Failure.
     } else {
-      obj->MonitorEnter(self);  // May block
+      DCHECK(self->HoldsLock(obj));
+      return 0;  // Success.
     }
-    return 0;  // Success.
-    // Only possible exception is NPE and is handled before entry
   }
 }
 
 extern "C" int artUnlockObjectFromCode(mirror::Object* obj, Thread* self)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
-    NO_THREAD_SAFETY_ANALYSIS /* UNLOCK_FUNCTION(Monitor::monitor_lock_) */ {
+    NO_THREAD_SAFETY_ANALYSIS
+    REQUIRES(!Roles::uninterruptible_)
+    REQUIRES_SHARED(Locks::mutator_lock_) /* UNLOCK_FUNCTION(Monitor::monitor_lock_) */ {
   ScopedQuickEntrypointChecks sqec(self);
   if (UNLIKELY(obj == nullptr)) {
     ThrowNullPointerException("Null reference used for synchronization (monitor-exit)");

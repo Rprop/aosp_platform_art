@@ -15,12 +15,18 @@
  */
 
 #include "cmdline_parser.h"
-#include "runtime/runtime_options.h"
-#include "runtime/parsed_options.h"
 
-#include "utils.h"
 #include <numeric>
+
 #include "gtest/gtest.h"
+
+#include "base/mutex.h"
+#include "base/utils.h"
+#include "jdwp_provider.h"
+#include "experimental_flags.h"
+#include "parsed_options.h"
+#include "runtime.h"
+#include "runtime_options.h"
 
 #define EXPECT_NULL(expected) EXPECT_EQ(reinterpret_cast<const void*>(expected), \
                                         reinterpret_cast<void*>(nullptr));
@@ -29,18 +35,15 @@ namespace art {
   bool UsuallyEquals(double expected, double actual);
 
   // This has a gtest dependency, which is why it's in the gtest only.
-  bool operator==(const TestProfilerOptions& lhs, const TestProfilerOptions& rhs) {
+  bool operator==(const ProfileSaverOptions& lhs, const ProfileSaverOptions& rhs) {
     return lhs.enabled_ == rhs.enabled_ &&
-        lhs.output_file_name_ == rhs.output_file_name_ &&
-        lhs.period_s_ == rhs.period_s_ &&
-        lhs.duration_s_ == rhs.duration_s_ &&
-        lhs.interval_us_ == rhs.interval_us_ &&
-        UsuallyEquals(lhs.backoff_coefficient_, rhs.backoff_coefficient_) &&
-        UsuallyEquals(lhs.start_immediately_, rhs.start_immediately_) &&
-        UsuallyEquals(lhs.top_k_threshold_, rhs.top_k_threshold_) &&
-        UsuallyEquals(lhs.top_k_change_threshold_, rhs.top_k_change_threshold_) &&
-        lhs.profile_type_ == rhs.profile_type_ &&
-        lhs.max_stack_depth_ == rhs.max_stack_depth_;
+        lhs.min_save_period_ms_ == rhs.min_save_period_ms_ &&
+        lhs.save_resolved_classes_delay_ms_ == rhs.save_resolved_classes_delay_ms_ &&
+        lhs.hot_startup_method_samples_ == rhs.hot_startup_method_samples_ &&
+        lhs.min_methods_to_save_ == rhs.min_methods_to_save_ &&
+        lhs.min_classes_to_save_ == rhs.min_classes_to_save_ &&
+        lhs.min_notification_before_wake_ == rhs.min_notification_before_wake_ &&
+        lhs.max_notification_before_wake_ == rhs.max_notification_before_wake_;
   }
 
   bool UsuallyEquals(double expected, double actual) {
@@ -80,7 +83,7 @@ namespace art {
     return memcmp(std::addressof(expected), std::addressof(actual), sizeof(expected)) == 0;
   }
 
-  bool UsuallyEquals(const char* expected, std::string actual) {
+  bool UsuallyEquals(const char* expected, const std::string& actual) {
     return std::string(expected) == actual;
   }
 
@@ -101,6 +104,19 @@ namespace art {
     return ::testing::AssertionFailure() << "key was not in the map";
   }
 
+  template <typename TMap, typename TKey, typename T>
+  ::testing::AssertionResult IsExpectedDefaultKeyValue(const T& expected,
+                                                       const TMap& map,
+                                                       const TKey& key) {
+    const T& actual = map.GetOrDefault(key);
+    if (!UsuallyEquals(expected, actual)) {
+      return ::testing::AssertionFailure()
+          << "expected " << detail::ToStringAny(expected) << " but got "
+          << detail::ToStringAny(actual);
+     }
+    return ::testing::AssertionSuccess();
+  }
+
 class CmdlineParserTest : public ::testing::Test {
  public:
   CmdlineParserTest() = default;
@@ -111,14 +127,15 @@ class CmdlineParserTest : public ::testing::Test {
   using RuntimeParser = ParsedOptions::RuntimeParser;
 
   static void SetUpTestCase() {
-    art::InitLogging(nullptr);  // argv = null
+    art::Locks::Init();
+    art::InitLogging(nullptr, art::Runtime::Abort);  // argv = null
   }
 
   virtual void SetUp() {
     parser_ = ParsedOptions::MakeParser(false);  // do not ignore unrecognized options
   }
 
-  static ::testing::AssertionResult IsResultSuccessful(CmdlineResult result) {
+  static ::testing::AssertionResult IsResultSuccessful(const CmdlineResult& result) {
     if (result.IsSuccess()) {
       return ::testing::AssertionSuccess();
     } else {
@@ -127,7 +144,7 @@ class CmdlineParserTest : public ::testing::Test {
     }
   }
 
-  static ::testing::AssertionResult IsResultFailure(CmdlineResult result,
+  static ::testing::AssertionResult IsResultFailure(const CmdlineResult& result,
                                                     CmdlineResult::Status failure_status) {
     if (result.IsSuccess()) {
       return ::testing::AssertionFailure() << " got success but expected failure: "
@@ -145,12 +162,22 @@ class CmdlineParserTest : public ::testing::Test {
 
 #define EXPECT_KEY_EXISTS(map, key) EXPECT_TRUE((map).Exists(key))
 #define EXPECT_KEY_VALUE(map, key, expected) EXPECT_TRUE(IsExpectedKeyValue(expected, map, key))
+#define EXPECT_DEFAULT_KEY_VALUE(map, key, expected) EXPECT_TRUE(IsExpectedDefaultKeyValue(expected, map, key))
 
-#define EXPECT_SINGLE_PARSE_EMPTY_SUCCESS(argv)               \
+#define _EXPECT_SINGLE_PARSE_EMPTY_SUCCESS(argv)              \
   do {                                                        \
     EXPECT_TRUE(IsResultSuccessful(parser_->Parse(argv)));    \
     EXPECT_EQ(0u, parser_->GetArgumentsMap().Size());         \
+
+#define EXPECT_SINGLE_PARSE_EMPTY_SUCCESS(argv)               \
+  _EXPECT_SINGLE_PARSE_EMPTY_SUCCESS(argv);                   \
   } while (false)
+
+#define EXPECT_SINGLE_PARSE_DEFAULT_VALUE(expected, argv, key)\
+  _EXPECT_SINGLE_PARSE_EMPTY_SUCCESS(argv);                   \
+    RuntimeArgumentMap args = parser_->ReleaseArgumentsMap(); \
+    EXPECT_DEFAULT_KEY_VALUE(args, key, expected);            \
+  } while (false)                                             // NOLINT [readability/namespace] [5]
 
 #define _EXPECT_SINGLE_PARSE_EXISTS(argv, key)                \
   do {                                                        \
@@ -166,7 +193,7 @@ class CmdlineParserTest : public ::testing::Test {
 #define EXPECT_SINGLE_PARSE_VALUE(expected, argv, key)        \
     _EXPECT_SINGLE_PARSE_EXISTS(argv, key);                   \
     EXPECT_KEY_VALUE(args, key, expected);                    \
-  } while (false)                                             // NOLINT [readability/namespace] [5]
+  } while (false)
 
 #define EXPECT_SINGLE_PARSE_VALUE_STR(expected, argv, key)    \
   EXPECT_SINGLE_PARSE_VALUE(std::string(expected), argv, key)
@@ -193,9 +220,6 @@ TEST_F(CmdlineParserTest, TestSimpleSuccesses) {
   EXPECT_SINGLE_PARSE_EXISTS("-Xzygote", M::Zygote);
   EXPECT_SINGLE_PARSE_VALUE_STR("/hello/world", "-Xbootclasspath:/hello/world", M::BootClassPath);
   EXPECT_SINGLE_PARSE_VALUE("/hello/world", "-Xbootclasspath:/hello/world", M::BootClassPath);
-  EXPECT_SINGLE_PARSE_VALUE(false, "-Xverify:none", M::Verify);
-  EXPECT_SINGLE_PARSE_VALUE(true, "-Xverify:remote", M::Verify);
-  EXPECT_SINGLE_PARSE_VALUE(true, "-Xverify:all", M::Verify);
   EXPECT_SINGLE_PARSE_VALUE(Memory<1>(234), "-Xss234", M::StackSize);
   EXPECT_SINGLE_PARSE_VALUE(MemoryKiB(1234*MB), "-Xms1234m", M::MemoryInitialSize);
   EXPECT_SINGLE_PARSE_VALUE(true, "-XX:EnableHSpaceCompactForOOM", M::EnableHSpaceCompactForOOM);
@@ -222,8 +246,8 @@ TEST_F(CmdlineParserTest, TestSimpleFailures) {
 TEST_F(CmdlineParserTest, TestLogVerbosity) {
   {
     const char* log_args = "-verbose:"
-        "class,compiler,gc,heap,jdwp,jni,monitor,profiler,signals,startup,third-party-jni,"
-        "threads,verifier";
+        "class,compiler,gc,heap,jdwp,jni,monitor,profiler,signals,simulator,startup,"
+        "third-party-jni,threads,verifier,verifier-debug";
 
     LogVerbosity log_verbosity = LogVerbosity();
     log_verbosity.class_linker = true;
@@ -235,10 +259,12 @@ TEST_F(CmdlineParserTest, TestLogVerbosity) {
     log_verbosity.monitor = true;
     log_verbosity.profiler = true;
     log_verbosity.signals = true;
+    log_verbosity.simulator = true;
     log_verbosity.startup = true;
     log_verbosity.third_party_jni = true;
     log_verbosity.threads = true;
     log_verbosity.verifier = true;
+    log_verbosity.verifier_debug = true;
 
     EXPECT_SINGLE_PARSE_VALUE(log_verbosity, log_args, M::Verbose);
   }
@@ -262,9 +288,30 @@ TEST_F(CmdlineParserTest, TestLogVerbosity) {
   EXPECT_SINGLE_PARSE_FAIL("-verbose:blablabla", CmdlineResult::kUsage);  // invalid verbose opt
 
   {
+    const char* log_args = "-verbose:deopt";
+    LogVerbosity log_verbosity = LogVerbosity();
+    log_verbosity.deopt = true;
+    EXPECT_SINGLE_PARSE_VALUE(log_verbosity, log_args, M::Verbose);
+  }
+
+  {
+    const char* log_args = "-verbose:collector";
+    LogVerbosity log_verbosity = LogVerbosity();
+    log_verbosity.collector = true;
+    EXPECT_SINGLE_PARSE_VALUE(log_verbosity, log_args, M::Verbose);
+  }
+
+  {
     const char* log_args = "-verbose:oat";
     LogVerbosity log_verbosity = LogVerbosity();
     log_verbosity.oat = true;
+    EXPECT_SINGLE_PARSE_VALUE(log_verbosity, log_args, M::Verbose);
+  }
+
+  {
+    const char* log_args = "-verbose:dex";
+    LogVerbosity log_verbosity = LogVerbosity();
+    log_verbosity.dex = true;
     EXPECT_SINGLE_PARSE_VALUE(log_verbosity, log_args, M::Verbose);
   }
 }  // TEST_F
@@ -275,7 +322,7 @@ TEST_F(CmdlineParserTest, DISABLED_TestXGcOption) {
    * Test success
    */
   {
-    XGcOption option_all_true{};  // NOLINT [readability/braces] [4]
+    XGcOption option_all_true{};
     option_all_true.collector_type_ = gc::CollectorType::kCollectorTypeCMS;
     option_all_true.verify_pre_gc_heap_ = true;
     option_all_true.verify_pre_sweeping_heap_ = true;
@@ -292,7 +339,7 @@ TEST_F(CmdlineParserTest, DISABLED_TestXGcOption) {
 
     EXPECT_SINGLE_PARSE_VALUE(option_all_true, xgc_args_all_true, M::GcOption);
 
-    XGcOption option_all_false{};  // NOLINT [readability/braces] [4]
+    XGcOption option_all_false{};
     option_all_false.collector_type_ = gc::CollectorType::kCollectorTypeMS;
     option_all_false.verify_pre_gc_heap_ = false;
     option_all_false.verify_pre_sweeping_heap_ = false;
@@ -307,7 +354,7 @@ TEST_F(CmdlineParserTest, DISABLED_TestXGcOption) {
 
     EXPECT_SINGLE_PARSE_VALUE(option_all_false, xgc_args_all_false, M::GcOption);
 
-    XGcOption option_all_default{};  // NOLINT [readability/braces] [4]
+    XGcOption option_all_default{};
 
     const char* xgc_args_blank = "-Xgc:";
     EXPECT_SINGLE_PARSE_VALUE(option_all_default, xgc_args_blank, M::GcOption);
@@ -320,48 +367,40 @@ TEST_F(CmdlineParserTest, DISABLED_TestXGcOption) {
 }  // TEST_F
 
 /*
- * {"-Xrunjdwp:_", "-agentlib:jdwp=_"}
+ * { "-XjdwpProvider:_" }
  */
-TEST_F(CmdlineParserTest, TestJdwpOptions) {
-  /*
-   * Test success
-   */
+TEST_F(CmdlineParserTest, TestJdwpProviderEmpty) {
   {
-    /*
-     * "Example: -Xrunjdwp:transport=dt_socket,address=8000,server=y\n"
-     */
-    JDWP::JdwpOptions opt = JDWP::JdwpOptions();
-    opt.transport = JDWP::JdwpTransportType::kJdwpTransportSocket;
-    opt.port = 8000;
-    opt.server = true;
-
-    const char *opt_args = "-Xrunjdwp:transport=dt_socket,address=8000,server=y";
-
-    EXPECT_SINGLE_PARSE_VALUE(opt, opt_args, M::JdwpOptions);
+    EXPECT_SINGLE_PARSE_DEFAULT_VALUE(JdwpProvider::kUnset, "", M::JdwpProvider);
   }
+}  // TEST_F
 
-  {
-    /*
-     * "Example: -agentlib:jdwp=transport=dt_socket,address=localhost:6500,server=n\n");
-     */
-    JDWP::JdwpOptions opt = JDWP::JdwpOptions();
-    opt.transport = JDWP::JdwpTransportType::kJdwpTransportSocket;
-    opt.host = "localhost";
-    opt.port = 6500;
-    opt.server = false;
+TEST_F(CmdlineParserTest, TestJdwpProviderDefault) {
+  const char* opt_args = "-XjdwpProvider:default";
+  EXPECT_SINGLE_PARSE_VALUE(JdwpProvider::kDefaultJdwpProvider, opt_args, M::JdwpProvider);
+}  // TEST_F
 
-    const char *opt_args = "-agentlib:jdwp=transport=dt_socket,address=localhost:6500,server=n";
+TEST_F(CmdlineParserTest, TestJdwpProviderInternal) {
+  const char* opt_args = "-XjdwpProvider:internal";
+  EXPECT_SINGLE_PARSE_VALUE(JdwpProvider::kInternal, opt_args, M::JdwpProvider);
+}  // TEST_F
 
-    EXPECT_SINGLE_PARSE_VALUE(opt, opt_args, M::JdwpOptions);
-  }
+TEST_F(CmdlineParserTest, TestJdwpProviderNone) {
+  const char* opt_args = "-XjdwpProvider:none";
+  EXPECT_SINGLE_PARSE_VALUE(JdwpProvider::kNone, opt_args, M::JdwpProvider);
+}  // TEST_F
 
-  /*
-   * Test failures
-   */
-  EXPECT_SINGLE_PARSE_FAIL("-Xrunjdwp:help", CmdlineResult::kUsage);  // usage for help only
-  EXPECT_SINGLE_PARSE_FAIL("-Xrunjdwp:blabla", CmdlineResult::kFailure);  // invalid subarg
-  EXPECT_SINGLE_PARSE_FAIL("-agentlib:jdwp=help", CmdlineResult::kUsage);  // usage for help only
-  EXPECT_SINGLE_PARSE_FAIL("-agentlib:jdwp=blabla", CmdlineResult::kFailure);  // invalid subarg
+TEST_F(CmdlineParserTest, TestJdwpProviderAdbconnection) {
+  const char* opt_args = "-XjdwpProvider:adbconnection";
+  EXPECT_SINGLE_PARSE_VALUE(JdwpProvider::kAdbConnection, opt_args, M::JdwpProvider);
+}  // TEST_F
+
+TEST_F(CmdlineParserTest, TestJdwpProviderHelp) {
+  EXPECT_SINGLE_PARSE_FAIL("-XjdwpProvider:help", CmdlineResult::kUsage);
+}  // TEST_F
+
+TEST_F(CmdlineParserTest, TestJdwpProviderFail) {
+  EXPECT_SINGLE_PARSE_FAIL("-XjdwpProvider:blablabla", CmdlineResult::kFailure);
 }  // TEST_F
 
 /*
@@ -425,12 +464,14 @@ TEST_F(CmdlineParserTest, TestJitOptions) {
   * Test successes
   */
   {
-    EXPECT_SINGLE_PARSE_VALUE(true, "-Xusejit:true", M::UseJIT);
-    EXPECT_SINGLE_PARSE_VALUE(false, "-Xusejit:false", M::UseJIT);
+    EXPECT_SINGLE_PARSE_VALUE(true, "-Xusejit:true", M::UseJitCompilation);
+    EXPECT_SINGLE_PARSE_VALUE(false, "-Xusejit:false", M::UseJitCompilation);
   }
   {
-    EXPECT_SINGLE_PARSE_VALUE(MemoryKiB(16 * KB), "-Xjitcodecachesize:16K", M::JITCodeCacheCapacity);
-    EXPECT_SINGLE_PARSE_VALUE(MemoryKiB(16 * MB), "-Xjitcodecachesize:16M", M::JITCodeCacheCapacity);
+    EXPECT_SINGLE_PARSE_VALUE(
+        MemoryKiB(16 * KB), "-Xjitinitialsize:16K", M::JITCodeCacheInitialCapacity);
+    EXPECT_SINGLE_PARSE_VALUE(
+        MemoryKiB(16 * MB), "-Xjitmaxsize:16M", M::JITCodeCacheMaxCapacity);
   }
   {
     EXPECT_SINGLE_PARSE_VALUE(12345u, "-Xjitthreshold:12345", M::JITCompileThreshold);
@@ -438,69 +479,45 @@ TEST_F(CmdlineParserTest, TestJitOptions) {
 }  // TEST_F
 
 /*
-* -X-profile-*
+* -Xps-*
 */
-TEST_F(CmdlineParserTest, TestProfilerOptions) {
- /*
-  * Test successes
-  */
+TEST_F(CmdlineParserTest, ProfileSaverOptions) {
+  ProfileSaverOptions opt = ProfileSaverOptions(true, 1, 2, 3, 4, 5, 6, 7, "abc", true);
 
-  {
-    TestProfilerOptions opt;
-    opt.enabled_ = true;
-
-    EXPECT_SINGLE_PARSE_VALUE(opt,
-                              "-Xenable-profiler",
-                              M::ProfilerOpts);
-  }
-
-  {
-    TestProfilerOptions opt;
-    // also need to test 'enabled'
-    opt.output_file_name_ = "hello_world.txt";
-
-    EXPECT_SINGLE_PARSE_VALUE(opt,
-                              "-Xprofile-filename:hello_world.txt ",
-                              M::ProfilerOpts);
-  }
-
-  {
-    TestProfilerOptions opt = TestProfilerOptions();
-    // also need to test 'enabled'
-    opt.output_file_name_ = "output.txt";
-    opt.period_s_ = 123u;
-    opt.duration_s_ = 456u;
-    opt.interval_us_ = 789u;
-    opt.backoff_coefficient_ = 2.0;
-    opt.start_immediately_ = true;
-    opt.top_k_threshold_ = 50.0;
-    opt.top_k_change_threshold_ = 60.0;
-    opt.profile_type_ = kProfilerMethod;
-    opt.max_stack_depth_ = 1337u;
-
-    EXPECT_SINGLE_PARSE_VALUE(opt,
-                              "-Xprofile-filename:output.txt "
-                              "-Xprofile-period:123 "
-                              "-Xprofile-duration:456 "
-                              "-Xprofile-interval:789 "
-                              "-Xprofile-backoff:2.0 "
-                              "-Xprofile-start-immediately "
-                              "-Xprofile-top-k-threshold:50.0 "
-                              "-Xprofile-top-k-change-threshold:60.0 "
-                              "-Xprofile-type:method "
-                              "-Xprofile-max-stack-depth:1337",
-                              M::ProfilerOpts);
-  }
-
-  {
-    TestProfilerOptions opt = TestProfilerOptions();
-    opt.profile_type_ = kProfilerBoundedStack;
-
-    EXPECT_SINGLE_PARSE_VALUE(opt,
-                              "-Xprofile-type:stack",
-                              M::ProfilerOpts);
-  }
+  EXPECT_SINGLE_PARSE_VALUE(opt,
+                            "-Xjitsaveprofilinginfo "
+                            "-Xps-min-save-period-ms:1 "
+                            "-Xps-save-resolved-classes-delay-ms:2 "
+                            "-Xps-hot-startup-method-samples:3 "
+                            "-Xps-min-methods-to-save:4 "
+                            "-Xps-min-classes-to-save:5 "
+                            "-Xps-min-notification-before-wake:6 "
+                            "-Xps-max-notification-before-wake:7 "
+                            "-Xps-profile-path:abc "
+                            "-Xps-profile-boot-class-path",
+                            M::ProfileSaverOpts);
 }  // TEST_F
+
+/* -Xexperimental:_ */
+TEST_F(CmdlineParserTest, TestExperimentalFlags) {
+  // Default
+  EXPECT_SINGLE_PARSE_DEFAULT_VALUE(ExperimentalFlags::kNone,
+                                    "",
+                                    M::Experimental);
+
+  // Disabled explicitly
+  EXPECT_SINGLE_PARSE_VALUE(ExperimentalFlags::kNone,
+                            "-Xexperimental:none",
+                            M::Experimental);
+}
+
+// -Xverify:_
+TEST_F(CmdlineParserTest, TestVerify) {
+  EXPECT_SINGLE_PARSE_VALUE(verifier::VerifyMode::kNone,     "-Xverify:none",     M::Verify);
+  EXPECT_SINGLE_PARSE_VALUE(verifier::VerifyMode::kEnable,   "-Xverify:remote",   M::Verify);
+  EXPECT_SINGLE_PARSE_VALUE(verifier::VerifyMode::kEnable,   "-Xverify:all",      M::Verify);
+  EXPECT_SINGLE_PARSE_VALUE(verifier::VerifyMode::kSoftFail, "-Xverify:softfail", M::Verify);
+}
 
 TEST_F(CmdlineParserTest, TestIgnoreUnrecognized) {
   RuntimeParser::Builder parserBuilder;
@@ -545,10 +562,10 @@ TEST_F(CmdlineParserTest, MultipleArguments) {
 
   auto&& map = parser_->ReleaseArgumentsMap();
   EXPECT_EQ(5u, map.Size());
-  EXPECT_KEY_VALUE(map, M::Help, Unit{});  // NOLINT [whitespace/braces] [5]
+  EXPECT_KEY_VALUE(map, M::Help, Unit{});
   EXPECT_KEY_VALUE(map, M::ForegroundHeapGrowthMultiplier, 0.5);
   EXPECT_KEY_VALUE(map, M::Dex2Oat, false);
-  EXPECT_KEY_VALUE(map, M::MethodTrace, Unit{});  // NOLINT [whitespace/braces] [5]
+  EXPECT_KEY_VALUE(map, M::MethodTrace, Unit{});
   EXPECT_KEY_VALUE(map, M::LargeObjectSpace, gc::space::LargeObjectSpaceType::kMap);
 }  //  TEST_F
 }  // namespace art

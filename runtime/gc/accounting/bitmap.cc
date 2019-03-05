@@ -16,9 +16,12 @@
 
 #include "bitmap-inl.h"
 
+#include <sys/mman.h>  // For the PROT_* and MAP_* constants.
+
 #include "base/bit_utils.h"
+#include "base/mem_map.h"
 #include "card_table.h"
-#include "mem_map.h"
+#include "jit/jit_code_cache.h"
 
 namespace art {
 namespace gc {
@@ -91,6 +94,7 @@ MemoryRangeBitmap<kAlignment>* MemoryRangeBitmap<kAlignment>::CreateFromMemMap(
 }
 
 template class MemoryRangeBitmap<CardTable::kCardSize>;
+template class MemoryRangeBitmap<jit::kJitCodeAlignment>;
 
 }  // namespace accounting
 }  // namespace gc

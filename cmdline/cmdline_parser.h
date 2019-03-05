@@ -19,20 +19,20 @@
 
 #define CMDLINE_NDEBUG 1  // Do not output any debugging information for parsing.
 
-#include "cmdline/detail/cmdline_parser_detail.h"
-#include "cmdline/detail/cmdline_parse_argument_detail.h"
-#include "cmdline/detail/cmdline_debug_detail.h"
+#include "detail/cmdline_debug_detail.h"
+#include "detail/cmdline_parse_argument_detail.h"
+#include "detail/cmdline_parser_detail.h"
 
-#include "cmdline_type_parser.h"
-#include "token_range.h"
-#include "cmdline_types.h"
-#include "cmdline_result.h"
 #include "cmdline_parse_result.h"
+#include "cmdline_result.h"
+#include "cmdline_type_parser.h"
+#include "cmdline_types.h"
+#include "token_range.h"
 
-#include "runtime/base/variant_map.h"
+#include "base/variant_map.h"
 
-#include <vector>
 #include <memory>
+#include <vector>
 
 namespace art {
 // Build a parser for command line arguments with a small domain specific language.
@@ -340,7 +340,7 @@ struct CmdlineParser {
     typename std::enable_if<std::is_same<TArg, Unit>::value>::type
     InitializeTypedBuilder(ArgumentBuilder<TArg>* arg_builder) {
       // Every Unit argument implicitly maps to a runtime value of Unit{}
-      std::vector<Unit> values(names_.size(), Unit{});  // NOLINT [whitespace/braces] [5]
+      std::vector<Unit> values(names_.size(), Unit{});
       arg_builder->SetValuesInternal(std::move(values));
     }
 
@@ -390,7 +390,7 @@ struct CmdlineParser {
         // Unlike regular argument definitions, when a value gets parsed into its
         // stronger type, we just throw it away.
 
-        if (ign.find("_") != std::string::npos) {  // Does the arg-def have a wildcard?
+        if (ign.find('_') != std::string::npos) {  // Does the arg-def have a wildcard?
           // pretend this is a string, e.g. -Xjitconfig:<anythinggoeshere>
           auto&& builder = Define(ignore_name).template WithType<std::string>().IntoIgnore();
           assert(&builder == this);
@@ -497,11 +497,10 @@ struct CmdlineParser {
   friend struct Builder;
 
   // Construct a new parser from the builder. Move all the arguments.
-  explicit CmdlineParser(bool ignore_unrecognized,
-                         std::vector<const char*>&& ignore_list,
-                         std::shared_ptr<SaveDestination> save_destination,
-                         std::vector<std::unique_ptr<detail::CmdlineParseArgumentAny>>&&
-                             completed_arguments)
+  CmdlineParser(bool ignore_unrecognized,
+                std::vector<const char*>&& ignore_list,
+                std::shared_ptr<SaveDestination> save_destination,
+                std::vector<std::unique_ptr<detail::CmdlineParseArgumentAny>>&& completed_arguments)
     : ignore_unrecognized_(ignore_unrecognized),
       ignore_list_(std::move(ignore_list)),
       save_destination_(save_destination),
@@ -613,7 +612,7 @@ struct CmdlineParser {
 template <typename TVariantMap,
           template <typename TKeyValue> class TVariantMapKey>
 template <typename TArg>
-CmdlineParser<TVariantMap, TVariantMapKey>::ArgumentBuilder<TArg>
+typename CmdlineParser<TVariantMap, TVariantMapKey>::template ArgumentBuilder<TArg>
 CmdlineParser<TVariantMap, TVariantMapKey>::CreateArgumentBuilder(
     CmdlineParser<TVariantMap, TVariantMapKey>::Builder& parent) {
   return CmdlineParser<TVariantMap, TVariantMapKey>::ArgumentBuilder<TArg>(

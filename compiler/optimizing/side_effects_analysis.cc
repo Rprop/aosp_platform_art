@@ -18,40 +18,40 @@
 
 namespace art {
 
-void SideEffectsAnalysis::Run() {
+bool SideEffectsAnalysis::Run() {
   // Inlining might have created more blocks, so we need to increase the size
   // if needed.
-  block_effects_.SetSize(graph_->GetBlocks().Size());
-  loop_effects_.SetSize(graph_->GetBlocks().Size());
+  block_effects_.resize(graph_->GetBlocks().size());
+  loop_effects_.resize(graph_->GetBlocks().size());
 
+  // In DEBUG mode, ensure side effects are properly initialized to empty.
   if (kIsDebugBuild) {
-    for (HReversePostOrderIterator it(*graph_); !it.Done(); it.Advance()) {
-      HBasicBlock* block = it.Current();
+    for (HBasicBlock* block : graph_->GetReversePostOrder()) {
       SideEffects effects = GetBlockEffects(block);
-      DCHECK(!effects.HasSideEffects() && !effects.HasDependencies());
+      DCHECK(effects.DoesNothing());
       if (block->IsLoopHeader()) {
         effects = GetLoopEffects(block);
-        DCHECK(!effects.HasSideEffects() && !effects.HasDependencies());
+        DCHECK(effects.DoesNothing());
       }
     }
   }
 
   // Do a post order visit to ensure we visit a loop header after its loop body.
-  for (HPostOrderIterator it(*graph_); !it.Done(); it.Advance()) {
-    HBasicBlock* block = it.Current();
-
+  for (HBasicBlock* block : graph_->GetPostOrder()) {
     SideEffects effects = SideEffects::None();
     // Update `effects` with the side effects of all instructions in this block.
     for (HInstructionIterator inst_it(block->GetInstructions()); !inst_it.Done();
          inst_it.Advance()) {
       HInstruction* instruction = inst_it.Current();
       effects = effects.Union(instruction->GetSideEffects());
-      if (effects.HasAllSideEffects()) {
+      // If all side effects are represented, scanning further will not add any
+      // more information to side-effects of this block.
+      if (effects.DoesAll()) {
         break;
       }
     }
 
-    block_effects_.Put(block->GetBlockId(), effects);
+    block_effects_[block->GetBlockId()] = effects;
 
     if (block->IsLoopHeader()) {
       // The side effects of the loop header are part of the loop.
@@ -69,20 +69,21 @@ void SideEffectsAnalysis::Run() {
     }
   }
   has_run_ = true;
+  return true;
 }
 
 SideEffects SideEffectsAnalysis::GetLoopEffects(HBasicBlock* block) const {
   DCHECK(block->IsLoopHeader());
-  return loop_effects_.Get(block->GetBlockId());
+  return loop_effects_[block->GetBlockId()];
 }
 
 SideEffects SideEffectsAnalysis::GetBlockEffects(HBasicBlock* block) const {
-  return block_effects_.Get(block->GetBlockId());
+  return block_effects_[block->GetBlockId()];
 }
 
 void SideEffectsAnalysis::UpdateLoopEffects(HLoopInformation* info, SideEffects effects) {
-  int id = info->GetHeader()->GetBlockId();
-  loop_effects_.Put(id, loop_effects_.Get(id).Union(effects));
+  uint32_t id = info->GetHeader()->GetBlockId();
+  loop_effects_[id] = loop_effects_[id].Union(effects);
 }
 
 }  // namespace art

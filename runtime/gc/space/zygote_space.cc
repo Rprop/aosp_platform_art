@@ -16,11 +16,13 @@
 
 #include "zygote_space.h"
 
+#include "base/mutex-inl.h"
+#include "base/utils.h"
 #include "gc/accounting/card_table-inl.h"
 #include "gc/accounting/space_bitmap-inl.h"
 #include "gc/heap.h"
-#include "thread-inl.h"
-#include "utils.h"
+#include "runtime.h"
+#include "thread-current-inl.h"
 
 namespace art {
 namespace gc {
@@ -31,8 +33,7 @@ class CountObjectsAllocated {
   explicit CountObjectsAllocated(size_t* objects_allocated)
       : objects_allocated_(objects_allocated) {}
 
-  void operator()(mirror::Object* obj) const {
-    UNUSED(obj);
+  void operator()(mirror::Object* obj ATTRIBUTE_UNUSED) const {
     ++*objects_allocated_;
   }
 
@@ -121,7 +122,7 @@ void ZygoteSpace::SweepCallback(size_t num_ptrs, mirror::Object** ptrs, void* ar
     // Need to mark the card since this will update the mod-union table next GC cycle.
     card_table->MarkCard(ptrs[i]);
   }
-  zygote_space->objects_allocated_.FetchAndSubSequentiallyConsistent(num_ptrs);
+  zygote_space->objects_allocated_.fetch_sub(num_ptrs, std::memory_order_seq_cst);
 }
 
 }  // namespace space

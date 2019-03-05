@@ -16,6 +16,9 @@
 
 #include "barrier.h"
 
+#include <android-base/logging.h>
+
+#include "base/aborting.h"
 #include "base/mutex.h"
 #include "base/time_utils.h"
 #include "thread.h"
@@ -27,6 +30,9 @@ Barrier::Barrier(int count)
       lock_("GC barrier lock", kThreadSuspendCountLock),
       condition_("GC barrier condition", lock_) {
 }
+
+template void Barrier::Increment<Barrier::kAllowHoldingLocks>(Thread* self, int delta);
+template void Barrier::Increment<Barrier::kDisallowHoldingLocks>(Thread* self, int delta);
 
 void Barrier::Pass(Thread* self) {
   MutexLock mu(self, lock_);
@@ -42,6 +48,7 @@ void Barrier::Init(Thread* self, int count) {
   SetCountLocked(self, count);
 }
 
+template <Barrier::LockHandling locks>
 void Barrier::Increment(Thread* self, int delta) {
   MutexLock mu(self, lock_);
   SetCountLocked(self, count_ + delta);
@@ -54,7 +61,11 @@ void Barrier::Increment(Thread* self, int delta) {
   // be decremented to zero and a Broadcast will be made on the
   // condition variable, thus waking this up.
   while (count_ != 0) {
-    condition_.Wait(self);
+    if (locks == kAllowHoldingLocks) {
+      condition_.WaitHoldingLocks(self);
+    } else {
+      condition_.Wait(self);
+    }
   }
 }
 
@@ -79,6 +90,11 @@ bool Barrier::Increment(Thread* self, int delta, uint32_t timeout_ms) {
   return timed_out;
 }
 
+int Barrier::GetCount(Thread* self) {
+  MutexLock mu(self, lock_);
+  return count_;
+}
+
 void Barrier::SetCountLocked(Thread* self, int count) {
   count_ = count;
   if (count == 0) {
@@ -87,7 +103,14 @@ void Barrier::SetCountLocked(Thread* self, int count) {
 }
 
 Barrier::~Barrier() {
-  CHECK_EQ(count_, 0) << "Attempted to destroy barrier with non zero count";
+  if (gAborting == 0) {
+    // Only check when not aborting.
+    CHECK_EQ(count_, 0) << "Attempted to destroy barrier with non zero count";
+  } else {
+    if (count_ != 0) {
+      LOG(WARNING) << "Attempted to destroy barrier with non zero count " << count_;
+    }
+  }
 }
 
 }  // namespace art

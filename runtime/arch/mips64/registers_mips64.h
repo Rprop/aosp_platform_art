@@ -19,9 +19,10 @@
 
 #include <iosfwd>
 
-#include "base/logging.h"
+#include <android-base/logging.h>
+
+#include "base/globals.h"
 #include "base/macros.h"
-#include "globals.h"
 
 namespace art {
 namespace mips64 {
@@ -59,6 +60,9 @@ enum GpuRegister {
   SP   = 29,  // Stack pointer.
   S8   = 30,  // Saved value/frame pointer.
   RA   = 31,  // Return address.
+  TR   = S1,  // ART Thread Register
+  TMP  = T8,  // scratch register (in addition to AT)
+  TMP2 = T3,  // scratch register (in addition to AT, reserved for assembler)
   kNumberOfGpuRegisters = 32,
   kNoGpuRegister = -1  // Signals an illegal register.
 };
@@ -98,10 +102,51 @@ enum FpuRegister {
   F29 = 29,
   F30 = 30,
   F31 = 31,
+  FTMP = F8,   // scratch register
+  FTMP2 = F9,  // scratch register (in addition to FTMP, reserved for MSA instructions)
   kNumberOfFpuRegisters = 32,
   kNoFpuRegister = -1,
 };
 std::ostream& operator<<(std::ostream& os, const FpuRegister& rhs);
+
+// Values for vector registers.
+enum VectorRegister {
+  W0  =  0,
+  W1  =  1,
+  W2  =  2,
+  W3  =  3,
+  W4  =  4,
+  W5  =  5,
+  W6  =  6,
+  W7  =  7,
+  W8  =  8,
+  W9  =  9,
+  W10 = 10,
+  W11 = 11,
+  W12 = 12,
+  W13 = 13,
+  W14 = 14,
+  W15 = 15,
+  W16 = 16,
+  W17 = 17,
+  W18 = 18,
+  W19 = 19,
+  W20 = 20,
+  W21 = 21,
+  W22 = 22,
+  W23 = 23,
+  W24 = 24,
+  W25 = 25,
+  W26 = 26,
+  W27 = 27,
+  W28 = 28,
+  W29 = 29,
+  W30 = 30,
+  W31 = 31,
+  kNumberOfVectorRegisters = 32,
+  kNoVectorRegister = -1,
+};
+std::ostream& operator<<(std::ostream& os, const VectorRegister& rhs);
 
 }  // namespace mips64
 }  // namespace art

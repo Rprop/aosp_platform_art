@@ -29,9 +29,9 @@ public class Clash2 {
 
         try {
             Proxy.newProxyInstance(Clash.class.getClassLoader(),
-                new Class[] { Interface2A.class, Interface2B.class },
+                new Class<?>[] { Interface2A.class, Interface2B.class },
                 handler);
-            System.err.println("Clash2 did not throw expected exception");
+            System.out.println("Clash2 did not throw expected exception");
         } catch (IllegalArgumentException iae) {
             System.out.println("Clash2 threw expected exception");
         }

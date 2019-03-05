@@ -17,18 +17,16 @@
 #ifndef ART_RUNTIME_VERIFIER_METHOD_VERIFIER_INL_H_
 #define ART_RUNTIME_VERIFIER_METHOD_VERIFIER_INL_H_
 
-#include "base/logging.h"
 #include "method_verifier.h"
+
+#include <android-base/logging.h>
+
+#include "handle_scope-inl.h"
 #include "mirror/class_loader.h"
 #include "mirror/dex_cache.h"
-#include "handle_scope-inl.h"
 
 namespace art {
 namespace verifier {
-
-inline const DexFile::CodeItem* MethodVerifier::CodeItem() const {
-  return code_item_;
-}
 
 inline RegisterLine* MethodVerifier::GetRegLine(uint32_t dex_pc) {
   return reg_table_.GetLine(dex_pc);
@@ -38,12 +36,20 @@ inline const InstructionFlags& MethodVerifier::GetInstructionFlags(size_t index)
   return insn_flags_[index];
 }
 
+inline InstructionFlags& MethodVerifier::GetInstructionFlags(size_t index) {
+  return insn_flags_[index];
+}
+
 inline mirror::ClassLoader* MethodVerifier::GetClassLoader() {
   return class_loader_.Get();
 }
 
 inline mirror::DexCache* MethodVerifier::GetDexCache() {
   return dex_cache_.Get();
+}
+
+inline ArtMethod* MethodVerifier::GetMethod() const {
+  return method_being_verified_;
 }
 
 inline MethodReference MethodVerifier::GetMethodReference() const {
@@ -66,9 +72,9 @@ inline bool MethodVerifier::HasFailures() const {
   return !failure_messages_.empty();
 }
 
-inline const RegType& MethodVerifier::ResolveCheckedClass(uint32_t class_idx) {
+inline const RegType& MethodVerifier::ResolveCheckedClass(dex::TypeIndex class_idx) {
   DCHECK(!HasFailures());
-  const RegType& result = ResolveClassAndCheckAccess(class_idx);
+  const RegType& result = ResolveClass<CheckAccess::kYes>(class_idx);
   DCHECK(!HasFailures());
   return result;
 }

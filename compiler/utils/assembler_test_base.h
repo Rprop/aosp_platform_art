@@ -17,14 +17,17 @@
 #ifndef ART_COMPILER_UTILS_ASSEMBLER_TEST_BASE_H_
 #define ART_COMPILER_UTILS_ASSEMBLER_TEST_BASE_H_
 
+#include <sys/stat.h>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
-#include <sys/stat.h>
 
+#include "android-base/strings.h"
+
+#include "base/utils.h"
 #include "common_runtime_test.h"  // For ScratchFile
-#include "utils.h"
+#include "exec_utils.h"
 
 namespace art {
 
@@ -34,7 +37,7 @@ static constexpr bool kKeepDisassembledFiles = false;
 
 // Use a glocal static variable to keep the same name for all test data. Else we'll just spam the
 // temp directory.
-static std::string tmpnam_;
+static std::string tmpnam_;  // NOLINT [runtime/string] [4]
 
 // We put this into a class as gtests are self-contained, so this helper needs to be in an h-file.
 class AssemblerTestInfrastructure {
@@ -67,12 +70,20 @@ class AssemblerTestInfrastructure {
 
   // This is intended to be run as a test.
   bool CheckTools() {
-    if (!FileExists(FindTool(assembler_cmd_name_))) {
+    std::string asm_tool = FindTool(assembler_cmd_name_);
+    if (!FileExists(asm_tool)) {
+      LOG(ERROR) << "Could not find assembler from " << assembler_cmd_name_;
+      LOG(ERROR) << "FindTool returned " << asm_tool;
+      FindToolDump(assembler_cmd_name_);
       return false;
     }
     LOG(INFO) << "Chosen assembler command: " << GetAssemblerCommand();
 
-    if (!FileExists(FindTool(objdump_cmd_name_))) {
+    std::string objdump_tool = FindTool(objdump_cmd_name_);
+    if (!FileExists(objdump_tool)) {
+      LOG(ERROR) << "Could not find objdump from " << objdump_cmd_name_;
+      LOG(ERROR) << "FindTool returned " << objdump_tool;
+      FindToolDump(objdump_cmd_name_);
       return false;
     }
     LOG(INFO) << "Chosen objdump command: " << GetObjdumpCommand();
@@ -80,7 +91,11 @@ class AssemblerTestInfrastructure {
     // Disassembly is optional.
     std::string disassembler = GetDisassembleCommand();
     if (disassembler.length() != 0) {
-      if (!FileExists(FindTool(disassembler_cmd_name_))) {
+      std::string disassembler_tool = FindTool(disassembler_cmd_name_);
+      if (!FileExists(disassembler_tool)) {
+        LOG(ERROR) << "Could not find disassembler from " << disassembler_cmd_name_;
+        LOG(ERROR) << "FindTool returned " << disassembler_tool;
+        FindToolDump(disassembler_cmd_name_);
         return false;
       }
       LOG(INFO) << "Chosen disassemble command: " << GetDisassembleCommand();
@@ -94,7 +109,9 @@ class AssemblerTestInfrastructure {
   // Driver() assembles and compares the results. If the results are not equal and we have a
   // disassembler, disassemble both and check whether they have the same mnemonics (in which case
   // we just warn).
-  void Driver(const std::vector<uint8_t>& data, std::string assembly_text, std::string test_name) {
+  void Driver(const std::vector<uint8_t>& data,
+              const std::string& assembly_text,
+              const std::string& test_name) {
     EXPECT_NE(assembly_text.length(), 0U) << "Empty assembly";
 
     NativeAssemblerResult res;
@@ -207,7 +224,7 @@ class AssemblerTestInfrastructure {
     args.push_back("-o");
     args.push_back(to_file);
     args.push_back(from_file);
-    std::string cmd = Join(args, ' ');
+    std::string cmd = android::base::Join(args, ' ');
 
     args.clear();
     args.push_back("/bin/sh");
@@ -216,9 +233,9 @@ class AssemblerTestInfrastructure {
 
     bool success = Exec(args, error_msg);
     if (!success) {
-      LOG(INFO) << "Assembler command line:";
-      for (std::string arg : args) {
-        LOG(INFO) << arg;
+      LOG(ERROR) << "Assembler command line:";
+      for (const std::string& arg : args) {
+        LOG(ERROR) << arg;
       }
     }
     return success;
@@ -226,7 +243,7 @@ class AssemblerTestInfrastructure {
 
   // Runs objdump -h on the binary file and extracts the first line with .text.
   // Returns "" on failure.
-  std::string Objdump(std::string file) {
+  std::string Objdump(const std::string& file) {
     bool have_objdump = FileExists(FindTool(objdump_cmd_name_));
     EXPECT_TRUE(have_objdump) << "Cannot find objdump: " << GetObjdumpCommand();
     if (!have_objdump) {
@@ -243,7 +260,7 @@ class AssemblerTestInfrastructure {
     args.push_back(file);
     args.push_back(">");
     args.push_back(file+".dump");
-    std::string cmd = Join(args, ' ');
+    std::string cmd = android::base::Join(args, ' ');
 
     args.clear();
     args.push_back("/bin/sh");
@@ -275,8 +292,9 @@ class AssemblerTestInfrastructure {
   }
 
   // Disassemble both binaries and compare the text.
-  bool DisassembleBinaries(const std::vector<uint8_t>& data, const std::vector<uint8_t>& as,
-                           std::string test_name) {
+  bool DisassembleBinaries(const std::vector<uint8_t>& data,
+                           const std::vector<uint8_t>& as,
+                           const std::string& test_name) {
     std::string disassembler = GetDisassembleCommand();
     if (disassembler.length() == 0) {
       LOG(WARNING) << "No dissassembler command.";
@@ -312,7 +330,7 @@ class AssemblerTestInfrastructure {
     return result;
   }
 
-  bool DisassembleBinary(std::string file, std::string* error_msg) {
+  bool DisassembleBinary(const std::string& file, std::string* error_msg) {
     std::vector<std::string> args;
 
     // Encaspulate the whole command line in a single string passed to
@@ -323,7 +341,7 @@ class AssemblerTestInfrastructure {
     args.push_back("| sed -n \'/<.data>/,$p\' | sed -e \'s/.*://\'");
     args.push_back(">");
     args.push_back(file+".dis");
-    std::string cmd = Join(args, ' ');
+    std::string cmd = android::base::Join(args, ' ');
 
     args.clear();
     args.push_back("/bin/sh");
@@ -333,7 +351,7 @@ class AssemblerTestInfrastructure {
     return Exec(args, error_msg);
   }
 
-  std::string WriteToFile(const std::vector<uint8_t>& buffer, std::string test_name) {
+  std::string WriteToFile(const std::vector<uint8_t>& buffer, const std::string& test_name) {
     std::string file_name = GetTmpnam() + std::string("---") + test_name;
     const char* data = reinterpret_cast<const char*>(buffer.data());
     std::ofstream s_out(file_name + ".o");
@@ -342,7 +360,7 @@ class AssemblerTestInfrastructure {
     return file_name + ".o";
   }
 
-  bool CompareFiles(std::string f1, std::string f2) {
+  bool CompareFiles(const std::string& f1, const std::string& f2) {
     std::ifstream f1_in(f1);
     std::ifstream f2_in(f2);
 
@@ -357,7 +375,9 @@ class AssemblerTestInfrastructure {
   }
 
   // Compile the given assembly code and extract the binary, if possible. Put result into res.
-  bool Compile(std::string assembly_code, NativeAssemblerResult* res, std::string test_name) {
+  bool Compile(const std::string& assembly_code,
+               NativeAssemblerResult* res,
+               const std::string& test_name) {
     res->ok = false;
     res->code.reset(nullptr);
 
@@ -426,7 +446,7 @@ class AssemblerTestInfrastructure {
   // Check whether file exists. Is used for commands, so strips off any parameters: anything after
   // the first space. We skip to the last slash for this, so it should work with directories with
   // spaces.
-  static bool FileExists(std::string file) {
+  static bool FileExists(const std::string& file) {
     if (file.length() == 0) {
       return false;
     }
@@ -466,7 +486,7 @@ class AssemblerTestInfrastructure {
     return getcwd(temp, 1024) ? std::string(temp) + "/" : std::string("");
   }
 
-  std::string FindTool(std::string tool_name) {
+  std::string FindTool(const std::string& tool_name) {
     // Find the current tool. Wild-card pattern is "arch-string*tool-name".
     std::string gcc_path = GetRootPath() + GetGCCRootPath();
     std::vector<std::string> args;
@@ -483,7 +503,7 @@ class AssemblerTestInfrastructure {
     std::string tmp_file = GetTmpnam();
     args.push_back(">");
     args.push_back(tmp_file);
-    std::string sh_args = Join(args, ' ');
+    std::string sh_args = android::base::Join(args, ' ');
 
     args.clear();
     args.push_back("/bin/sh");
@@ -493,7 +513,7 @@ class AssemblerTestInfrastructure {
     std::string error_msg;
     if (!Exec(args, &error_msg)) {
       EXPECT_TRUE(false) << error_msg;
-      return "";
+      UNREACHABLE();
     }
 
     std::ifstream in(tmp_file.c_str());
@@ -506,6 +526,55 @@ class AssemblerTestInfrastructure {
     in.close();
     std::remove(tmp_file.c_str());
     return line;
+  }
+
+  // Helper for below. If name_predicate is empty, search for all files, otherwise use it for the
+  // "-name" option.
+  static void FindToolDumpPrintout(const std::string& name_predicate,
+                                   const std::string& tmp_file) {
+    std::string gcc_path = GetRootPath() + GetGCCRootPath();
+    std::vector<std::string> args;
+    args.push_back("find");
+    args.push_back(gcc_path);
+    if (!name_predicate.empty()) {
+      args.push_back("-name");
+      args.push_back(name_predicate);
+    }
+    args.push_back("|");
+    args.push_back("sort");
+    args.push_back(">");
+    args.push_back(tmp_file);
+    std::string sh_args = android::base::Join(args, ' ');
+
+    args.clear();
+    args.push_back("/bin/sh");
+    args.push_back("-c");
+    args.push_back(sh_args);
+
+    std::string error_msg;
+    if (!Exec(args, &error_msg)) {
+      EXPECT_TRUE(false) << error_msg;
+      UNREACHABLE();
+    }
+
+    LOG(ERROR) << "FindToolDump: gcc_path=" << gcc_path
+               << " cmd=" << sh_args;
+    std::ifstream in(tmp_file.c_str());
+    if (in) {
+      std::string line;
+      while (std::getline(in, line)) {
+        LOG(ERROR) << line;
+      }
+    }
+    in.close();
+    std::remove(tmp_file.c_str());
+  }
+
+  // For debug purposes.
+  void FindToolDump(const std::string& tool_name) {
+    // Check with the tool name.
+    FindToolDumpPrintout(architecture_string_ + "*" + tool_name, GetTmpnam());
+    FindToolDumpPrintout("", GetTmpnam());
   }
 
   // Use a consistent tmpnam, so store it.

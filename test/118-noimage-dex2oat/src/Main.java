@@ -19,6 +19,7 @@ import java.lang.reflect.Method;
 
 public class Main {
   public static void main(String[] args) throws Exception {
+    System.loadLibrary(args[0]);
     boolean hasImage = hasImage();
     String instructionSet = VMRuntime.getCurrentInstructionSet();
     boolean isBootClassPathOnDisk = VMRuntime.isBootClassPathOnDisk(instructionSet);
@@ -41,10 +42,6 @@ public class Main {
     testB18485243();
   }
 
-  static {
-    System.loadLibrary("arttest");
-  }
-
   private native static boolean hasImage();
 
   private native static boolean isImageDex2OatEnabled();
@@ -54,7 +51,7 @@ public class Main {
     private static final Method isBootClassPathOnDiskMethod;
     static {
         try {
-            Class c = Class.forName("dalvik.system.VMRuntime");
+            Class<?> c = Class.forName("dalvik.system.VMRuntime");
             getCurrentInstructionSetMethod = c.getDeclaredMethod("getCurrentInstructionSet");
             isBootClassPathOnDiskMethod = c.getDeclaredMethod("isBootClassPathOnDisk",
                                                               String.class);

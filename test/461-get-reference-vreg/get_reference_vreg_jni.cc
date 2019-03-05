@@ -17,7 +17,7 @@
 #include "arch/context.h"
 #include "art_method-inl.h"
 #include "jni.h"
-#include "scoped_thread_state_change.h"
+#include "scoped_thread_state_change-inl.h"
 #include "stack.h"
 #include "thread.h"
 
@@ -28,30 +28,30 @@ namespace {
 class TestVisitor : public StackVisitor {
  public:
   TestVisitor(Thread* thread, Context* context, mirror::Object* this_value)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
+      REQUIRES_SHARED(Locks::mutator_lock_)
       : StackVisitor(thread, context, StackVisitor::StackWalkKind::kIncludeInlinedFrames),
         this_value_(this_value),
         found_method_index_(0) {}
 
-  bool VisitFrame() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  bool VisitFrame() REQUIRES_SHARED(Locks::mutator_lock_) {
     ArtMethod* m = GetMethod();
     std::string m_name(m->GetName());
 
-    if (m_name.compare("testThisWithInstanceCall") == 0) {
+    if (m_name.compare("$noinline$testThisWithInstanceCall") == 0) {
       found_method_index_ = 1;
       uint32_t value = 0;
       CHECK(GetVReg(m, 1, kReferenceVReg, &value));
       CHECK_EQ(reinterpret_cast<mirror::Object*>(value), this_value_);
       CHECK_EQ(GetThisObject(), this_value_);
-    } else if (m_name.compare("testThisWithStaticCall") == 0) {
+    } else if (m_name.compare("$noinline$testThisWithStaticCall") == 0) {
       found_method_index_ = 2;
       uint32_t value = 0;
       CHECK(GetVReg(m, 1, kReferenceVReg, &value));
-    } else if (m_name.compare("testParameter") == 0) {
+    } else if (m_name.compare("$noinline$testParameter") == 0) {
       found_method_index_ = 3;
       uint32_t value = 0;
       CHECK(GetVReg(m, 1, kReferenceVReg, &value));
-    } else if (m_name.compare("testObjectInScope") == 0) {
+    } else if (m_name.compare("$noinline$testObjectInScope") == 0) {
       found_method_index_ = 4;
       uint32_t value = 0;
       CHECK(GetVReg(m, 0, kReferenceVReg, &value));
@@ -70,7 +70,7 @@ class TestVisitor : public StackVisitor {
 extern "C" JNIEXPORT jint JNICALL Java_Main_doNativeCallRef(JNIEnv*, jobject value) {
   ScopedObjectAccess soa(Thread::Current());
   std::unique_ptr<Context> context(Context::Create());
-  TestVisitor visitor(soa.Self(), context.get(), soa.Decode<mirror::Object*>(value));
+  TestVisitor visitor(soa.Self(), context.get(), soa.Decode<mirror::Object>(value).Ptr());
   visitor.WalkStack();
   return visitor.found_method_index_;
 }

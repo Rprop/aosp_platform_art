@@ -24,10 +24,14 @@
 #include <iostream>
 #include <string>
 
-#include "runtime.h"
+#include "android-base/stringprintf.h"
+
+#include "base/file_utils.h"
+#include "base/logging.h"
+#include "base/mutex.h"
 #include "base/stringpiece.h"
 #include "noop_compiler_callbacks.h"
-#include "base/logging.h"
+#include "runtime.h"
 
 #if !defined(NDEBUG)
 #define DBG_LOG LOG(INFO)
@@ -76,12 +80,12 @@ static bool LocationToFilename(const std::string& location, InstructionSet isa,
     *filename = cache_filename;
     return true;
   } else {
+    *filename = system_filename;
     return false;
   }
 }
 
-static Runtime* StartRuntime(const char* boot_image_location,
-                             InstructionSet instruction_set) {
+static Runtime* StartRuntime(const char* boot_image_location, InstructionSet instruction_set) {
   CHECK(boot_image_location != nullptr);
 
   RuntimeOptions options;
@@ -104,7 +108,9 @@ static Runtime* StartRuntime(const char* boot_image_location,
   options.push_back(
       std::make_pair("imageinstructionset",
                      reinterpret_cast<const void*>(GetInstructionSetString(instruction_set))));
-
+  // None of the command line tools need sig chain. If this changes we'll need
+  // to upgrade this option to a proper parameter.
+  options.push_back(std::make_pair("-Xno-sig-chain", nullptr));
   if (!Runtime::Create(options, false)) {
     fprintf(stderr, "Failed to create runtime\n");
     return nullptr;
@@ -143,7 +149,7 @@ struct CmdlineArgs {
       } else if (option.starts_with("--instruction-set=")) {
         StringPiece instruction_set_str = option.substr(strlen("--instruction-set=")).data();
         instruction_set_ = GetInstructionSetFromString(instruction_set_str.data());
-        if (instruction_set_ == kNone) {
+        if (instruction_set_ == InstructionSet::kNone) {
           fprintf(stderr, "Unsupported instruction set %s\n", instruction_set_str.data());
           PrintUsage();
           return false;
@@ -194,8 +200,9 @@ struct CmdlineArgs {
         "  --boot-image=<file.art>: provide the image location for the boot class path.\n"
         "      Do not include the arch as part of the name, it is added automatically.\n"
         "      Example: --boot-image=/system/framework/boot.art\n"
+        "               (specifies /system/framework/<arch>/boot.art as the image file)\n"
         "\n";
-    usage += StringPrintf(  // Optional.
+    usage += android::base::StringPrintf(  // Optional.
         "  --instruction-set=(arm|arm64|mips|mips64|x86|x86_64): for locating the image\n"
         "      file based on the image location set.\n"
         "      Example: --instruction-set=x86\n"
@@ -213,7 +220,7 @@ struct CmdlineArgs {
   // Specified by --boot-image.
   const char* boot_image_location_ = nullptr;
   // Specified by --instruction-set.
-  InstructionSet instruction_set_ = kRuntimeISA;
+  InstructionSet instruction_set_ = InstructionSet::kNone;
   // Specified by --output.
   std::ostream* os_ = &std::cout;
   std::unique_ptr<std::ofstream> out_;  // If something besides cout is used
@@ -226,13 +233,17 @@ struct CmdlineArgs {
       *error_msg = "--boot-image must be specified";
       return false;
     }
+    if (instruction_set_ == InstructionSet::kNone) {
+      LOG(WARNING) << "No instruction set given, assuming " << GetInstructionSetString(kRuntimeISA);
+      instruction_set_ = kRuntimeISA;
+    }
 
     DBG_LOG << "boot image location: " << boot_image_location_;
 
     // Checks for --boot-image location.
     {
       std::string boot_image_location = boot_image_location_;
-      size_t file_name_idx = boot_image_location.rfind("/");
+      size_t file_name_idx = boot_image_location.rfind('/');
       if (file_name_idx == std::string::npos) {  // Prevent a InsertIsaDirectory check failure.
         *error_msg = "Boot image location must have a / in it";
         return false;
@@ -242,7 +253,7 @@ struct CmdlineArgs {
       // This prevents a common error "Could not create an image space..." when initing the Runtime.
       if (file_name_idx != std::string::npos) {
         std::string no_file_name = boot_image_location.substr(0, file_name_idx);
-        size_t ancestor_dirs_idx = no_file_name.rfind("/");
+        size_t ancestor_dirs_idx = no_file_name.rfind('/');
 
         std::string parent_dir_name;
         if (ancestor_dirs_idx != std::string::npos) {
@@ -253,7 +264,7 @@ struct CmdlineArgs {
 
         DBG_LOG << "boot_image_location parent_dir_name was " << parent_dir_name;
 
-        if (GetInstructionSetFromString(parent_dir_name.c_str()) != kNone) {
+        if (GetInstructionSetFromString(parent_dir_name.c_str()) != InstructionSet::kNone) {
           *error_msg = "Do not specify the architecture as part of the boot image location";
           return false;
         }
@@ -262,8 +273,10 @@ struct CmdlineArgs {
       // Check that the boot image location points to a valid file name.
       std::string file_name;
       if (!LocationToFilename(boot_image_location, instruction_set_, &file_name)) {
-        *error_msg = StringPrintf("No corresponding file for location '%s' exists",
-                                  file_name.c_str());
+        *error_msg = android::base::StringPrintf(
+            "No corresponding file for location '%s' (filename '%s') exists",
+            boot_image_location.c_str(),
+            file_name.c_str());
         return false;
       }
 
@@ -291,7 +304,8 @@ struct CmdlineArgs {
 template <typename Args = CmdlineArgs>
 struct CmdlineMain {
   int Main(int argc, char** argv) {
-    InitLogging(argv);
+    Locks::Init();
+    InitLogging(argv, Runtime::Abort);
     std::unique_ptr<Args> args = std::unique_ptr<Args>(CreateArguments());
     args_ = args.get();
 

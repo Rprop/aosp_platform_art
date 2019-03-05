@@ -19,20 +19,33 @@
 
 #include "reference.h"
 
+#include "obj_ptr-inl.h"
+#include "runtime.h"
+
 namespace art {
 namespace mirror {
 
-inline uint32_t Reference::ClassSize(size_t pointer_size) {
-  uint32_t vtable_entries = Object::kVTableLength + 5;
+inline uint32_t Reference::ClassSize(PointerSize pointer_size) {
+  uint32_t vtable_entries = Object::kVTableLength + 4;
   return Class::ComputeClassSize(false, vtable_entries, 2, 0, 0, 0, 0, pointer_size);
 }
 
-inline bool Reference::IsEnqueuable() {
-  // Not using volatile reads as an optimization since this is only called with all the mutators
-  // suspended.
-  const Object* queue = GetFieldObject<mirror::Object>(QueueOffset());
-  const Object* queue_next = GetFieldObject<mirror::Object>(QueueNextOffset());
-  return queue != nullptr && queue_next == nullptr;
+template<bool kTransactionActive>
+inline void Reference::SetReferent(ObjPtr<Object> referent) {
+  SetFieldObjectVolatile<kTransactionActive>(ReferentOffset(), referent);
+}
+
+inline void Reference::SetPendingNext(ObjPtr<Reference> pending_next) {
+  if (Runtime::Current()->IsActiveTransaction()) {
+    SetFieldObject<true>(PendingNextOffset(), pending_next);
+  } else {
+    SetFieldObject<false>(PendingNextOffset(), pending_next);
+  }
+}
+
+template<bool kTransactionActive>
+inline void FinalizerReference::SetZombie(ObjPtr<Object> zombie) {
+  return SetFieldObjectVolatile<kTransactionActive>(ZombieOffset(), zombie);
 }
 
 }  // namespace mirror

@@ -16,8 +16,8 @@
 
 #include "bump_pointer_space.h"
 #include "bump_pointer_space-inl.h"
-#include "mirror/object-inl.h"
 #include "mirror/class-inl.h"
+#include "mirror/object-inl.h"
 #include "thread_list.h"
 
 namespace art {
@@ -72,8 +72,8 @@ void BumpPointerSpace::Clear() {
   // Reset the end of the space back to the beginning, we move the end forward as we allocate
   // objects.
   SetEnd(Begin());
-  objects_allocated_.StoreRelaxed(0);
-  bytes_allocated_.StoreRelaxed(0);
+  objects_allocated_.store(0, std::memory_order_relaxed);
+  bytes_allocated_.store(0, std::memory_order_relaxed);
   growth_end_ = Limit();
   {
     MutexLock mu(Thread::Current(), block_lock_);
@@ -153,58 +153,6 @@ uint8_t* BumpPointerSpace::AllocBlock(size_t bytes) {
   return storage;
 }
 
-void BumpPointerSpace::Walk(ObjectCallback* callback, void* arg) {
-  uint8_t* pos = Begin();
-  uint8_t* end = End();
-  uint8_t* main_end = pos;
-  {
-    MutexLock mu(Thread::Current(), block_lock_);
-    // If we have 0 blocks then we need to update the main header since we have bump pointer style
-    // allocation into an unbounded region (actually bounded by Capacity()).
-    if (num_blocks_ == 0) {
-      UpdateMainBlock();
-    }
-    main_end = Begin() + main_block_size_;
-    if (num_blocks_ == 0) {
-      // We don't have any other blocks, this means someone else may be allocating into the main
-      // block. In this case, we don't want to try and visit the other blocks after the main block
-      // since these could actually be part of the main block.
-      end = main_end;
-    }
-  }
-  // Walk all of the objects in the main block first.
-  while (pos < main_end) {
-    mirror::Object* obj = reinterpret_cast<mirror::Object*>(pos);
-    // No read barrier because obj may not be a valid object.
-    if (obj->GetClass<kDefaultVerifyFlags, kWithoutReadBarrier>() == nullptr) {
-      // There is a race condition where a thread has just allocated an object but not set the
-      // class. We can't know the size of this object, so we don't visit it and exit the function
-      // since there is guaranteed to be not other blocks.
-      return;
-    } else {
-      callback(obj, arg);
-      pos = reinterpret_cast<uint8_t*>(GetNextObject(obj));
-    }
-  }
-  // Walk the other blocks (currently only TLABs).
-  while (pos < end) {
-    BlockHeader* header = reinterpret_cast<BlockHeader*>(pos);
-    size_t block_size = header->size_;
-    pos += sizeof(BlockHeader);  // Skip the header so that we know where the objects
-    mirror::Object* obj = reinterpret_cast<mirror::Object*>(pos);
-    const mirror::Object* end_obj = reinterpret_cast<const mirror::Object*>(pos + block_size);
-    CHECK_LE(reinterpret_cast<const uint8_t*>(end_obj), End());
-    // We don't know how many objects are allocated in the current block. When we hit a null class
-    // assume its the end. TODO: Have a thread update the header when it flushes the block?
-    // No read barrier because obj may not be a valid object.
-    while (obj < end_obj && obj->GetClass<kDefaultVerifyFlags, kWithoutReadBarrier>() != nullptr) {
-      callback(obj, arg);
-      obj = GetNextObject(obj);
-    }
-    pos += block_size;
-  }
-}
-
 accounting::ContinuousSpaceBitmap::SweepCallback* BumpPointerSpace::GetSweepCallback() {
   UNIMPLEMENTED(FATAL);
   UNREACHABLE();
@@ -212,7 +160,7 @@ accounting::ContinuousSpaceBitmap::SweepCallback* BumpPointerSpace::GetSweepCall
 
 uint64_t BumpPointerSpace::GetBytesAllocated() {
   // Start out pre-determined amount (blocks which are not being allocated into).
-  uint64_t total = static_cast<uint64_t>(bytes_allocated_.LoadRelaxed());
+  uint64_t total = static_cast<uint64_t>(bytes_allocated_.load(std::memory_order_relaxed));
   Thread* self = Thread::Current();
   MutexLock mu(self, *Locks::runtime_shutdown_lock_);
   MutexLock mu2(self, *Locks::thread_list_lock_);
@@ -230,7 +178,7 @@ uint64_t BumpPointerSpace::GetBytesAllocated() {
 
 uint64_t BumpPointerSpace::GetObjectsAllocated() {
   // Start out pre-determined amount (blocks which are not being allocated into).
-  uint64_t total = static_cast<uint64_t>(objects_allocated_.LoadRelaxed());
+  uint64_t total = static_cast<uint64_t>(objects_allocated_.load(std::memory_order_relaxed));
   Thread* self = Thread::Current();
   MutexLock mu(self, *Locks::runtime_shutdown_lock_);
   MutexLock mu2(self, *Locks::thread_list_lock_);
@@ -247,9 +195,9 @@ uint64_t BumpPointerSpace::GetObjectsAllocated() {
 }
 
 void BumpPointerSpace::RevokeThreadLocalBuffersLocked(Thread* thread) {
-  objects_allocated_.FetchAndAddSequentiallyConsistent(thread->GetThreadLocalObjectsAllocated());
-  bytes_allocated_.FetchAndAddSequentiallyConsistent(thread->GetThreadLocalBytesAllocated());
-  thread->SetTlab(nullptr, nullptr);
+  objects_allocated_.fetch_add(thread->GetThreadLocalObjectsAllocated(), std::memory_order_seq_cst);
+  bytes_allocated_.fetch_add(thread->GetThreadLocalBytesAllocated(), std::memory_order_seq_cst);
+  thread->SetTlab(nullptr, nullptr, nullptr);
 }
 
 bool BumpPointerSpace::AllocNewTlab(Thread* self, size_t bytes) {
@@ -259,7 +207,7 @@ bool BumpPointerSpace::AllocNewTlab(Thread* self, size_t bytes) {
   if (start == nullptr) {
     return false;
   }
-  self->SetTlab(start, start + bytes);
+  self->SetTlab(start, start + bytes, start + bytes);
   return true;
 }
 
@@ -269,6 +217,14 @@ void BumpPointerSpace::LogFragmentationAllocFailure(std::ostream& os,
   os << "; failed due to fragmentation (largest possible contiguous allocation "
      <<  max_contiguous_allocation << " bytes)";
   // Caller's job to print failed_alloc_bytes.
+}
+
+size_t BumpPointerSpace::AllocationSizeNonvirtual(mirror::Object* obj, size_t* usable_size) {
+  size_t num_bytes = obj->SizeOf();
+  if (usable_size != nullptr) {
+    *usable_size = RoundUp(num_bytes, kAlignment);
+  }
+  return num_bytes;
 }
 
 }  // namespace space

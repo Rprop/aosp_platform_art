@@ -14,13 +14,26 @@
  * limitations under the License.
  */
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.lang.reflect.Field;
 import java.lang.reflect.Proxy;
+import java.util.regex.Pattern;
+
+import dalvik.annotation.optimization.CriticalNative;
+import dalvik.annotation.optimization.FastNative;
 
 public class Main {
     public static void main(String[] args) {
-        System.loadLibrary("arttest");
+        System.loadLibrary(args[0]);
+
+        if (!isSlowDebug()) {
+          throw new RuntimeException("Slow-debug flags unexpectedly off.");
+        }
+
+        testFieldSubclass();
         testFindClassOnAttachedNativeThread();
         testFindFieldOnAttachedNativeThread();
         testReflectFieldGetFromAttachedNativeThreadNative();
@@ -38,7 +51,38 @@ public class Main {
         testNewStringObject();
         testRemoveLocalObject();
         testProxyGetMethodID();
+        testJniCriticalSectionAndGc();
+        testCallDefaultMethods();
+        String lambda = "λ";
+        testInvokeLambdaMethod(() -> { System.out.println("hi-lambda: " + lambda); });
+        String def = "δ";
+        testInvokeLambdaDefaultMethod(() -> { System.out.println("hi-default " + def + lambda); });
+
+        registerNativesJniTest();
+        testFastNativeMethods();
+        testCriticalNativeMethods();
+
+        testClinitMethodLookup();
+
+        testDoubleLoad(args[0]);
     }
+
+    static class ABC { public static int XYZ = 12; }
+    static class DEF extends ABC {}
+    public static void testFieldSubclass() {
+      try {
+        System.out.println("ABC.XYZ = " + ABC.XYZ + ", GetStaticIntField(DEF.class, 'XYZ') = " +
+            getFieldSubclass(ABC.class.getDeclaredField("XYZ"), DEF.class));
+      } catch (Exception e) {
+        throw new RuntimeException("Failed to test get static field on a subclass", e);
+      }
+    }
+
+    public static native int getFieldSubclass(Field f, Class sub);
+
+    private static native boolean registerNativesJniTest();
+
+    private static native void testCallDefaultMethods();
 
     private static native void testFindClassOnAttachedNativeThread();
 
@@ -120,7 +164,7 @@ public class Main {
     private static void testRemoveLocalObject() {
         removeLocalObject(new Object());
     }
-    
+
     private static native short shortMethod(short s1, short s2, short s3, short s4, short s5, short s6, short s7,
         short s8, short s9, short s10);
 
@@ -212,7 +256,7 @@ public class Main {
         InvocationHandler handler = new DummyInvocationHandler();
         SimpleInterface proxy =
                 (SimpleInterface) Proxy.newProxyInstance(SimpleInterface.class.getClassLoader(),
-                        new Class[] {SimpleInterface.class}, handler);
+                        new Class<?>[] {SimpleInterface.class}, handler);
         if (testGetMethodID(SimpleInterface.class) == 0) {
             throw new AssertionError();
         }
@@ -222,6 +266,166 @@ public class Main {
     }
 
     private static native long testGetMethodID(Class<?> c);
+
+    // Exercise GC and JNI critical sections in parallel.
+    private static void testJniCriticalSectionAndGc() {
+        Thread runGcThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                for (int i = 0; i < 10; ++i) {
+                    Runtime.getRuntime().gc();
+                }
+            }
+        });
+        Thread jniCriticalThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final int arraySize = 32;
+                byte[] array0 = new byte[arraySize];
+                byte[] array1 = new byte[arraySize];
+                enterJniCriticalSection(arraySize, array0, array1);
+            }
+        });
+        jniCriticalThread.start();
+        runGcThread.start();
+        try {
+            jniCriticalThread.join();
+            runGcThread.join();
+        } catch (InterruptedException ignored) {}
+    }
+
+    private static native void enterJniCriticalSection(int arraySize, byte[] array0, byte[] array);
+
+    private static native void testInvokeLambdaMethod(LambdaInterface iface);
+
+    private static native void testInvokeLambdaDefaultMethod(LambdaInterface iface);
+
+    // Test invoking @FastNative methods works correctly.
+
+    // Return sum of a+b+c.
+    @FastNative
+    static native int intFastNativeMethod(int a, int b, int c);
+
+    private static void testFastNativeMethods() {
+      int returns[] = { 0, 3, 6, 9, 12 };
+      for (int i = 0; i < returns.length; i++) {
+        int result = intFastNativeMethod(i, i, i);
+        if (returns[i] != result) {
+          System.out.println("FastNative Int Run " + i + " with " + returns[i] + " vs " + result);
+          throw new AssertionError();
+        }
+      }
+    }
+
+    // Smoke test for @CriticalNative
+    // TODO: Way more thorough tests since it involved quite a bit of changes.
+
+    // Return sum of a+b+c.
+    @CriticalNative
+    static native int intCriticalNativeMethod(int a, int b, int c);
+
+    private static void testCriticalNativeMethods() {
+      int returns[] = { 3, 6, 9, 12, 15 };
+      for (int i = 0; i < returns.length; i++) {
+        int result = intCriticalNativeMethod(i, i+1, i+2);
+        if (returns[i] != result) {
+          System.out.println("CriticalNative Int Run " + i + " with " + returns[i] + " vs " + result);
+          throw new AssertionError();
+        }
+      }
+    }
+
+    private static native boolean isSlowDebug();
+
+    private static void testClinitMethodLookup() {
+      // Expect this to print <NSME Exception>
+      try {
+        System.out.println("Clinit Lookup: ClassWithoutClinit: " + methodString(lookupClinit(ClassWithoutClinit.class)));
+      } catch (NoSuchMethodError e) {
+        System.out.println("Clinit Lookup: ClassWithoutClinit: <NSME Exception>");
+      }
+      // Expect this to print <clinit>
+      try {
+        System.out.println("Clinit Lookup: ClassWithClinit: " + methodString(lookupClinit(ClassWithClinit.class)));
+      } catch (NoSuchMethodError e) {
+        System.out.println("Clinit Lookup: ClassWithClinit: <NSME Exception>");
+      }
+   }
+
+    private static String methodString(java.lang.reflect.Executable method) {
+      if (method == null) {
+        return "<<null>>";
+      } else {
+        return method.toString() + "(Class: " + method.getClass().toString() + ")";
+      }
+    }
+    private static native java.lang.reflect.Executable lookupClinit(Class kls);
+
+    private static class ClassWithoutClinit {
+    }
+    private static class ClassWithClinit {
+      static {}
+    }
+
+  private static void testDoubleLoad(String library) {
+    // Test that nothing observably happens on loading "library" again.
+    System.loadLibrary(library);
+
+    // Now load code in a separate classloader and try to let it load.
+    ClassLoader loader = createClassLoader();
+    try {
+      Class<?> aClass = loader.loadClass("A");
+      Method runMethod = aClass.getDeclaredMethod("run", String.class);
+      runMethod.invoke(null, library);
+    } catch (InvocationTargetException ite) {
+      if (ite.getCause() instanceof UnsatisfiedLinkError) {
+        if (!(loader instanceof java.net.URLClassLoader)) {
+          String msg = ite.getCause().getMessage();
+          String pattern = "^Shared library .*libarttest.* already opened by ClassLoader.*" +
+                           "004-JniTest.jar.*; can't open in ClassLoader.*004-JniTest-ex.jar.*";
+          if (!Pattern.matches(pattern, msg)) {
+            throw new RuntimeException("Could not find pattern in message", ite.getCause());
+          }
+        }
+        System.out.println("Got UnsatisfiedLinkError for duplicate loadLibrary");
+      } else {
+        throw new RuntimeException(ite);
+      }
+    } catch (Throwable t) {
+      // Anything else just let die.
+      throw new RuntimeException(t);
+    }
+  }
+
+  private static ClassLoader createClassLoader() {
+    String location = System.getenv("DEX_LOCATION");
+    try {
+      Class<?> class_loader_class = Class.forName("dalvik.system.PathClassLoader");
+      Constructor<?> ctor = class_loader_class.getConstructor(String.class, ClassLoader.class);
+
+      return (ClassLoader)ctor.newInstance(location + "/004-JniTest-ex.jar",
+                                           Main.class.getClassLoader());
+    } catch (ClassNotFoundException e) {
+      // Running on RI. Use URLClassLoader.
+      try {
+        return new java.net.URLClassLoader(
+            new java.net.URL[] { new java.net.URL("file://" + location + "/classes-ex/") });
+      } catch (Throwable t) {
+        throw new RuntimeException(t);
+      }
+    } catch (Throwable t) {
+      throw new RuntimeException(t);
+    }
+  }
+}
+
+@FunctionalInterface
+interface LambdaInterface {
+  public void sayHi();
+  public default void sayHiTwice() {
+    sayHi();
+    sayHi();
+  }
 }
 
 class JniCallNonvirtualTest {

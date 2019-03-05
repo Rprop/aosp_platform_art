@@ -16,50 +16,42 @@
 
 #include <fstream>
 
-#include "arch/x86/instruction_set_features_x86.h"
 #include "base/arena_allocator.h"
-#include "base/stringprintf.h"
 #include "builder.h"
 #include "code_generator.h"
-#include "code_generator_x86.h"
-#include "dex_file.h"
-#include "dex_instruction.h"
+#include "dex/dex_file.h"
+#include "dex/dex_instruction.h"
 #include "driver/compiler_options.h"
 #include "graph_visualizer.h"
 #include "nodes.h"
 #include "optimizing_unit_test.h"
 #include "pretty_printer.h"
-#include "ssa_builder.h"
 #include "ssa_liveness_analysis.h"
-
-#include "gtest/gtest.h"
 
 namespace art {
 
-static void TestCode(const uint16_t* data, const int* expected_order, size_t number_of_blocks) {
-  ArenaPool pool;
-  ArenaAllocator allocator(&pool);
-  HGraph* graph = CreateGraph(&allocator);
-  HGraphBuilder builder(graph);
-  const DexFile::CodeItem* item = reinterpret_cast<const DexFile::CodeItem*>(data);
-  bool graph_built = builder.BuildGraph(*item);
-  ASSERT_TRUE(graph_built);
+class LinearizeTest : public OptimizingUnitTest {
+ protected:
+  template <size_t number_of_blocks>
+  void TestCode(const std::vector<uint16_t>& data,
+                const uint32_t (&expected_order)[number_of_blocks]);
+};
 
-  graph->TryBuildingSsa();
-
-  std::unique_ptr<const X86InstructionSetFeatures> features_x86(
-      X86InstructionSetFeatures::FromCppDefines());
-  x86::CodeGeneratorX86 codegen(graph, *features_x86.get(), CompilerOptions());
-  SsaLivenessAnalysis liveness(graph, &codegen);
+template <size_t number_of_blocks>
+void LinearizeTest::TestCode(const std::vector<uint16_t>& data,
+                             const uint32_t (&expected_order)[number_of_blocks]) {
+  HGraph* graph = CreateCFG(data);
+  std::unique_ptr<CodeGenerator> codegen = CodeGenerator::Create(graph, *compiler_options_);
+  SsaLivenessAnalysis liveness(graph, codegen.get(), GetScopedAllocator());
   liveness.Analyze();
 
-  ASSERT_EQ(graph->GetLinearOrder().Size(), number_of_blocks);
+  ASSERT_EQ(graph->GetLinearOrder().size(), number_of_blocks);
   for (size_t i = 0; i < number_of_blocks; ++i) {
-    ASSERT_EQ(graph->GetLinearOrder().Get(i)->GetBlockId(), expected_order[i]);
+    ASSERT_EQ(graph->GetLinearOrder()[i]->GetBlockId(), expected_order[i]);
   }
 }
 
-TEST(LinearizeTest, CFG1) {
+TEST_F(LinearizeTest, CFG1) {
   // Structure of this graph (+ are back edges)
   //            Block0
   //              |
@@ -73,18 +65,18 @@ TEST(LinearizeTest, CFG1) {
   //               + /   \  +
   //           Block4   Block8
 
-  const uint16_t data[] = ONE_REGISTER_CODE_ITEM(
+  const std::vector<uint16_t> data = ONE_REGISTER_CODE_ITEM(
     Instruction::CONST_4 | 0 | 0,
     Instruction::IF_EQ, 5,
     Instruction::IF_EQ, 0xFFFE,
     Instruction::GOTO | 0xFE00,
     Instruction::RETURN_VOID);
 
-  const int blocks[] = {0, 1, 2, 7, 3, 4, 8, 5, 6};
-  TestCode(data, blocks, 9);
+  const uint32_t blocks[] = {0, 1, 2, 7, 3, 4, 8, 5, 6};
+  TestCode(data, blocks);
 }
 
-TEST(LinearizeTest, CFG2) {
+TEST_F(LinearizeTest, CFG2) {
   // Structure of this graph (+ are back edges)
   //            Block0
   //              |
@@ -98,18 +90,18 @@ TEST(LinearizeTest, CFG2) {
   //               + /   \  +
   //           Block5   Block8
 
-  const uint16_t data[] = ONE_REGISTER_CODE_ITEM(
+  const std::vector<uint16_t> data = ONE_REGISTER_CODE_ITEM(
     Instruction::CONST_4 | 0 | 0,
     Instruction::IF_EQ, 3,
     Instruction::RETURN_VOID,
     Instruction::IF_EQ, 0xFFFD,
     Instruction::GOTO | 0xFE00);
 
-  const int blocks[] = {0, 1, 2, 7, 4, 5, 8, 3, 6};
-  TestCode(data, blocks, 9);
+  const uint32_t blocks[] = {0, 1, 2, 7, 4, 5, 8, 3, 6};
+  TestCode(data, blocks);
 }
 
-TEST(LinearizeTest, CFG3) {
+TEST_F(LinearizeTest, CFG3) {
   // Structure of this graph (+ are back edges)
   //            Block0
   //              |
@@ -124,7 +116,7 @@ TEST(LinearizeTest, CFG3) {
   //           Block6  + Block9
   //             |     +
   //           Block4 ++
-  const uint16_t data[] = ONE_REGISTER_CODE_ITEM(
+  const std::vector<uint16_t> data = ONE_REGISTER_CODE_ITEM(
     Instruction::CONST_4 | 0 | 0,
     Instruction::IF_EQ, 4,
     Instruction::RETURN_VOID,
@@ -132,11 +124,11 @@ TEST(LinearizeTest, CFG3) {
     Instruction::IF_EQ, 0xFFFC,
     Instruction::GOTO | 0xFD00);
 
-  const int blocks[] = {0, 1, 2, 8, 5, 6, 4, 9, 3, 7};
-  TestCode(data, blocks, 10);
+  const uint32_t blocks[] = {0, 1, 2, 8, 5, 6, 4, 9, 3, 7};
+  TestCode(data, blocks);
 }
 
-TEST(LinearizeTest, CFG4) {
+TEST_F(LinearizeTest, CFG4) {
   /* Structure of this graph (+ are back edges)
   //            Block0
   //              |
@@ -154,7 +146,7 @@ TEST(LinearizeTest, CFG4) {
   //                  + /    \   +
   //                Block5  Block11
   */
-  const uint16_t data[] = ONE_REGISTER_CODE_ITEM(
+  const std::vector<uint16_t> data = ONE_REGISTER_CODE_ITEM(
     Instruction::CONST_4 | 0 | 0,
     Instruction::IF_EQ, 7,
     Instruction::IF_EQ, 0xFFFE,
@@ -162,11 +154,11 @@ TEST(LinearizeTest, CFG4) {
     Instruction::GOTO | 0xFE00,
     Instruction::RETURN_VOID);
 
-  const int blocks[] = {0, 1, 2, 8, 3, 10, 4, 5, 11, 9, 6, 7};
-  TestCode(data, blocks, 12);
+  const uint32_t blocks[] = {0, 1, 2, 8, 3, 10, 4, 5, 11, 9, 6, 7};
+  TestCode(data, blocks);
 }
 
-TEST(LinearizeTest, CFG5) {
+TEST_F(LinearizeTest, CFG5) {
   /* Structure of this graph (+ are back edges)
   //            Block0
   //              |
@@ -184,7 +176,7 @@ TEST(LinearizeTest, CFG5) {
   //                   +/    \   +
   //                Block6  Block11
   */
-  const uint16_t data[] = ONE_REGISTER_CODE_ITEM(
+  const std::vector<uint16_t> data = ONE_REGISTER_CODE_ITEM(
     Instruction::CONST_4 | 0 | 0,
     Instruction::IF_EQ, 3,
     Instruction::RETURN_VOID,
@@ -192,11 +184,11 @@ TEST(LinearizeTest, CFG5) {
     Instruction::IF_EQ, 0xFFFE,
     Instruction::GOTO | 0xFE00);
 
-  const int blocks[] = {0, 1, 2, 8, 4, 10, 5, 6, 11, 9, 3, 7};
-  TestCode(data, blocks, 12);
+  const uint32_t blocks[] = {0, 1, 2, 8, 4, 10, 5, 6, 11, 9, 3, 7};
+  TestCode(data, blocks);
 }
 
-TEST(LinearizeTest, CFG6) {
+TEST_F(LinearizeTest, CFG6) {
   //            Block0
   //              |
   //            Block1
@@ -210,7 +202,7 @@ TEST(LinearizeTest, CFG6) {
   //       Block5 <- Block9 Block6  +
   //         |
   //       Block7
-  const uint16_t data[] = ONE_REGISTER_CODE_ITEM(
+  const std::vector<uint16_t> data = ONE_REGISTER_CODE_ITEM(
     Instruction::CONST_4 | 0 | 0,
     Instruction::GOTO | 0x0100,
     Instruction::IF_EQ, 0x0004,
@@ -218,11 +210,11 @@ TEST(LinearizeTest, CFG6) {
     Instruction::RETURN_VOID,
     Instruction::GOTO | 0xFA00);
 
-  const int blocks[] = {0, 1, 2, 3, 4, 6, 9, 8, 5, 7};
-  TestCode(data, blocks, arraysize(blocks));
+  const uint32_t blocks[] = {0, 1, 2, 3, 4, 6, 9, 8, 5, 7};
+  TestCode(data, blocks);
 }
 
-TEST(LinearizeTest, CFG7) {
+TEST_F(LinearizeTest, CFG7) {
   // Structure of this graph (+ are back edges)
   //            Block0
   //              |
@@ -238,7 +230,7 @@ TEST(LinearizeTest, CFG7) {
   //     |
   //   Block7
   //
-  const uint16_t data[] = ONE_REGISTER_CODE_ITEM(
+  const std::vector<uint16_t> data = ONE_REGISTER_CODE_ITEM(
     Instruction::CONST_4 | 0 | 0,
     Instruction::GOTO | 0x0100,
     Instruction::IF_EQ, 0x0005,
@@ -246,8 +238,8 @@ TEST(LinearizeTest, CFG7) {
     Instruction::RETURN_VOID,
     Instruction::GOTO | 0xFA00);
 
-  const int blocks[] = {0, 1, 2, 3, 4, 9, 8, 6, 5, 7};
-  TestCode(data, blocks, arraysize(blocks));
+  const uint32_t blocks[] = {0, 1, 2, 3, 4, 9, 8, 6, 5, 7};
+  TestCode(data, blocks);
 }
 
 }  // namespace art

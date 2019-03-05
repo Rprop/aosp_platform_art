@@ -27,18 +27,27 @@
 
 #include <sstream>
 
+#include <android-base/stringprintf.h>
+
+#if defined(ART_TARGET_ANDROID)
+#include <tombstoned/tombstoned.h>
+#endif
+
 #include "arch/instruction_set.h"
+#include "base/file_utils.h"
+#include "base/logging.h"  // For GetCmdLine.
+#include "base/os.h"
 #include "base/time_utils.h"
 #include "base/unix_file/fd_file.h"
+#include "base/utils.h"
 #include "class_linker.h"
 #include "gc/heap.h"
-#include "os.h"
+#include "jit/profile_saver.h"
 #include "runtime.h"
-#include "scoped_thread_state_change.h"
+#include "scoped_thread_state_change-inl.h"
 #include "signal_set.h"
 #include "thread.h"
 #include "thread_list.h"
-#include "utils.h"
 
 namespace art {
 
@@ -64,9 +73,8 @@ static void DumpCmdLine(std::ostream& os) {
 #endif
 }
 
-SignalCatcher::SignalCatcher(const std::string& stack_trace_file)
-    : stack_trace_file_(stack_trace_file),
-      lock_("SignalCatcher lock"),
+SignalCatcher::SignalCatcher()
+    : lock_("SignalCatcher lock"),
       cond_("SignalCatcher::cond_", lock_),
       thread_(nullptr) {
   SetHaltFlag(false);
@@ -100,29 +108,35 @@ bool SignalCatcher::ShouldHalt() {
 }
 
 void SignalCatcher::Output(const std::string& s) {
-  if (stack_trace_file_.empty()) {
+#if defined(ART_TARGET_ANDROID)
+  android::base::unique_fd tombstone_fd;
+  android::base::unique_fd output_fd;
+  if (!tombstoned_connect(getpid(), &tombstone_fd, &output_fd, kDebuggerdJavaBacktrace)) {
     LOG(INFO) << s;
     return;
   }
 
   ScopedThreadStateChange tsc(Thread::Current(), kWaitingForSignalCatcherOutput);
-  int fd = open(stack_trace_file_.c_str(), O_APPEND | O_CREAT | O_WRONLY, 0666);
-  if (fd == -1) {
-    PLOG(ERROR) << "Unable to open stack trace file '" << stack_trace_file_ << "'";
-    return;
-  }
-  std::unique_ptr<File> file(new File(fd, stack_trace_file_, true));
+
+  std::unique_ptr<File> file(new File(output_fd.release(), true /* check_usage */));
   bool success = file->WriteFully(s.data(), s.size());
   if (success) {
     success = file->FlushCloseOrErase() == 0;
   } else {
     file->Erase();
   }
+
   if (success) {
-    LOG(INFO) << "Wrote stack traces to '" << stack_trace_file_ << "'";
+    LOG(INFO) << "Wrote stack traces to tombstoned";
   } else {
-    PLOG(ERROR) << "Failed to write stack traces to '" << stack_trace_file_ << "'";
+    PLOG(ERROR) << "Failed to write stack traces to tombstoned";
   }
+  if (!tombstoned_notify_completion(tombstone_fd)) {
+    PLOG(WARNING) << "Unable to notify tombstoned of dump completion";
+  }
+#else
+  LOG(INFO) << s;
+#endif
 }
 
 void SignalCatcher::HandleSigQuit() {
@@ -154,8 +168,9 @@ void SignalCatcher::HandleSigQuit() {
 }
 
 void SignalCatcher::HandleSigUsr1() {
-  LOG(INFO) << "SIGUSR1 forcing GC (no HPROF)";
-  Runtime::Current()->GetHeap()->CollectGarbage(false);
+  LOG(INFO) << "SIGUSR1 forcing GC (no HPROF) and profile save";
+  Runtime::Current()->GetHeap()->CollectGarbage(/* clear_soft_references */ false);
+  ProfileSaver::ForceProcessProfiles();
 }
 
 int SignalCatcher::WaitForSignal(Thread* self, SignalSet& signals) {
@@ -172,7 +187,7 @@ int SignalCatcher::WaitForSignal(Thread* self, SignalSet& signals) {
     LOG(INFO) << *self << ": reacting to signal " << signal_number;
 
     // If anyone's holding locks (which might prevent us from getting back into state Runnable), say so...
-    Runtime::Current()->DumpLockHolders(LOG(INFO));
+    Runtime::Current()->DumpLockHolders(LOG_STREAM(INFO));
   }
 
   return signal_number;

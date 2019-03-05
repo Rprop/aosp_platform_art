@@ -17,22 +17,31 @@
 #ifndef ART_RUNTIME_GC_ACCOUNTING_ATOMIC_STACK_H_
 #define ART_RUNTIME_GC_ACCOUNTING_ATOMIC_STACK_H_
 
+#include <sys/mman.h>  // For the PROT_* and MAP_* constants.
+
 #include <algorithm>
 #include <memory>
 #include <string>
 
-#include "atomic.h"
-#include "base/bit_utils.h"
-#include "base/logging.h"
+#include <android-base/logging.h>
+
+#include "base/atomic.h"
 #include "base/macros.h"
-#include "mem_map.h"
-#include "stack.h"
+#include "base/mem_map.h"
+#include "stack_reference.h"
+
+// This implements a double-ended queue (deque) with various flavors of PushBack operations,
+// as well as PopBack and PopFront operations. We expect that all calls are performed
+// by a single thread (normally the GC). There is one exception, which accounts for the
+// name:
+// - Multiple calls to AtomicPushBack*() and AtomicBumpBack() may be made concurrently,
+// provided no other calls are made at the same time.
 
 namespace art {
 namespace gc {
 namespace accounting {
 
-// Internal representation is StackReference<T>, so this only works with mirror::Object or it's
+// Internal representation is StackReference<T>, so this only works with mirror::Object or its
 // subclasses.
 template <typename T>
 class AtomicStack {
@@ -65,8 +74,8 @@ class AtomicStack {
   void Reset() {
     DCHECK(mem_map_.get() != nullptr);
     DCHECK(begin_ != nullptr);
-    front_index_.StoreRelaxed(0);
-    back_index_.StoreRelaxed(0);
+    front_index_.store(0, std::memory_order_relaxed);
+    back_index_.store(0, std::memory_order_relaxed);
     debug_is_sorted_ = true;
     mem_map_->MadviseDontNeedAndZero();
   }
@@ -74,12 +83,12 @@ class AtomicStack {
   // Beware: Mixing atomic pushes and atomic pops will cause ABA problem.
 
   // Returns false if we overflowed the stack.
-  bool AtomicPushBackIgnoreGrowthLimit(T* value) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  bool AtomicPushBackIgnoreGrowthLimit(T* value) REQUIRES_SHARED(Locks::mutator_lock_) {
     return AtomicPushBackInternal(value, capacity_);
   }
 
   // Returns false if we overflowed the stack.
-  bool AtomicPushBack(T* value) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  bool AtomicPushBack(T* value) REQUIRES_SHARED(Locks::mutator_lock_) {
     return AtomicPushBackInternal(value, growth_limit_);
   }
 
@@ -87,20 +96,20 @@ class AtomicStack {
   // slots. Returns false if we overflowed the stack.
   bool AtomicBumpBack(size_t num_slots, StackReference<T>** start_address,
                       StackReference<T>** end_address)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     if (kIsDebugBuild) {
       debug_is_sorted_ = false;
     }
     int32_t index;
     int32_t new_index;
     do {
-      index = back_index_.LoadRelaxed();
+      index = back_index_.load(std::memory_order_relaxed);
       new_index = index + num_slots;
       if (UNLIKELY(static_cast<size_t>(new_index) >= growth_limit_)) {
         // Stack overflow.
         return false;
       }
-    } while (!back_index_.CompareExchangeWeakRelaxed(index, new_index));
+    } while (!back_index_.CompareAndSetWeakRelaxed(index, new_index));
     *start_address = begin_ + index;
     *end_address = begin_ + new_index;
     if (kIsDebugBuild) {
@@ -113,7 +122,7 @@ class AtomicStack {
     return true;
   }
 
-  void AssertAllZero() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  void AssertAllZero() REQUIRES_SHARED(Locks::mutator_lock_) {
     if (kIsDebugBuild) {
       for (size_t i = 0; i < capacity_; ++i) {
         DCHECK_EQ(begin_[i].AsMirrorPtr(), static_cast<T*>(nullptr)) << "i=" << i;
@@ -121,51 +130,58 @@ class AtomicStack {
     }
   }
 
-  void PushBack(T* value) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  void PushBack(T* value) REQUIRES_SHARED(Locks::mutator_lock_) {
     if (kIsDebugBuild) {
       debug_is_sorted_ = false;
     }
-    const int32_t index = back_index_.LoadRelaxed();
+    const int32_t index = back_index_.load(std::memory_order_relaxed);
     DCHECK_LT(static_cast<size_t>(index), growth_limit_);
-    back_index_.StoreRelaxed(index + 1);
+    back_index_.store(index + 1, std::memory_order_relaxed);
     begin_[index].Assign(value);
   }
 
-  T* PopBack() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    DCHECK_GT(back_index_.LoadRelaxed(), front_index_.LoadRelaxed());
+  T* PopBack() REQUIRES_SHARED(Locks::mutator_lock_) {
+    DCHECK_GT(back_index_.load(std::memory_order_relaxed),
+              front_index_.load(std::memory_order_relaxed));
     // Decrement the back index non atomically.
-    back_index_.StoreRelaxed(back_index_.LoadRelaxed() - 1);
-    return begin_[back_index_.LoadRelaxed()].AsMirrorPtr();
+    back_index_.store(back_index_.load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
+    return begin_[back_index_.load(std::memory_order_relaxed)].AsMirrorPtr();
   }
 
   // Take an item from the front of the stack.
   T PopFront() {
-    int32_t index = front_index_.LoadRelaxed();
-    DCHECK_LT(index, back_index_.LoadRelaxed());
-    front_index_.StoreRelaxed(index + 1);
+    int32_t index = front_index_.load(std::memory_order_relaxed);
+    DCHECK_LT(index, back_index_.load(std::memory_order_relaxed));
+    front_index_.store(index + 1, std::memory_order_relaxed);
     return begin_[index];
   }
 
   // Pop a number of elements.
   void PopBackCount(int32_t n) {
     DCHECK_GE(Size(), static_cast<size_t>(n));
-    back_index_.FetchAndSubSequentiallyConsistent(n);
+    back_index_.store(back_index_.load(std::memory_order_relaxed) - n, std::memory_order_relaxed);
   }
 
   bool IsEmpty() const {
     return Size() == 0;
   }
 
+  bool IsFull() const {
+    return Size() == growth_limit_;
+  }
+
   size_t Size() const {
-    DCHECK_LE(front_index_.LoadRelaxed(), back_index_.LoadRelaxed());
-    return back_index_.LoadRelaxed() - front_index_.LoadRelaxed();
+    DCHECK_LE(front_index_.load(std::memory_order_relaxed),
+              back_index_.load(std::memory_order_relaxed));
+    return
+        back_index_.load(std::memory_order_relaxed) - front_index_.load(std::memory_order_relaxed);
   }
 
   StackReference<T>* Begin() const {
-    return begin_ + front_index_.LoadRelaxed();
+    return begin_ + front_index_.load(std::memory_order_relaxed);
   }
   StackReference<T>* End() const {
-    return begin_ + back_index_.LoadRelaxed();
+    return begin_ + back_index_.load(std::memory_order_relaxed);
   }
 
   size_t Capacity() const {
@@ -180,22 +196,22 @@ class AtomicStack {
   }
 
   void Sort() {
-    int32_t start_back_index = back_index_.LoadRelaxed();
-    int32_t start_front_index = front_index_.LoadRelaxed();
+    int32_t start_back_index = back_index_.load(std::memory_order_relaxed);
+    int32_t start_front_index = front_index_.load(std::memory_order_relaxed);
     std::sort(Begin(), End(), ObjectComparator());
-    CHECK_EQ(start_back_index, back_index_.LoadRelaxed());
-    CHECK_EQ(start_front_index, front_index_.LoadRelaxed());
+    CHECK_EQ(start_back_index, back_index_.load(std::memory_order_relaxed));
+    CHECK_EQ(start_front_index, front_index_.load(std::memory_order_relaxed));
     if (kIsDebugBuild) {
       debug_is_sorted_ = true;
     }
   }
 
-  bool ContainsSorted(const T* value) const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  bool ContainsSorted(const T* value) const REQUIRES_SHARED(Locks::mutator_lock_) {
     DCHECK(debug_is_sorted_);
     return std::binary_search(Begin(), End(), value, ObjectComparator());
   }
 
-  bool Contains(const T* value) const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  bool Contains(const T* value) const REQUIRES_SHARED(Locks::mutator_lock_) {
     for (auto cur = Begin(), end = End(); cur != end; ++cur) {
       if (cur->AsMirrorPtr() == value) {
         return true;
@@ -217,18 +233,18 @@ class AtomicStack {
 
   // Returns false if we overflowed the stack.
   bool AtomicPushBackInternal(T* value, size_t limit) ALWAYS_INLINE
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     if (kIsDebugBuild) {
       debug_is_sorted_ = false;
     }
     int32_t index;
     do {
-      index = back_index_.LoadRelaxed();
+      index = back_index_.load(std::memory_order_relaxed);
       if (UNLIKELY(static_cast<size_t>(index) >= limit)) {
         // Stack overflow.
         return false;
       }
-    } while (!back_index_.CompareExchangeWeakRelaxed(index, index + 1));
+    } while (!back_index_.CompareAndSetWeakRelaxed(index, index + 1));
     begin_[index].Assign(value);
     return true;
   }

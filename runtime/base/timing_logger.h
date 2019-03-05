@@ -20,6 +20,7 @@
 #include "base/histogram.h"
 #include "base/macros.h"
 #include "base/mutex.h"
+#include "base/time_utils.h"
 
 #include <set>
 #include <string>
@@ -33,17 +34,17 @@ class CumulativeLogger {
   explicit CumulativeLogger(const std::string& name);
   ~CumulativeLogger();
   void Start();
-  void End() LOCKS_EXCLUDED(lock_);
-  void Reset() LOCKS_EXCLUDED(lock_);
-  void Dump(std::ostream& os) const LOCKS_EXCLUDED(lock_);
+  void End() REQUIRES(!lock_);
+  void Reset() REQUIRES(!lock_);
+  void Dump(std::ostream& os) const REQUIRES(!lock_);
   uint64_t GetTotalNs() const {
     return GetTotalTime() * kAdjust;
   }
   // Allow the name to be modified, particularly when the cumulative logger is a field within a
   // parent class that is unable to determine the "name" of a sub-class.
-  void SetName(const std::string& name) LOCKS_EXCLUDED(lock_);
-  void AddLogger(const TimingLogger& logger) LOCKS_EXCLUDED(lock_);
-  size_t GetIterations() const;
+  void SetName(const std::string& name) REQUIRES(!lock_);
+  void AddLogger(const TimingLogger& logger) REQUIRES(!lock_);
+  size_t GetIterations() const REQUIRES(!lock_);
 
  private:
   class HistogramComparator {
@@ -58,8 +59,8 @@ class CumulativeLogger {
   static constexpr size_t kInitialBucketSize = 50;  // 50 microseconds.
 
   void AddPair(const std::string &label, uint64_t delta_time)
-      EXCLUSIVE_LOCKS_REQUIRED(lock_);
-  void DumpHistogram(std::ostream &os) const EXCLUSIVE_LOCKS_REQUIRED(lock_);
+      REQUIRES(lock_);
+  void DumpHistogram(std::ostream &os) const REQUIRES(lock_);
   uint64_t GetTotalTime() const {
     return total_time_;
   }
@@ -79,9 +80,23 @@ class TimingLogger {
  public:
   static constexpr size_t kIndexNotFound = static_cast<size_t>(-1);
 
+  // Kind of timing we are going to do. We collect time at the nano second.
+  enum class TimingKind {
+    kMonotonic,
+    kThreadCpu,
+  };
+
   class Timing {
    public:
-    Timing(uint64_t time, const char* name) : time_(time), name_(name) {
+    Timing(TimingKind kind, const char* name) : name_(name) {
+       switch (kind) {
+        case TimingKind::kMonotonic:
+          time_ = NanoTime();
+          break;
+        case TimingKind::kThreadCpu:
+          time_ = ThreadCpuNanoTime();
+          break;
+       }
     }
     bool IsStartTiming() const {
       return !IsEndTiming();
@@ -131,7 +146,10 @@ class TimingLogger {
     friend class TimingLogger;
   };
 
-  explicit TimingLogger(const char* name, bool precise, bool verbose);
+  TimingLogger(const char* name,
+               bool precise,
+               bool verbose,
+               TimingKind kind = TimingKind::kMonotonic);
   ~TimingLogger();
   // Verify that all open timings have related closed timings.
   void Verify();
@@ -156,7 +174,7 @@ class TimingLogger {
   // starts and ends.
   class ScopedTiming {
    public:
-    explicit ScopedTiming(const char* label, TimingLogger* logger) : logger_(logger) {
+    ScopedTiming(const char* label, TimingLogger* logger) : logger_(logger) {
       logger_->StartTiming(label);
     }
     ~ScopedTiming() {
@@ -187,6 +205,8 @@ class TimingLogger {
   const bool precise_;
   // Verbose logging.
   const bool verbose_;
+  // The kind of timing we want.
+  const TimingKind kind_;
   // Timing points that are either start or end points. For each starting point ret[i] = location
   // of end split associated with i. If it is and end split ret[i] = i.
   std::vector<Timing> timings_;

@@ -19,18 +19,20 @@
 
 #include "array.h"
 
+#include <android-base/logging.h>
+#include <android-base/stringprintf.h>
+
 #include "base/bit_utils.h"
 #include "base/casts.h"
-#include "base/logging.h"
-#include "base/stringprintf.h"
-#include "class-inl.h"
+#include "class.h"
 #include "gc/heap-inl.h"
-#include "thread.h"
+#include "obj_ptr-inl.h"
+#include "thread-current-inl.h"
 
 namespace art {
 namespace mirror {
 
-inline uint32_t Array::ClassSize(size_t pointer_size) {
+inline uint32_t Array::ClassSize(PointerSize pointer_size) {
   uint32_t vtable_entries = Object::kVTableLength;
   return Class::ComputeClassSize(true, vtable_entries, 0, 0, 0, 0, 0, pointer_size);
 }
@@ -100,11 +102,10 @@ class SetLengthVisitor {
   explicit SetLengthVisitor(int32_t length) : length_(length) {
   }
 
-  void operator()(Object* obj, size_t usable_size) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    UNUSED(usable_size);
+  void operator()(ObjPtr<Object> obj, size_t usable_size ATTRIBUTE_UNUSED) const
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     // Avoid AsArray as object is not yet in live bitmap or allocation stack.
-    Array* array = down_cast<Array*>(obj);
+    ObjPtr<Array> array = ObjPtr<Array>::DownCast(obj);
     // DCHECK(array->IsArrayInstance());
     array->SetLength(length_);
   }
@@ -125,10 +126,10 @@ class SetLengthToUsableSizeVisitor {
       component_size_shift_(component_size_shift) {
   }
 
-  void operator()(Object* obj, size_t usable_size) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  void operator()(ObjPtr<Object> obj, size_t usable_size) const
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     // Avoid AsArray as object is not yet in live bitmap or allocation stack.
-    Array* array = down_cast<Array*>(obj);
+    ObjPtr<Array> array = ObjPtr<Array>::DownCast(obj);
     // DCHECK(array->IsArrayInstance());
     int32_t length = (usable_size - header_size_) >> component_size_shift_;
     DCHECK_GE(length, minimum_length_);
@@ -150,8 +151,11 @@ class SetLengthToUsableSizeVisitor {
 };
 
 template <bool kIsInstrumented, bool kFillUsable>
-inline Array* Array::Alloc(Thread* self, Class* array_class, int32_t component_count,
-                           size_t component_size_shift, gc::AllocatorType allocator_type) {
+inline ObjPtr<Array> Array::Alloc(Thread* self,
+                                  ObjPtr<Class> array_class,
+                                  int32_t component_count,
+                                  size_t component_size_shift,
+                                  gc::AllocatorType allocator_type) {
   DCHECK(allocator_type != gc::kAllocatorTypeLOS);
   DCHECK(array_class != nullptr);
   DCHECK(array_class->IsArrayClass());
@@ -164,26 +168,26 @@ inline Array* Array::Alloc(Thread* self, Class* array_class, int32_t component_c
 #else
   // 32-bit.
   if (UNLIKELY(size == 0)) {
-    self->ThrowOutOfMemoryError(StringPrintf("%s of length %d would overflow",
-                                             PrettyDescriptor(array_class).c_str(),
-                                             component_count).c_str());
+    self->ThrowOutOfMemoryError(android::base::StringPrintf("%s of length %d would overflow",
+                                                            array_class->PrettyDescriptor().c_str(),
+                                                            component_count).c_str());
     return nullptr;
   }
 #endif
   gc::Heap* heap = Runtime::Current()->GetHeap();
-  Array* result;
+  ObjPtr<Array> result;
   if (!kFillUsable) {
     SetLengthVisitor visitor(component_count);
-    result = down_cast<Array*>(
+    result = ObjPtr<Array>::DownCast(MakeObjPtr(
         heap->AllocObjectWithAllocator<kIsInstrumented, true>(self, array_class, size,
-                                                              allocator_type, visitor));
+                                                              allocator_type, visitor)));
   } else {
     SetLengthToUsableSizeVisitor visitor(component_count,
                                          DataOffset(1U << component_size_shift).SizeValue(),
                                          component_size_shift);
-    result = down_cast<Array*>(
+    result = ObjPtr<Array>::DownCast(MakeObjPtr(
         heap->AllocObjectWithAllocator<kIsInstrumented, true>(self, array_class, size,
-                                                              allocator_type, visitor));
+                                                              allocator_type, visitor)));
   }
   if (kIsDebugBuild && result != nullptr && Runtime::Current()->IsStarted()) {
     array_class = result->GetClass();  // In case the array class moved.
@@ -197,17 +201,17 @@ inline Array* Array::Alloc(Thread* self, Class* array_class, int32_t component_c
   return result;
 }
 
-template<class T>
-inline void PrimitiveArray<T>::VisitRoots(RootVisitor* visitor) {
-  array_class_.VisitRootIfNonNull(visitor, RootInfo(kRootStickyClass));
-}
-
 template<typename T>
-inline PrimitiveArray<T>* PrimitiveArray<T>::Alloc(Thread* self, size_t length) {
-  Array* raw_array = Array::Alloc<true>(self, GetArrayClass(), length,
-                                        ComponentSizeShiftWidth(sizeof(T)),
-                                        Runtime::Current()->GetHeap()->GetCurrentAllocator());
-  return down_cast<PrimitiveArray<T>*>(raw_array);
+inline ObjPtr<PrimitiveArray<T>> PrimitiveArray<T>::AllocateAndFill(Thread* self,
+                                                                   const T* data,
+                                                                   size_t length) {
+  StackHandleScope<1> hs(self);
+  Handle<PrimitiveArray<T>> arr(hs.NewHandle(PrimitiveArray<T>::Alloc(self, length)));
+  if (!arr.IsNull()) {
+    // Copy it in. Just skip if it's null
+    memcpy(arr->GetData(), data, sizeof(T) * length);
+  }
+  return arr.Get();
 }
 
 template<typename T>
@@ -239,7 +243,7 @@ inline void PrimitiveArray<T>::Set(int32_t i, T value) {
 }
 
 template<typename T>
-template<bool kTransactionActive, bool kCheckTransaction>
+template<bool kTransactionActive, bool kCheckTransaction, VerifyObjectFlags kVerifyFlags>
 inline void PrimitiveArray<T>::SetWithoutChecks(int32_t i, T value) {
   if (kCheckTransaction) {
     DCHECK_EQ(kTransactionActive, Runtime::Current()->IsActiveTransaction());
@@ -247,7 +251,7 @@ inline void PrimitiveArray<T>::SetWithoutChecks(int32_t i, T value) {
   if (kTransactionActive) {
     Runtime::Current()->RecordWriteArray(this, i, GetWithoutChecks(i));
   }
-  DCHECK(CheckIsValidIndex(i));
+  DCHECK(CheckIsValidIndex<kVerifyFlags>(i));
   GetData()[i] = value;
 }
 // Backward copy where elements are of aligned appropriately for T. Count is in T sized units.
@@ -275,7 +279,9 @@ static inline void ArrayForwardCopy(T* d, const T* s, int32_t count) {
 }
 
 template<class T>
-inline void PrimitiveArray<T>::Memmove(int32_t dst_pos, PrimitiveArray<T>* src, int32_t src_pos,
+inline void PrimitiveArray<T>::Memmove(int32_t dst_pos,
+                                       ObjPtr<PrimitiveArray<T>> src,
+                                       int32_t src_pos,
                                        int32_t count) {
   if (UNLIKELY(count == 0)) {
     return;
@@ -335,7 +341,9 @@ inline void PrimitiveArray<T>::Memmove(int32_t dst_pos, PrimitiveArray<T>* src, 
 }
 
 template<class T>
-inline void PrimitiveArray<T>::Memcpy(int32_t dst_pos, PrimitiveArray<T>* src, int32_t src_pos,
+inline void PrimitiveArray<T>::Memcpy(int32_t dst_pos,
+                                      ObjPtr<PrimitiveArray<T>> src,
+                                      int32_t src_pos,
                                       int32_t count) {
   if (UNLIKELY(count == 0)) {
     return;
@@ -371,27 +379,70 @@ inline void PrimitiveArray<T>::Memcpy(int32_t dst_pos, PrimitiveArray<T>* src, i
   }
 }
 
-template<typename T>
-inline T PointerArray::GetElementPtrSize(uint32_t idx, size_t ptr_size) {
+template<typename T, VerifyObjectFlags kVerifyFlags, ReadBarrierOption kReadBarrierOption>
+inline T PointerArray::GetElementPtrSize(uint32_t idx, PointerSize ptr_size) {
   // C style casts here since we sometimes have T be a pointer, or sometimes an integer
   // (for stack traces).
-  if (ptr_size == 8) {
-    return (T)static_cast<uintptr_t>(AsLongArray()->GetWithoutChecks(idx));
+  if (ptr_size == PointerSize::k64) {
+    return (T)static_cast<uintptr_t>(
+        AsLongArray<kVerifyFlags, kReadBarrierOption>()->GetWithoutChecks(idx));
   }
-  DCHECK_EQ(ptr_size, 4u);
-  return (T)static_cast<uintptr_t>(AsIntArray()->GetWithoutChecks(idx));
+  return (T)static_cast<uintptr_t>(static_cast<uint32_t>(
+      AsIntArray<kVerifyFlags, kReadBarrierOption>()->GetWithoutChecks(idx)));
+}
+
+template<bool kTransactionActive, bool kUnchecked>
+inline void PointerArray::SetElementPtrSize(uint32_t idx, uint64_t element, PointerSize ptr_size) {
+  if (ptr_size == PointerSize::k64) {
+    (kUnchecked ? down_cast<LongArray*>(static_cast<Object*>(this)) : AsLongArray())->
+        SetWithoutChecks<kTransactionActive>(idx, element);
+  } else {
+    DCHECK_LE(element, static_cast<uint64_t>(0xFFFFFFFFu));
+    (kUnchecked ? down_cast<IntArray*>(static_cast<Object*>(this)) : AsIntArray())
+        ->SetWithoutChecks<kTransactionActive>(idx, static_cast<uint32_t>(element));
+  }
 }
 
 template<bool kTransactionActive, bool kUnchecked, typename T>
-inline void PointerArray::SetElementPtrSize(uint32_t idx, T element, size_t ptr_size) {
-  if (ptr_size == 8) {
-    (kUnchecked ? down_cast<LongArray*>(static_cast<Object*>(this)) : AsLongArray())->
-        SetWithoutChecks<kTransactionActive>(idx, (uint64_t)(element));
+inline void PointerArray::SetElementPtrSize(uint32_t idx, T* element, PointerSize ptr_size) {
+  SetElementPtrSize<kTransactionActive, kUnchecked>(idx,
+                                                    reinterpret_cast<uintptr_t>(element),
+                                                    ptr_size);
+}
+
+template <VerifyObjectFlags kVerifyFlags, ReadBarrierOption kReadBarrierOption, typename Visitor>
+inline void PointerArray::Fixup(mirror::PointerArray* dest,
+                                PointerSize pointer_size,
+                                const Visitor& visitor) {
+  for (size_t i = 0, count = GetLength(); i < count; ++i) {
+    void* ptr = GetElementPtrSize<void*, kVerifyFlags, kReadBarrierOption>(i, pointer_size);
+    void* new_ptr = visitor(ptr);
+    if (ptr != new_ptr) {
+      dest->SetElementPtrSize<false, true>(i, new_ptr, pointer_size);
+    }
+  }
+}
+
+template<bool kUnchecked>
+void PointerArray::Memcpy(int32_t dst_pos,
+                          ObjPtr<PointerArray> src,
+                          int32_t src_pos,
+                          int32_t count,
+                          PointerSize ptr_size) {
+  DCHECK(!Runtime::Current()->IsActiveTransaction());
+  DCHECK(!src.IsNull());
+  if (ptr_size == PointerSize::k64) {
+    LongArray* l_this = (kUnchecked ? down_cast<LongArray*>(static_cast<Object*>(this))
+                                    : AsLongArray());
+    LongArray* l_src = (kUnchecked ? down_cast<LongArray*>(static_cast<Object*>(src.Ptr()))
+                                   : src->AsLongArray());
+    l_this->Memcpy(dst_pos, l_src, src_pos, count);
   } else {
-    DCHECK_EQ(ptr_size, 4u);
-    DCHECK_LE((uintptr_t)element, 0xFFFFFFFFu);
-    (kUnchecked ? down_cast<IntArray*>(static_cast<Object*>(this)) : AsIntArray())
-        ->SetWithoutChecks<kTransactionActive>(idx, static_cast<uint32_t>((uintptr_t)element));
+    IntArray* i_this = (kUnchecked ? down_cast<IntArray*>(static_cast<Object*>(this))
+                                   : AsIntArray());
+    IntArray* i_src = (kUnchecked ? down_cast<IntArray*>(static_cast<Object*>(src.Ptr()))
+                                  : src->AsIntArray());
+    i_this->Memcpy(dst_pos, i_src, src_pos, count);
   }
 }
 

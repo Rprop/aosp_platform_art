@@ -16,13 +16,18 @@
 
 #include "java_util_concurrent_atomic_AtomicLong.h"
 
-#include "atomic.h"
-#include "jni_internal.h"
+#include "nativehelper/jni_macros.h"
+
+#include "arch/instruction_set.h"
+#include "base/atomic.h"
+#include "base/quasi_atomic.h"
+#include "jni/jni_internal.h"
+#include "native_util.h"
 
 namespace art {
 
 static jboolean AtomicLong_VMSupportsCS8(JNIEnv*, jclass) {
-  return QuasiAtomic::LongAtomicsUseMutexes() ? JNI_FALSE : JNI_TRUE;
+  return QuasiAtomic::LongAtomicsUseMutexes(kRuntimeISA) ? JNI_FALSE : JNI_TRUE;
 }
 
 static JNINativeMethod gMethods[] = {

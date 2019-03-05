@@ -19,18 +19,22 @@
 
 #include "reflection.h"
 
-#include "base/stringprintf.h"
+#include "android-base/stringprintf.h"
+
+#include "base/utils.h"
 #include "common_throws.h"
-#include "jvalue.h"
+#include "dex/descriptors_names.h"
+#include "dex/primitive.h"
+#include "jvalue-inl.h"
 #include "mirror/object-inl.h"
-#include "primitive.h"
-#include "utils.h"
+#include "obj_ptr-inl.h"
 
 namespace art {
 
-inline bool ConvertPrimitiveValue(bool unbox_for_result,
-                                  Primitive::Type srcType, Primitive::Type dstType,
-                                  const JValue& src, JValue* dst) {
+inline bool ConvertPrimitiveValueNoThrow(Primitive::Type srcType,
+                                         Primitive::Type dstType,
+                                         const JValue& src,
+                                         JValue* dst) {
   DCHECK(srcType != Primitive::kPrimNot && dstType != Primitive::kPrimNot);
   if (LIKELY(srcType == dstType)) {
     dst->SetJ(src.GetJ());
@@ -88,19 +92,32 @@ inline bool ConvertPrimitiveValue(bool unbox_for_result,
   default:
     break;
   }
+  return false;
+}
+
+inline bool ConvertPrimitiveValue(bool unbox_for_result,
+                                  Primitive::Type srcType,
+                                  Primitive::Type dstType,
+                                  const JValue& src,
+                                  JValue* dst) {
+  if (ConvertPrimitiveValueNoThrow(srcType, dstType, src, dst)) {
+    return true;
+  }
+
   if (!unbox_for_result) {
-    ThrowIllegalArgumentException(StringPrintf("Invalid primitive conversion from %s to %s",
-                                               PrettyDescriptor(srcType).c_str(),
-                                               PrettyDescriptor(dstType).c_str()).c_str());
+    ThrowIllegalArgumentException(
+        android::base::StringPrintf("Invalid primitive conversion from %s to %s",
+                                    PrettyDescriptor(srcType).c_str(),
+                                    PrettyDescriptor(dstType).c_str()).c_str());
   } else {
-    ThrowClassCastException(StringPrintf("Couldn't convert result of type %s to %s",
-                                         PrettyDescriptor(srcType).c_str(),
-                                         PrettyDescriptor(dstType).c_str()).c_str());
+    ThrowClassCastException(android::base::StringPrintf("Couldn't convert result of type %s to %s",
+                                                        PrettyDescriptor(srcType).c_str(),
+                                                        PrettyDescriptor(dstType).c_str()).c_str());
   }
   return false;
 }
 
-inline bool VerifyObjectIsClass(mirror::Object* o, mirror::Class* c) {
+inline bool VerifyObjectIsClass(ObjPtr<mirror::Object> o, ObjPtr<mirror::Class> c) {
   if (UNLIKELY(o == nullptr)) {
     ThrowNullPointerException("null receiver");
     return false;

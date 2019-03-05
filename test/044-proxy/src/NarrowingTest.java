@@ -45,9 +45,12 @@ class NarrowingTest {
                        }
                    }
                });
+       Main.registerProxyClassName(proxy.getClass().getCanonicalName());
 
        Method[] methods = proxy.getClass().getDeclaredMethods();
-       System.out.println("Proxy methods: " + Arrays.deepToString(methods));
+       Arrays.sort(methods, new MethodComparator());
+       System.out.println("Proxy methods: " +
+                          Main.replaceProxyClassNamesForOutput(Arrays.deepToString(methods)));
 
        System.out.println("Invoking foo using I2 type: " + proxy.foo());
 

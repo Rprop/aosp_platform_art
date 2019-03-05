@@ -19,26 +19,16 @@
 #include <algorithm>
 #include <vector>
 
-#include "arm/assembler_arm32.h"
-#include "arm/assembler_thumb2.h"
-#include "arm64/assembler_arm64.h"
-#include "mips/assembler_mips.h"
-#include "mips64/assembler_mips64.h"
-#include "x86/assembler_x86.h"
-#include "x86_64/assembler_x86_64.h"
-#include "globals.h"
-#include "memory_region.h"
+#include "base/casts.h"
+#include "base/globals.h"
+#include "base/memory_region.h"
 
 namespace art {
 
-static uint8_t* NewContents(size_t capacity) {
-  return new uint8_t[capacity];
-}
-
-
-AssemblerBuffer::AssemblerBuffer() {
+AssemblerBuffer::AssemblerBuffer(ArenaAllocator* allocator)
+    : allocator_(allocator) {
   static const size_t kInitialBufferCapacity = 4 * KB;
-  contents_ = NewContents(kInitialBufferCapacity);
+  contents_ = allocator_->AllocArray<uint8_t>(kInitialBufferCapacity, kArenaAllocAssembler);
   cursor_ = contents_;
   limit_ = ComputeLimit(contents_, kInitialBufferCapacity);
   fixup_ = nullptr;
@@ -55,7 +45,9 @@ AssemblerBuffer::AssemblerBuffer() {
 
 
 AssemblerBuffer::~AssemblerBuffer() {
-  delete[] contents_;
+  if (allocator_->IsRunningOnMemoryTool()) {
+    allocator_->MakeInaccessible(contents_, Capacity());
+  }
 }
 
 
@@ -80,25 +72,20 @@ void AssemblerBuffer::FinalizeInstructions(const MemoryRegion& instructions) {
 }
 
 
-void AssemblerBuffer::ExtendCapacity() {
+void AssemblerBuffer::ExtendCapacity(size_t min_capacity) {
   size_t old_size = Size();
   size_t old_capacity = Capacity();
+  DCHECK_GT(min_capacity, old_capacity);
   size_t new_capacity = std::min(old_capacity * 2, old_capacity + 1 * MB);
+  new_capacity = std::max(new_capacity, min_capacity);
 
   // Allocate the new data area and copy contents of the old one to it.
-  uint8_t* new_contents = NewContents(new_capacity);
-  memmove(reinterpret_cast<void*>(new_contents),
-          reinterpret_cast<void*>(contents_),
-          old_size);
-
-  // Compute the relocation delta and switch to the new contents area.
-  ptrdiff_t delta = new_contents - contents_;
-  delete[] contents_;
-  contents_ = new_contents;
+  contents_ = reinterpret_cast<uint8_t*>(
+      allocator_->Realloc(contents_, old_capacity, new_capacity, kArenaAllocAssembler));
 
   // Update the cursor and recompute the limit.
-  cursor_ += delta;
-  limit_ = ComputeLimit(new_contents, new_capacity);
+  cursor_ = contents_ + old_size;
+  limit_ = ComputeLimit(contents_, new_capacity);
 
   // Verify internal state.
   CHECK_EQ(Capacity(), new_capacity);
@@ -106,117 +93,13 @@ void AssemblerBuffer::ExtendCapacity() {
 }
 
 void DebugFrameOpCodeWriterForAssembler::ImplicitlyAdvancePC() {
-  this->AdvancePC(assembler_->CodeSize());
-}
-
-Assembler* Assembler::Create(InstructionSet instruction_set) {
-  switch (instruction_set) {
-    case kArm:
-      return new arm::Arm32Assembler();
-    case kThumb2:
-      return new arm::Thumb2Assembler();
-    case kArm64:
-      return new arm64::Arm64Assembler();
-    case kMips:
-      return new mips::MipsAssembler();
-    case kMips64:
-      return new mips64::Mips64Assembler();
-    case kX86:
-      return new x86::X86Assembler();
-    case kX86_64:
-      return new x86_64::X86_64Assembler();
-    default:
-      LOG(FATAL) << "Unknown InstructionSet: " << instruction_set;
-      return nullptr;
+  uint32_t pc = dchecked_integral_cast<uint32_t>(assembler_->CodeSize());
+  if (delay_emitting_advance_pc_) {
+    uint32_t stream_pos = dchecked_integral_cast<uint32_t>(opcodes_.size());
+    delayed_advance_pcs_.push_back(DelayedAdvancePC {stream_pos, pc});
+  } else {
+    AdvancePC(pc);
   }
-}
-
-void Assembler::StoreImmediateToThread32(ThreadOffset<4> dest ATTRIBUTE_UNUSED,
-                                         uint32_t imm ATTRIBUTE_UNUSED,
-                                         ManagedRegister scratch ATTRIBUTE_UNUSED) {
-  UNIMPLEMENTED(FATAL);
-}
-
-void Assembler::StoreImmediateToThread64(ThreadOffset<8> dest ATTRIBUTE_UNUSED,
-                                         uint32_t imm ATTRIBUTE_UNUSED,
-                                         ManagedRegister scratch ATTRIBUTE_UNUSED) {
-  UNIMPLEMENTED(FATAL);
-}
-
-void Assembler::StoreStackOffsetToThread32(ThreadOffset<4> thr_offs ATTRIBUTE_UNUSED,
-                                           FrameOffset fr_offs ATTRIBUTE_UNUSED,
-                                           ManagedRegister scratch ATTRIBUTE_UNUSED) {
-  UNIMPLEMENTED(FATAL);
-}
-
-void Assembler::StoreStackOffsetToThread64(ThreadOffset<8> thr_offs ATTRIBUTE_UNUSED,
-                                           FrameOffset fr_offs ATTRIBUTE_UNUSED,
-                                           ManagedRegister scratch ATTRIBUTE_UNUSED) {
-  UNIMPLEMENTED(FATAL);
-}
-
-void Assembler::StoreStackPointerToThread32(ThreadOffset<4> thr_offs ATTRIBUTE_UNUSED) {
-  UNIMPLEMENTED(FATAL);
-}
-
-void Assembler::StoreStackPointerToThread64(ThreadOffset<8> thr_offs ATTRIBUTE_UNUSED) {
-  UNIMPLEMENTED(FATAL);
-}
-
-void Assembler::LoadFromThread32(ManagedRegister dest ATTRIBUTE_UNUSED,
-                                 ThreadOffset<4> src ATTRIBUTE_UNUSED,
-                                 size_t size ATTRIBUTE_UNUSED) {
-  UNIMPLEMENTED(FATAL);
-}
-
-void Assembler::LoadFromThread64(ManagedRegister dest ATTRIBUTE_UNUSED,
-                                 ThreadOffset<8> src ATTRIBUTE_UNUSED,
-                                 size_t size ATTRIBUTE_UNUSED) {
-  UNIMPLEMENTED(FATAL);
-}
-
-void Assembler::LoadRawPtrFromThread32(ManagedRegister dest ATTRIBUTE_UNUSED,
-                                       ThreadOffset<4> offs ATTRIBUTE_UNUSED) {
-  UNIMPLEMENTED(FATAL);
-}
-
-void Assembler::LoadRawPtrFromThread64(ManagedRegister dest ATTRIBUTE_UNUSED,
-                                       ThreadOffset<8> offs ATTRIBUTE_UNUSED) {
-  UNIMPLEMENTED(FATAL);
-}
-
-void Assembler::CopyRawPtrFromThread32(FrameOffset fr_offs ATTRIBUTE_UNUSED,
-                                       ThreadOffset<4> thr_offs ATTRIBUTE_UNUSED,
-                                       ManagedRegister scratch ATTRIBUTE_UNUSED) {
-  UNIMPLEMENTED(FATAL);
-}
-
-void Assembler::CopyRawPtrFromThread64(FrameOffset fr_offs ATTRIBUTE_UNUSED,
-                                       ThreadOffset<8> thr_offs ATTRIBUTE_UNUSED,
-                                       ManagedRegister scratch ATTRIBUTE_UNUSED) {
-  UNIMPLEMENTED(FATAL);
-}
-
-void Assembler::CopyRawPtrToThread32(ThreadOffset<4> thr_offs ATTRIBUTE_UNUSED,
-                                     FrameOffset fr_offs ATTRIBUTE_UNUSED,
-                                     ManagedRegister scratch ATTRIBUTE_UNUSED) {
-  UNIMPLEMENTED(FATAL);
-}
-
-void Assembler::CopyRawPtrToThread64(ThreadOffset<8> thr_offs ATTRIBUTE_UNUSED,
-                                     FrameOffset fr_offs ATTRIBUTE_UNUSED,
-                                     ManagedRegister scratch ATTRIBUTE_UNUSED) {
-  UNIMPLEMENTED(FATAL);
-}
-
-void Assembler::CallFromThread32(ThreadOffset<4> offset ATTRIBUTE_UNUSED,
-                                 ManagedRegister scratch ATTRIBUTE_UNUSED) {
-  UNIMPLEMENTED(FATAL);
-}
-
-void Assembler::CallFromThread64(ThreadOffset<8> offset ATTRIBUTE_UNUSED,
-                                 ManagedRegister scratch ATTRIBUTE_UNUSED) {
-  UNIMPLEMENTED(FATAL);
 }
 
 }  // namespace art

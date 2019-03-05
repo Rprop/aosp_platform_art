@@ -18,8 +18,11 @@
 #define ART_RUNTIME_CHECK_REFERENCE_MAP_VISITOR_H_
 
 #include "art_method-inl.h"
-#include "gc_map.h"
-#include "scoped_thread_state_change.h"
+#include "dex/code_item_accessors-inl.h"
+#include "dex/dex_file_types.h"
+#include "oat_quick_method_header.h"
+#include "scoped_thread_state_change-inl.h"
+#include "stack.h"
 #include "stack_map.h"
 
 namespace art {
@@ -28,23 +31,23 @@ namespace art {
 // holding references.
 class CheckReferenceMapVisitor : public StackVisitor {
  public:
-  explicit CheckReferenceMapVisitor(Thread* thread) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
+  explicit CheckReferenceMapVisitor(Thread* thread) REQUIRES_SHARED(Locks::mutator_lock_)
       : StackVisitor(thread, nullptr, StackVisitor::StackWalkKind::kIncludeInlinedFrames) {}
 
-  bool VisitFrame() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  bool VisitFrame() REQUIRES_SHARED(Locks::mutator_lock_) {
     ArtMethod* m = GetMethod();
     if (m->IsCalleeSaveMethod() || m->IsNative()) {
-      CHECK_EQ(GetDexPc(), DexFile::kDexNoIndex);
+      CHECK_EQ(GetDexPc(), dex::kDexNoIndex);
     }
 
     if (m == nullptr || m->IsNative() || m->IsRuntimeMethod() || IsShadowFrame()) {
       return true;
     }
 
-    LOG(INFO) << "At " << PrettyMethod(m, false);
+    LOG(INFO) << "At " << m->PrettyMethod(false);
 
     if (m->IsCalleeSaveMethod()) {
-      LOG(WARNING) << "no PC for " << PrettyMethod(m);
+      LOG(WARNING) << "no PC for " << m->PrettyMethod();
       return true;
     }
 
@@ -52,30 +55,27 @@ class CheckReferenceMapVisitor : public StackVisitor {
   }
 
   void CheckReferences(int* registers, int number_of_references, uint32_t native_pc_offset)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    if (GetMethod()->IsOptimized(sizeof(void*))) {
-      CheckOptimizedMethod(registers, number_of_references, native_pc_offset);
-    } else {
-      CheckQuickMethod(registers, number_of_references, native_pc_offset);
-    }
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    CHECK(GetCurrentOatQuickMethodHeader()->IsOptimized());
+    CheckOptimizedMethod(registers, number_of_references, native_pc_offset);
   }
 
  private:
   void CheckOptimizedMethod(int* registers, int number_of_references, uint32_t native_pc_offset)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     ArtMethod* m = GetMethod();
-    CodeInfo code_info = m->GetOptimizedCodeInfo();
+    CodeInfo code_info(GetCurrentOatQuickMethodHeader());
     StackMap stack_map = code_info.GetStackMapForNativePcOffset(native_pc_offset);
-    uint16_t number_of_dex_registers = m->GetCodeItem()->registers_size_;
-    DexRegisterMap dex_register_map =
-        code_info.GetDexRegisterMapOf(stack_map, number_of_dex_registers);
-    MemoryRegion stack_mask = stack_map.GetStackMask(code_info);
-    uint32_t register_mask = stack_map.GetRegisterMask(code_info);
+    CodeItemDataAccessor accessor(m->DexInstructionData());
+    uint16_t number_of_dex_registers = accessor.RegistersSize();
+    DexRegisterMap dex_register_map = code_info.GetDexRegisterMapOf(stack_map);
+    DCHECK_EQ(dex_register_map.size(), number_of_dex_registers);
+    uint32_t register_mask = code_info.GetRegisterMaskOf(stack_map);
+    BitMemoryRegion stack_mask = code_info.GetStackMaskOf(stack_map);
     for (int i = 0; i < number_of_references; ++i) {
       int reg = registers[i];
-      CHECK(reg < m->GetCodeItem()->registers_size_);
-      DexRegisterLocation location =
-          dex_register_map.GetDexRegisterLocation(reg, number_of_dex_registers, code_info);
+      CHECK_LT(reg, accessor.RegistersSize());
+      DexRegisterLocation location = dex_register_map[reg];
       switch (location.GetKind()) {
         case DexRegisterLocation::Kind::kNone:
           // Not set, should not be a reference.
@@ -86,9 +86,11 @@ class CheckReferenceMapVisitor : public StackVisitor {
           CHECK(stack_mask.LoadBit(location.GetValue() / kFrameSlotSize));
           break;
         case DexRegisterLocation::Kind::kInRegister:
+        case DexRegisterLocation::Kind::kInRegisterHigh:
           CHECK_NE(register_mask & (1 << location.GetValue()), 0u);
           break;
         case DexRegisterLocation::Kind::kInFpuRegister:
+        case DexRegisterLocation::Kind::kInFpuRegisterHigh:
           // In Fpu register, should not be a reference.
           CHECK(false);
           break;
@@ -96,23 +98,8 @@ class CheckReferenceMapVisitor : public StackVisitor {
           CHECK_EQ(location.GetValue(), 0);
           break;
         default:
-          LOG(FATAL) << "Unexpected location kind"
-                     << DexRegisterLocation::PrettyDescriptor(location.GetInternalKind());
+          LOG(FATAL) << "Unexpected location kind " << location.GetKind();
       }
-    }
-  }
-
-  void CheckQuickMethod(int* registers, int number_of_references, uint32_t native_pc_offset)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    ArtMethod* m = GetMethod();
-    NativePcOffsetToReferenceMap map(m->GetNativeGcMap(sizeof(void*)));
-    const uint8_t* ref_bitmap = map.FindBitMap(native_pc_offset);
-    CHECK(ref_bitmap);
-    for (int i = 0; i < number_of_references; ++i) {
-      int reg = registers[i];
-      CHECK(reg < m->GetCodeItem()->registers_size_);
-      CHECK((*((ref_bitmap) + reg / 8) >> (reg % 8) ) & 0x01)
-          << "Error: Reg @" << i << " is not in GC map";
     }
   }
 };

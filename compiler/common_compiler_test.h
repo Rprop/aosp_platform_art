@@ -18,21 +18,25 @@
 #define ART_COMPILER_COMMON_COMPILER_TEST_H_
 
 #include <list>
-#include <unordered_set>
 #include <vector>
 
+#include "arch/instruction_set.h"
+#include "arch/instruction_set_features.h"
+#include "base/hash_set.h"
 #include "common_runtime_test.h"
+#include "compiler.h"
 #include "oat_file.h"
 
 namespace art {
 namespace mirror {
-  class ClassLoader;
+class ClassLoader;
 }  // namespace mirror
 
 class CompilerDriver;
 class CompilerOptions;
 class CumulativeLogger;
-class DexFileToMethodInlinerMap;
+class DexFile;
+class ProfileCompilationInfo;
 class VerificationResults;
 
 template<class T> class Handle;
@@ -45,56 +49,70 @@ class CommonCompilerTest : public CommonRuntimeTest {
   // Create an OatMethod based on pointers (for unit tests).
   OatFile::OatMethod CreateOatMethod(const void* code);
 
-  void MakeExecutable(ArtMethod* method) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void MakeExecutable(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_);
 
   static void MakeExecutable(const void* code_start, size_t code_length);
 
-  void MakeExecutable(mirror::ClassLoader* class_loader, const char* class_name)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void MakeExecutable(ObjPtr<mirror::ClassLoader> class_loader, const char* class_name)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
  protected:
-  virtual void SetUp();
+  void SetUp() OVERRIDE;
 
-  virtual void SetUpRuntimeOptions(RuntimeOptions *options);
+  void SetUpRuntimeOptions(RuntimeOptions* options) OVERRIDE;
 
-  // Get the set of image classes given to the compiler-driver in SetUp. Note: the compiler
-  // driver assumes ownership of the set, so the test should properly release the set.
-  virtual std::unordered_set<std::string>* GetImageClasses();
+  Compiler::Kind GetCompilerKind() const;
+  void SetCompilerKind(Compiler::Kind compiler_kind);
 
-  // Get the set of compiled classes given to the compiler-driver in SetUp. Note: the compiler
-  // driver assumes ownership of the set, so the test should properly release the set.
-  virtual std::unordered_set<std::string>* GetCompiledClasses();
+  // Get the set of image classes given to the compiler-driver in SetUp.
+  virtual std::unique_ptr<HashSet<std::string>> GetImageClasses();
 
-  // Get the set of compiled methods given to the compiler-driver in SetUp. Note: the compiler
-  // driver assumes ownership of the set, so the test should properly release the set.
-  virtual std::unordered_set<std::string>* GetCompiledMethods();
+  virtual ProfileCompilationInfo* GetProfileCompilationInfo();
 
-  virtual void TearDown();
+  virtual CompilerFilter::Filter GetCompilerFilter() const {
+    return CompilerFilter::kDefaultCompilerFilter;
+  }
+
+  void TearDown() OVERRIDE;
 
   void CompileClass(mirror::ClassLoader* class_loader, const char* class_name)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
-  void CompileMethod(ArtMethod* method) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void CompileMethod(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_);
 
   void CompileDirectMethod(Handle<mirror::ClassLoader> class_loader, const char* class_name,
                            const char* method_name, const char* signature)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   void CompileVirtualMethod(Handle<mirror::ClassLoader> class_loader, const char* class_name,
                             const char* method_name, const char* signature)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  void ApplyInstructionSet();
+  void OverrideInstructionSetFeatures(InstructionSet instruction_set, const std::string& variant);
+
+  void CreateCompilerDriver();
 
   void ReserveImageSpace();
 
   void UnreserveImageSpace();
 
+  void SetDexFilesForOatFile(const std::vector<const DexFile*>& dex_files);
+
+  void ClearBootImageOption();
+
+  Compiler::Kind compiler_kind_ = Compiler::kOptimizing;
+  size_t number_of_threads_ = 2u;
+
+  InstructionSet instruction_set_ =
+      (kRuntimeISA == InstructionSet::kArm) ? InstructionSet::kThumb2 : kRuntimeISA;
+  // Take the default set of instruction features from the build.
+  std::unique_ptr<const InstructionSetFeatures> instruction_set_features_
+      = InstructionSetFeatures::FromCppDefines();
+
   std::unique_ptr<CompilerOptions> compiler_options_;
   std::unique_ptr<VerificationResults> verification_results_;
-  std::unique_ptr<DexFileToMethodInlinerMap> method_inliner_map_;
   std::unique_ptr<CompilerDriver> compiler_driver_;
-  std::unique_ptr<CumulativeLogger> timer_;
-  std::unique_ptr<const InstructionSetFeatures> instruction_set_features_;
-
 
  private:
   std::unique_ptr<MemMap> image_reservation_;

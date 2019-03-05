@@ -1,3 +1,19 @@
+/*
+ * Copyright (C) 2011 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 import sun.misc.Unsafe;
 
 import java.lang.reflect.Field;
@@ -25,9 +41,11 @@ public class Main {
         test.parkNow = true;
 
         try {
-            Thread.sleep(1500);
+            // Give some time to the ParkTester thread to honor the park command.
+            Thread.sleep(3000);
         } catch (InterruptedException ex) {
-            // Ignore it.
+            System.out.println("Main thread interrupted!");
+            System.exit(1);
         }
 
         if (test.success) {
@@ -40,22 +58,24 @@ public class Main {
     /**
      * Set up {@link #UNSAFE}.
      */
-    public static void setUp() {
+    public static void setUp() throws Exception{
         /*
          * Subvert the access check to get the unique Unsafe instance.
          * We can do this because there's no security manager
          * installed when running the test.
          */
+        Field field = null;
         try {
-            Field field = Unsafe.class.getDeclaredField("THE_ONE");
-            field.setAccessible(true);
-
-            UNSAFE = (Unsafe) field.get(null);
-        } catch (NoSuchFieldException ex) {
-            throw new RuntimeException(ex);
-        } catch (IllegalAccessException ex) {
-            throw new RuntimeException(ex);
+            field = Unsafe.class.getDeclaredField("THE_ONE");
+        } catch (NoSuchFieldException e1) {
+            try {
+                field = Unsafe.class.getDeclaredField("theUnsafe");
+            } catch (NoSuchFieldException e2) {
+                throw new RuntimeException("Failed to find THE_ONE or theUnsafe");
+            }
         }
+        field.setAccessible(true);
+        UNSAFE = (Unsafe) field.get(null);
     }
 
     /**

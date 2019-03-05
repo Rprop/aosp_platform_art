@@ -1,4 +1,5 @@
-About to null reference and request GC.
+About to null reference.
 Finalizer started and spinning...
 Finalizer done spinning.
 Finalizer sleeping forever now.
+exit status: 2

@@ -30,21 +30,29 @@ class StickyMarkSweep FINAL : public PartialMarkSweep {
     return kGcTypeSticky;
   }
 
-  explicit StickyMarkSweep(Heap* heap, bool is_concurrent, const std::string& name_prefix = "");
+  StickyMarkSweep(Heap* heap, bool is_concurrent, const std::string& name_prefix = "");
   ~StickyMarkSweep() {}
+
+  virtual void MarkConcurrentRoots(VisitRootFlags flags)
+      OVERRIDE
+      REQUIRES(Locks::heap_bitmap_lock_)
+      REQUIRES(!mark_stack_lock_)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
  protected:
   // Bind the live bits to the mark bits of bitmaps for all spaces, all spaces other than the
   // alloc space will be marked as immune.
-  void BindBitmaps() OVERRIDE SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void BindBitmaps() OVERRIDE REQUIRES_SHARED(Locks::mutator_lock_);
 
-  void MarkReachableObjects() OVERRIDE
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
-      EXCLUSIVE_LOCKS_REQUIRED(Locks::heap_bitmap_lock_);
+  void MarkReachableObjects()
+      OVERRIDE
+      REQUIRES(Locks::heap_bitmap_lock_)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
-  void Sweep(bool swap_bitmaps) OVERRIDE
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
-      EXCLUSIVE_LOCKS_REQUIRED(Locks::heap_bitmap_lock_);
+  void Sweep(bool swap_bitmaps)
+      OVERRIDE
+      REQUIRES(Locks::heap_bitmap_lock_)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
  private:
   DISALLOW_IMPLICIT_CONSTRUCTORS(StickyMarkSweep);

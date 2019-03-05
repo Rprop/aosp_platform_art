@@ -18,8 +18,9 @@
 #define ART_RUNTIME_GC_SPACE_LARGE_OBJECT_SPACE_H_
 
 #include "base/allocator.h"
+#include "base/safe_map.h"
+#include "base/tracking_safe_map.h"
 #include "dlmalloc_space.h"
-#include "safe_map.h"
 #include "space.h"
 
 #include <set>
@@ -96,13 +97,17 @@ class LargeObjectSpace : public DiscontinuousSpace, public AllocSpace {
     return Begin() <= byte_obj && byte_obj < End();
   }
   void LogFragmentationAllocFailure(std::ostream& os, size_t failed_alloc_bytes) OVERRIDE
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Return true if the large object is a zygote large object. Potentially slow.
   virtual bool IsZygoteLargeObject(Thread* self, mirror::Object* obj) const = 0;
   // Called when we create the zygote space, mark all existing large objects as zygote large
   // objects.
   virtual void SetAllLargeObjectsAsZygoteObjects(Thread* self) = 0;
+
+  // GetRangeAtomic returns Begin() and End() atomically, that is, it never returns Begin() and
+  // End() from different allocations.
+  virtual std::pair<uint8_t*, uint8_t*> GetBeginEndAtomic() const = 0;
 
  protected:
   explicit LargeObjectSpace(const std::string& name, uint8_t* begin, uint8_t* end);
@@ -130,13 +135,16 @@ class LargeObjectMapSpace : public LargeObjectSpace {
   // of malloc.
   static LargeObjectMapSpace* Create(const std::string& name);
   // Return the storage space required by obj.
-  size_t AllocationSize(mirror::Object* obj, size_t* usable_size);
+  size_t AllocationSize(mirror::Object* obj, size_t* usable_size) REQUIRES(!lock_);
   mirror::Object* Alloc(Thread* self, size_t num_bytes, size_t* bytes_allocated,
-                        size_t* usable_size, size_t* bytes_tl_bulk_allocated);
-  size_t Free(Thread* self, mirror::Object* ptr);
-  void Walk(DlMallocSpace::WalkCallback, void* arg) OVERRIDE LOCKS_EXCLUDED(lock_);
+                        size_t* usable_size, size_t* bytes_tl_bulk_allocated)
+      REQUIRES(!lock_);
+  size_t Free(Thread* self, mirror::Object* ptr) REQUIRES(!lock_);
+  void Walk(DlMallocSpace::WalkCallback, void* arg) OVERRIDE REQUIRES(!lock_);
   // TODO: disabling thread safety analysis as this may be called when we already hold lock_.
   bool Contains(const mirror::Object* obj) const NO_THREAD_SAFETY_ANALYSIS;
+
+  std::pair<uint8_t*, uint8_t*> GetBeginEndAtomic() const OVERRIDE REQUIRES(!lock_);
 
  protected:
   struct LargeObject {
@@ -146,8 +154,8 @@ class LargeObjectMapSpace : public LargeObjectSpace {
   explicit LargeObjectMapSpace(const std::string& name);
   virtual ~LargeObjectMapSpace() {}
 
-  bool IsZygoteLargeObject(Thread* self, mirror::Object* obj) const OVERRIDE LOCKS_EXCLUDED(lock_);
-  void SetAllLargeObjectsAsZygoteObjects(Thread* self) OVERRIDE LOCKS_EXCLUDED(lock_);
+  bool IsZygoteLargeObject(Thread* self, mirror::Object* obj) const OVERRIDE REQUIRES(!lock_);
+  void SetAllLargeObjectsAsZygoteObjects(Thread* self) OVERRIDE REQUIRES(!lock_);
 
   // Used to ensure mutual exclusion when the allocation spaces data structures are being modified.
   mutable Mutex lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
@@ -163,12 +171,15 @@ class FreeListSpace FINAL : public LargeObjectSpace {
   virtual ~FreeListSpace();
   static FreeListSpace* Create(const std::string& name, uint8_t* requested_begin, size_t capacity);
   size_t AllocationSize(mirror::Object* obj, size_t* usable_size) OVERRIDE
-      EXCLUSIVE_LOCKS_REQUIRED(lock_);
+      REQUIRES(lock_);
   mirror::Object* Alloc(Thread* self, size_t num_bytes, size_t* bytes_allocated,
-                        size_t* usable_size, size_t* bytes_tl_bulk_allocated) OVERRIDE;
-  size_t Free(Thread* self, mirror::Object* obj) OVERRIDE;
-  void Walk(DlMallocSpace::WalkCallback callback, void* arg) OVERRIDE LOCKS_EXCLUDED(lock_);
-  void Dump(std::ostream& os) const;
+                        size_t* usable_size, size_t* bytes_tl_bulk_allocated)
+      OVERRIDE REQUIRES(!lock_);
+  size_t Free(Thread* self, mirror::Object* obj) OVERRIDE REQUIRES(!lock_);
+  void Walk(DlMallocSpace::WalkCallback callback, void* arg) OVERRIDE REQUIRES(!lock_);
+  void Dump(std::ostream& os) const REQUIRES(!lock_);
+
+  std::pair<uint8_t*, uint8_t*> GetBeginEndAtomic() const OVERRIDE REQUIRES(!lock_);
 
  protected:
   FreeListSpace(const std::string& name, MemMap* mem_map, uint8_t* begin, uint8_t* end);
@@ -186,9 +197,9 @@ class FreeListSpace FINAL : public LargeObjectSpace {
     return GetAllocationAddressForSlot(GetSlotIndexForAllocationInfo(info));
   }
   // Removes header from the free blocks set by finding the corresponding iterator and erasing it.
-  void RemoveFreePrev(AllocationInfo* info) EXCLUSIVE_LOCKS_REQUIRED(lock_);
+  void RemoveFreePrev(AllocationInfo* info) REQUIRES(lock_);
   bool IsZygoteLargeObject(Thread* self, mirror::Object* obj) const OVERRIDE;
-  void SetAllLargeObjectsAsZygoteObjects(Thread* self) OVERRIDE;
+  void SetAllLargeObjectsAsZygoteObjects(Thread* self) OVERRIDE REQUIRES(!lock_);
 
   class SortByPrevFree {
    public:

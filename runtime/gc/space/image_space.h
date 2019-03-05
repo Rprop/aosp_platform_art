@@ -17,8 +17,9 @@
 #ifndef ART_RUNTIME_GC_SPACE_IMAGE_SPACE_H_
 #define ART_RUNTIME_GC_SPACE_IMAGE_SPACE_H_
 
+#include "arch/instruction_set.h"
 #include "gc/accounting/space_bitmap.h"
-#include "runtime.h"
+#include "image.h"
 #include "space.h"
 
 namespace art {
@@ -35,21 +36,22 @@ class ImageSpace : public MemMapSpace {
     return kSpaceTypeImageSpace;
   }
 
-  // Create a Space from an image file for a specified instruction
-  // set. Cannot be used for future allocation or collected.
+  // Load boot image spaces from a primary image file for a specified instruction set.
   //
-  // Create also opens the OatFile associated with the image file so
-  // that it be contiguously allocated with the image before the
-  // creation of the alloc space. The ReleaseOatFile will later be
-  // used to transfer ownership of the OatFile to the ClassLinker when
-  // it is initialized.
-  static ImageSpace* Create(const char* image, InstructionSet image_isa, std::string* error_msg)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  // On successful return, the loaded spaces are added to boot_image_spaces (which must be
+  // empty on entry) and oat_file_end is updated with the (page-aligned) end of the last
+  // oat file.
+  static bool LoadBootImage(const std::string& image_file_name,
+                            const InstructionSet image_instruction_set,
+                            std::vector<space::ImageSpace*>* boot_image_spaces,
+                            uint8_t** oat_file_end)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
-  // Reads the image header from the specified image location for the
-  // instruction set image_isa or dies trying.
-  static ImageHeader* ReadImageHeaderOrDie(const char* image_location,
-                                           InstructionSet image_isa);
+  // Try to open an existing app image space.
+  static std::unique_ptr<ImageSpace> CreateFromAppImage(const char* image,
+                                                        const OatFile* oat_file,
+                                                        std::string* error_msg)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Reads the image header from the specified image location for the
   // instruction set image_isa. Returns null on failure, with
@@ -62,12 +64,11 @@ class ImageSpace : public MemMapSpace {
   const OatFile* GetOatFile() const;
 
   // Releases the OatFile from the ImageSpace so it can be transfer to
-  // the caller, presumably the ClassLinker.
-  OatFile* ReleaseOatFile()
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  // the caller, presumably the OatFileManager.
+  std::unique_ptr<const OatFile> ReleaseOatFile();
 
   void VerifyImageAllocations()
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   const ImageHeader& GetImageHeader() const {
     return *reinterpret_cast<ImageHeader*>(Begin());
@@ -120,32 +121,70 @@ class ImageSpace : public MemMapSpace {
                                 bool* has_data,
                                 bool *is_global_cache);
 
- private:
-  // Tries to initialize an ImageSpace from the given image path,
-  // returning null on error.
+  // Use the input image filename to adapt the names in the given boot classpath to establish
+  // complete locations for secondary images.
+  static void ExtractMultiImageLocations(const std::string& input_image_file_name,
+                                        const std::string& boot_classpath,
+                                        std::vector<std::string>* image_filenames);
+
+  static std::string GetMultiImageBootClassPath(const std::vector<const char*>& dex_locations,
+                                                const std::vector<const char*>& oat_filenames,
+                                                const std::vector<const char*>& image_filenames);
+
+  // Returns true if the dex checksums in the given oat file match the
+  // checksums of the original dex files on disk. This is intended to be used
+  // to validate the boot image oat file, which may contain dex entries from
+  // multiple different (possibly multidex) dex files on disk. Prefer the
+  // OatFileAssistant for validating regular app oat files because the
+  // OatFileAssistant caches dex checksums that are reused to check both the
+  // oat and odex file.
   //
-  // If validate_oat_file is false (for /system), do not verify that
-  // image's OatFile is up-to-date relative to its DexFile
-  // inputs. Otherwise (for /data), validate the inputs and generate
-  // the OatFile in /data/dalvik-cache if necessary.
-  static ImageSpace* Init(const char* image_filename, const char* image_location,
-                          bool validate_oat_file, std::string* error_msg)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  // This function is exposed for testing purposes.
+  static bool ValidateOatFile(const OatFile& oat_file, std::string* error_msg);
 
-  OatFile* OpenOatFile(const char* image, std::string* error_msg) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  // Return the end of the image which includes non-heap objects such as ArtMethods and ArtFields.
+  uint8_t* GetImageEnd() const {
+    return Begin() + GetImageHeader().GetImageSize();
+  }
 
-  bool ValidateOatFile(std::string* error_msg) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  // Return the start of the associated oat file.
+  uint8_t* GetOatFileBegin() const {
+    return GetImageHeader().GetOatFileBegin();
+  }
 
-  friend class Space;
+  // Return the end of the associated oat file.
+  uint8_t* GetOatFileEnd() const {
+    return GetImageHeader().GetOatFileEnd();
+  }
+
+  void DumpSections(std::ostream& os) const;
+
+  // De-initialize the image-space by undoing the effects in Init().
+  virtual ~ImageSpace();
+
+ protected:
+  // Tries to initialize an ImageSpace from the given image path, returning null on error.
+  //
+  // If validate_oat_file is false (for /system), do not verify that image's OatFile is up-to-date
+  // relative to its DexFile inputs. Otherwise (for /data), validate the inputs and generate the
+  // OatFile in /data/dalvik-cache if necessary. If the oat_file is null, it uses the oat file from
+  // the image.
+  static std::unique_ptr<ImageSpace> Init(const char* image_filename,
+                                          const char* image_location,
+                                          bool validate_oat_file,
+                                          const OatFile* oat_file,
+                                          std::string* error_msg)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   static Atomic<uint32_t> bitmap_index_;
 
   std::unique_ptr<accounting::ContinuousSpaceBitmap> live_bitmap_;
 
-  ImageSpace(const std::string& name, const char* image_location,
-             MemMap* mem_map, accounting::ContinuousSpaceBitmap* live_bitmap, uint8_t* end);
+  ImageSpace(const std::string& name,
+             const char* image_location,
+             MemMap* mem_map,
+             accounting::ContinuousSpaceBitmap* live_bitmap,
+             uint8_t* end);
 
   // The OatFile associated with the image during early startup to
   // reserve space contiguous to the image. It is later released to
@@ -157,6 +196,24 @@ class ImageSpace : public MemMapSpace {
   const OatFile* oat_file_non_owned_;
 
   const std::string image_location_;
+
+  friend class ImageSpaceLoader;
+  friend class Space;
+
+ private:
+  // Create a boot image space from an image file for a specified instruction
+  // set. Cannot be used for future allocation or collected.
+  //
+  // Create also opens the OatFile associated with the image file so
+  // that it be contiguously allocated with the image before the
+  // creation of the alloc space. The ReleaseOatFile will later be
+  // used to transfer ownership of the OatFile to the ClassLinker when
+  // it is initialized.
+  static std::unique_ptr<ImageSpace> CreateBootImage(const char* image,
+                                     InstructionSet image_isa,
+                                     bool secondary_image,
+                                     std::string* error_msg)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   DISALLOW_COPY_AND_ASSIGN(ImageSpace);
 };

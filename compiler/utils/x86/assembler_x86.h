@@ -18,10 +18,15 @@
 #define ART_COMPILER_UTILS_X86_ASSEMBLER_X86_H_
 
 #include <vector>
+
+#include "base/arena_containers.h"
+#include "base/array_ref.h"
 #include "base/bit_utils.h"
+#include "base/enums.h"
+#include "base/globals.h"
 #include "base/macros.h"
 #include "constants_x86.h"
-#include "globals.h"
+#include "heap_poisoning.h"
 #include "managed_register_x86.h"
 #include "offsets.h"
 #include "utils/assembler.h"
@@ -86,7 +91,7 @@ class Operand : public ValueObject {
 
  protected:
   // Operand can be sub classed (e.g: Address).
-  Operand() : length_(0) { }
+  Operand() : length_(0), fixup_(nullptr) { }
 
   void SetModRM(int mod_in, Register rm_in) {
     CHECK_EQ(mod_in & ~3, 0);
@@ -113,11 +118,23 @@ class Operand : public ValueObject {
     length_ += disp_size;
   }
 
+  AssemblerFixup* GetFixup() const {
+    return fixup_;
+  }
+
+  void SetFixup(AssemblerFixup* fixup) {
+    fixup_ = fixup;
+  }
+
  private:
   uint8_t length_;
   uint8_t encoding_[6];
 
-  explicit Operand(Register reg) { SetModRM(3, reg); }
+  // A fixup can be associated with the operand, in order to be applied after the
+  // code has been generated. This is used for constant area fixups.
+  AssemblerFixup* fixup_;
+
+  explicit Operand(Register reg) : fixup_(nullptr) { SetModRM(3, reg); }
 
   // Get the operand encoding byte at the given index.
   uint8_t encoding_at(int index_in) const {
@@ -136,6 +153,11 @@ class Address : public Operand {
     Init(base_in, disp);
   }
 
+  Address(Register base_in, int32_t disp, AssemblerFixup *fixup) {
+    Init(base_in, disp);
+    SetFixup(fixup);
+  }
+
   Address(Register base_in, Offset disp) {
     Init(base_in, disp.Int32Value());
   }
@@ -148,6 +170,39 @@ class Address : public Operand {
   Address(Register base_in, MemberOffset disp) {
     Init(base_in, disp.Int32Value());
   }
+
+  Address(Register index_in, ScaleFactor scale_in, int32_t disp) {
+    CHECK_NE(index_in, ESP);  // Illegal addressing mode.
+    SetModRM(0, ESP);
+    SetSIB(scale_in, index_in, EBP);
+    SetDisp32(disp);
+  }
+
+  Address(Register base_in, Register index_in, ScaleFactor scale_in, int32_t disp) {
+    Init(base_in, index_in, scale_in, disp);
+  }
+
+  Address(Register base_in,
+          Register index_in,
+          ScaleFactor scale_in,
+          int32_t disp, AssemblerFixup *fixup) {
+    Init(base_in, index_in, scale_in, disp);
+    SetFixup(fixup);
+  }
+
+  static Address Absolute(uintptr_t addr) {
+    Address result;
+    result.SetModRM(0, EBP);
+    result.SetDisp32(addr);
+    return result;
+  }
+
+  static Address Absolute(ThreadOffset32 addr) {
+    return Absolute(addr.Int32Value());
+  }
+
+ private:
+  Address() {}
 
   void Init(Register base_in, int32_t disp) {
     if (disp == 0 && base_in != EBP) {
@@ -164,14 +219,7 @@ class Address : public Operand {
     }
   }
 
-  Address(Register index_in, ScaleFactor scale_in, int32_t disp) {
-    CHECK_NE(index_in, ESP);  // Illegal addressing mode.
-    SetModRM(0, ESP);
-    SetSIB(scale_in, index_in, EBP);
-    SetDisp32(disp);
-  }
-
-  Address(Register base_in, Register index_in, ScaleFactor scale_in, int32_t disp) {
+  void Init(Register base_in, Register index_in, ScaleFactor scale_in, int32_t disp) {
     CHECK_NE(index_in, ESP);  // Illegal addressing mode.
     if (disp == 0 && base_in != EBP) {
       SetModRM(0, ESP);
@@ -186,26 +234,82 @@ class Address : public Operand {
       SetDisp32(disp);
     }
   }
+};
 
-  static Address Absolute(uintptr_t addr) {
-    Address result;
-    result.SetModRM(0, EBP);
-    result.SetDisp32(addr);
-    return result;
+std::ostream& operator<<(std::ostream& os, const Address& addr);
+
+// This is equivalent to the Label class, used in a slightly different context. We
+// inherit the functionality of the Label class, but prevent unintended
+// derived-to-base conversions by making the base class private.
+class NearLabel : private Label {
+ public:
+  NearLabel() : Label() {}
+
+  // Expose the Label routines that we need.
+  using Label::Position;
+  using Label::LinkPosition;
+  using Label::IsBound;
+  using Label::IsUnused;
+  using Label::IsLinked;
+
+ private:
+  using Label::BindTo;
+  using Label::LinkTo;
+
+  friend class x86::X86Assembler;
+
+  DISALLOW_COPY_AND_ASSIGN(NearLabel);
+};
+
+/**
+ * Class to handle constant area values.
+ */
+class ConstantArea {
+ public:
+  explicit ConstantArea(ArenaAllocator* allocator)
+      : buffer_(allocator->Adapter(kArenaAllocAssembler)) {}
+
+  // Add a double to the constant area, returning the offset into
+  // the constant area where the literal resides.
+  size_t AddDouble(double v);
+
+  // Add a float to the constant area, returning the offset into
+  // the constant area where the literal resides.
+  size_t AddFloat(float v);
+
+  // Add an int32_t to the constant area, returning the offset into
+  // the constant area where the literal resides.
+  size_t AddInt32(int32_t v);
+
+  // Add an int32_t to the end of the constant area, returning the offset into
+  // the constant area where the literal resides.
+  size_t AppendInt32(int32_t v);
+
+  // Add an int64_t to the constant area, returning the offset into
+  // the constant area where the literal resides.
+  size_t AddInt64(int64_t v);
+
+  bool IsEmpty() const {
+    return buffer_.size() == 0;
   }
 
-  static Address Absolute(ThreadOffset<4> addr) {
-    return Absolute(addr.Int32Value());
+  size_t GetSize() const {
+    return buffer_.size() * elem_size_;
+  }
+
+  ArrayRef<const int32_t> GetBuffer() const {
+    return ArrayRef<const int32_t>(buffer_);
   }
 
  private:
-  Address() {}
+  static constexpr size_t elem_size_ = sizeof(int32_t);
+  ArenaVector<int32_t> buffer_;
 };
-
 
 class X86Assembler FINAL : public Assembler {
  public:
-  explicit X86Assembler() {}
+  explicit X86Assembler(ArenaAllocator* allocator)
+      : Assembler(allocator), constant_area_(allocator) {}
   virtual ~X86Assembler() {}
 
   /*
@@ -231,7 +335,22 @@ class X86Assembler FINAL : public Assembler {
   void movl(const Address& dst, const Immediate& imm);
   void movl(const Address& dst, Label* lbl);
 
+  void movntl(const Address& dst, Register src);
+
   void bswapl(Register dst);
+
+  void bsfl(Register dst, Register src);
+  void bsfl(Register dst, const Address& src);
+  void bsrl(Register dst, Register src);
+  void bsrl(Register dst, const Address& src);
+
+  void popcntl(Register dst, Register src);
+  void popcntl(Register dst, const Address& src);
+
+  void rorl(Register reg, const Immediate& imm);
+  void rorl(Register operand, Register shifter);
+  void roll(Register reg, const Immediate& imm);
+  void roll(Register operand, Register shifter);
 
   void movzxb(Register dst, ByteRegister src);
   void movzxb(Register dst, const Address& src);
@@ -252,10 +371,16 @@ class X86Assembler FINAL : public Assembler {
   void leal(Register dst, const Address& src);
 
   void cmovl(Condition condition, Register dst, Register src);
+  void cmovl(Condition condition, Register dst, const Address& src);
 
   void setb(Condition condition, Register dst);
 
-  void movaps(XmmRegister dst, XmmRegister src);
+  void movaps(XmmRegister dst, XmmRegister src);     // move
+  void movaps(XmmRegister dst, const Address& src);  // load aligned
+  void movups(XmmRegister dst, const Address& src);  // load unaligned
+  void movaps(const Address& dst, XmmRegister src);  // store aligned
+  void movups(const Address& dst, XmmRegister src);  // store unaligned
+
   void movss(XmmRegister dst, const Address& src);
   void movss(const Address& dst, XmmRegister src);
   void movss(XmmRegister dst, XmmRegister src);
@@ -272,17 +397,23 @@ class X86Assembler FINAL : public Assembler {
   void divss(XmmRegister dst, XmmRegister src);
   void divss(XmmRegister dst, const Address& src);
 
+  void addps(XmmRegister dst, XmmRegister src);  // no addr variant (for now)
+  void subps(XmmRegister dst, XmmRegister src);
+  void mulps(XmmRegister dst, XmmRegister src);
+  void divps(XmmRegister dst, XmmRegister src);
+
+  void movapd(XmmRegister dst, XmmRegister src);     // move
+  void movapd(XmmRegister dst, const Address& src);  // load aligned
+  void movupd(XmmRegister dst, const Address& src);  // load unaligned
+  void movapd(const Address& dst, XmmRegister src);  // store aligned
+  void movupd(const Address& dst, XmmRegister src);  // store unaligned
+
   void movsd(XmmRegister dst, const Address& src);
   void movsd(const Address& dst, XmmRegister src);
   void movsd(XmmRegister dst, XmmRegister src);
 
-  void psrlq(XmmRegister reg, const Immediate& shift_count);
-  void punpckldq(XmmRegister dst, XmmRegister src);
-
   void movhpd(XmmRegister dst, const Address& src);
   void movhpd(const Address& dst, XmmRegister src);
-
-  void psrldq(XmmRegister reg, const Immediate& shift_count);
 
   void addsd(XmmRegister dst, XmmRegister src);
   void addsd(XmmRegister dst, const Address& src);
@@ -292,6 +423,40 @@ class X86Assembler FINAL : public Assembler {
   void mulsd(XmmRegister dst, const Address& src);
   void divsd(XmmRegister dst, XmmRegister src);
   void divsd(XmmRegister dst, const Address& src);
+
+  void addpd(XmmRegister dst, XmmRegister src);  // no addr variant (for now)
+  void subpd(XmmRegister dst, XmmRegister src);
+  void mulpd(XmmRegister dst, XmmRegister src);
+  void divpd(XmmRegister dst, XmmRegister src);
+
+  void movdqa(XmmRegister dst, XmmRegister src);     // move
+  void movdqa(XmmRegister dst, const Address& src);  // load aligned
+  void movdqu(XmmRegister dst, const Address& src);  // load unaligned
+  void movdqa(const Address& dst, XmmRegister src);  // store aligned
+  void movdqu(const Address& dst, XmmRegister src);  // store unaligned
+
+  void paddb(XmmRegister dst, XmmRegister src);  // no addr variant (for now)
+  void psubb(XmmRegister dst, XmmRegister src);
+
+  void paddw(XmmRegister dst, XmmRegister src);
+  void psubw(XmmRegister dst, XmmRegister src);
+  void pmullw(XmmRegister dst, XmmRegister src);
+
+  void paddd(XmmRegister dst, XmmRegister src);
+  void psubd(XmmRegister dst, XmmRegister src);
+  void pmulld(XmmRegister dst, XmmRegister src);
+
+  void paddq(XmmRegister dst, XmmRegister src);
+  void psubq(XmmRegister dst, XmmRegister src);
+
+  void paddusb(XmmRegister dst, XmmRegister src);
+  void paddsb(XmmRegister dst, XmmRegister src);
+  void paddusw(XmmRegister dst, XmmRegister src);
+  void paddsw(XmmRegister dst, XmmRegister src);
+  void psubusb(XmmRegister dst, XmmRegister src);
+  void psubsb(XmmRegister dst, XmmRegister src);
+  void psubusw(XmmRegister dst, XmmRegister src);
+  void psubsw(XmmRegister dst, XmmRegister src);
 
   void cvtsi2ss(XmmRegister dst, Register src);
   void cvtsi2sd(XmmRegister dst, Register src);
@@ -305,12 +470,17 @@ class X86Assembler FINAL : public Assembler {
   void cvttss2si(Register dst, XmmRegister src);
   void cvttsd2si(Register dst, XmmRegister src);
 
+  void cvtdq2ps(XmmRegister dst, XmmRegister src);
   void cvtdq2pd(XmmRegister dst, XmmRegister src);
 
   void comiss(XmmRegister a, XmmRegister b);
+  void comiss(XmmRegister a, const Address& b);
   void comisd(XmmRegister a, XmmRegister b);
+  void comisd(XmmRegister a, const Address& b);
   void ucomiss(XmmRegister a, XmmRegister b);
+  void ucomiss(XmmRegister a, const Address& b);
   void ucomisd(XmmRegister a, XmmRegister b);
+  void ucomisd(XmmRegister a, const Address& b);
 
   void roundsd(XmmRegister dst, XmmRegister src, const Immediate& imm);
   void roundss(XmmRegister dst, XmmRegister src, const Immediate& imm);
@@ -322,14 +492,90 @@ class X86Assembler FINAL : public Assembler {
   void xorpd(XmmRegister dst, XmmRegister src);
   void xorps(XmmRegister dst, const Address& src);
   void xorps(XmmRegister dst, XmmRegister src);
+  void pxor(XmmRegister dst, XmmRegister src);  // no addr variant (for now)
 
   void andpd(XmmRegister dst, XmmRegister src);
   void andpd(XmmRegister dst, const Address& src);
   void andps(XmmRegister dst, XmmRegister src);
   void andps(XmmRegister dst, const Address& src);
+  void pand(XmmRegister dst, XmmRegister src);  // no addr variant (for now)
 
-  void orpd(XmmRegister dst, XmmRegister src);
+  void andnpd(XmmRegister dst, XmmRegister src);  // no addr variant (for now)
+  void andnps(XmmRegister dst, XmmRegister src);
+  void pandn(XmmRegister dst, XmmRegister src);
+
+  void orpd(XmmRegister dst, XmmRegister src);  // no addr variant (for now)
   void orps(XmmRegister dst, XmmRegister src);
+  void por(XmmRegister dst, XmmRegister src);
+
+  void pavgb(XmmRegister dst, XmmRegister src);  // no addr variant (for now)
+  void pavgw(XmmRegister dst, XmmRegister src);
+  void psadbw(XmmRegister dst, XmmRegister src);
+  void pmaddwd(XmmRegister dst, XmmRegister src);
+  void phaddw(XmmRegister dst, XmmRegister src);
+  void phaddd(XmmRegister dst, XmmRegister src);
+  void haddps(XmmRegister dst, XmmRegister src);
+  void haddpd(XmmRegister dst, XmmRegister src);
+  void phsubw(XmmRegister dst, XmmRegister src);
+  void phsubd(XmmRegister dst, XmmRegister src);
+  void hsubps(XmmRegister dst, XmmRegister src);
+  void hsubpd(XmmRegister dst, XmmRegister src);
+
+  void pminsb(XmmRegister dst, XmmRegister src);  // no addr variant (for now)
+  void pmaxsb(XmmRegister dst, XmmRegister src);
+  void pminsw(XmmRegister dst, XmmRegister src);
+  void pmaxsw(XmmRegister dst, XmmRegister src);
+  void pminsd(XmmRegister dst, XmmRegister src);
+  void pmaxsd(XmmRegister dst, XmmRegister src);
+
+  void pminub(XmmRegister dst, XmmRegister src);  // no addr variant (for now)
+  void pmaxub(XmmRegister dst, XmmRegister src);
+  void pminuw(XmmRegister dst, XmmRegister src);
+  void pmaxuw(XmmRegister dst, XmmRegister src);
+  void pminud(XmmRegister dst, XmmRegister src);
+  void pmaxud(XmmRegister dst, XmmRegister src);
+
+  void minps(XmmRegister dst, XmmRegister src);  // no addr variant (for now)
+  void maxps(XmmRegister dst, XmmRegister src);
+  void minpd(XmmRegister dst, XmmRegister src);
+  void maxpd(XmmRegister dst, XmmRegister src);
+
+  void pcmpeqb(XmmRegister dst, XmmRegister src);
+  void pcmpeqw(XmmRegister dst, XmmRegister src);
+  void pcmpeqd(XmmRegister dst, XmmRegister src);
+  void pcmpeqq(XmmRegister dst, XmmRegister src);
+
+  void pcmpgtb(XmmRegister dst, XmmRegister src);
+  void pcmpgtw(XmmRegister dst, XmmRegister src);
+  void pcmpgtd(XmmRegister dst, XmmRegister src);
+  void pcmpgtq(XmmRegister dst, XmmRegister src);  // SSE4.2
+
+  void shufpd(XmmRegister dst, XmmRegister src, const Immediate& imm);
+  void shufps(XmmRegister dst, XmmRegister src, const Immediate& imm);
+  void pshufd(XmmRegister dst, XmmRegister src, const Immediate& imm);
+
+  void punpcklbw(XmmRegister dst, XmmRegister src);
+  void punpcklwd(XmmRegister dst, XmmRegister src);
+  void punpckldq(XmmRegister dst, XmmRegister src);
+  void punpcklqdq(XmmRegister dst, XmmRegister src);
+
+  void punpckhbw(XmmRegister dst, XmmRegister src);
+  void punpckhwd(XmmRegister dst, XmmRegister src);
+  void punpckhdq(XmmRegister dst, XmmRegister src);
+  void punpckhqdq(XmmRegister dst, XmmRegister src);
+
+  void psllw(XmmRegister reg, const Immediate& shift_count);
+  void pslld(XmmRegister reg, const Immediate& shift_count);
+  void psllq(XmmRegister reg, const Immediate& shift_count);
+
+  void psraw(XmmRegister reg, const Immediate& shift_count);
+  void psrad(XmmRegister reg, const Immediate& shift_count);
+  // no psraq
+
+  void psrlw(XmmRegister reg, const Immediate& shift_count);
+  void psrld(XmmRegister reg, const Immediate& shift_count);
+  void psrlq(XmmRegister reg, const Immediate& shift_count);
+  void psrldq(XmmRegister reg, const Immediate& shift_count);
 
   void flds(const Address& src);
   void fstps(const Address& dst);
@@ -362,6 +608,7 @@ class X86Assembler FINAL : public Assembler {
   void xchgl(Register dst, Register src);
   void xchgl(Register reg, const Address& address);
 
+  void cmpb(const Address& address, const Immediate& imm);
   void cmpw(const Address& address, const Immediate& imm);
 
   void cmpl(Register reg, const Immediate& imm);
@@ -374,6 +621,9 @@ class X86Assembler FINAL : public Assembler {
   void testl(Register reg1, Register reg2);
   void testl(Register reg, const Immediate& imm);
   void testl(Register reg1, const Address& address);
+
+  void testb(const Address& dst, const Immediate& imm);
+  void testl(const Address& dst, const Immediate& imm);
 
   void andl(Register dst, const Immediate& imm);
   void andl(Register dst, Register src);
@@ -393,6 +643,7 @@ class X86Assembler FINAL : public Assembler {
 
   void addl(const Address& address, Register reg);
   void addl(const Address& address, const Immediate& imm);
+  void addw(const Address& address, const Immediate& imm);
 
   void adcl(Register dst, Register src);
   void adcl(Register reg, const Immediate& imm);
@@ -409,6 +660,7 @@ class X86Assembler FINAL : public Assembler {
 
   void imull(Register dst, Register src);
   void imull(Register reg, const Immediate& imm);
+  void imull(Register dst, Register src, const Immediate& imm);
   void imull(Register reg, const Address& address);
 
   void imull(Register reg);
@@ -459,12 +711,21 @@ class X86Assembler FINAL : public Assembler {
   void hlt();
 
   void j(Condition condition, Label* label);
+  void j(Condition condition, NearLabel* label);
+  void jecxz(NearLabel* label);
 
   void jmp(Register reg);
   void jmp(const Address& address);
   void jmp(Label* label);
+  void jmp(NearLabel* label);
 
+  void repne_scasb();
   void repne_scasw();
+  void repe_cmpsb();
+  void repe_cmpsw();
+  void repe_cmpsl();
+  void rep_movsb();
+  void rep_movsw();
 
   X86Assembler* lock();
   void cmpxchgl(const Address& address, Register reg);
@@ -497,124 +758,65 @@ class X86Assembler FINAL : public Assembler {
   //
   int PreferredLoopAlignment() { return 16; }
   void Align(int alignment, int offset);
-  void Bind(Label* label);
+  void Bind(Label* label) OVERRIDE;
+  void Jump(Label* label) OVERRIDE {
+    jmp(label);
+  }
+  void Bind(NearLabel* label);
 
   //
-  // Overridden common assembler high-level functionality
+  // Heap poisoning.
   //
 
-  // Emit code that will create an activation on the stack
-  void BuildFrame(size_t frame_size, ManagedRegister method_reg,
-                  const std::vector<ManagedRegister>& callee_save_regs,
-                  const ManagedRegisterEntrySpills& entry_spills) OVERRIDE;
+  // Poison a heap reference contained in `reg`.
+  void PoisonHeapReference(Register reg) { negl(reg); }
+  // Unpoison a heap reference contained in `reg`.
+  void UnpoisonHeapReference(Register reg) { negl(reg); }
+  // Poison a heap reference contained in `reg` if heap poisoning is enabled.
+  void MaybePoisonHeapReference(Register reg) {
+    if (kPoisonHeapReferences) {
+      PoisonHeapReference(reg);
+    }
+  }
+  // Unpoison a heap reference contained in `reg` if heap poisoning is enabled.
+  void MaybeUnpoisonHeapReference(Register reg) {
+    if (kPoisonHeapReferences) {
+      UnpoisonHeapReference(reg);
+    }
+  }
 
-  // Emit code that will remove an activation from the stack
-  void RemoveFrame(size_t frame_size, const std::vector<ManagedRegister>& callee_save_regs)
-      OVERRIDE;
+  // Add a double to the constant area, returning the offset into
+  // the constant area where the literal resides.
+  size_t AddDouble(double v) { return constant_area_.AddDouble(v); }
 
-  void IncreaseFrameSize(size_t adjust) OVERRIDE;
-  void DecreaseFrameSize(size_t adjust) OVERRIDE;
+  // Add a float to the constant area, returning the offset into
+  // the constant area where the literal resides.
+  size_t AddFloat(float v)   { return constant_area_.AddFloat(v); }
 
-  // Store routines
-  void Store(FrameOffset offs, ManagedRegister src, size_t size) OVERRIDE;
-  void StoreRef(FrameOffset dest, ManagedRegister src) OVERRIDE;
-  void StoreRawPtr(FrameOffset dest, ManagedRegister src) OVERRIDE;
+  // Add an int32_t to the constant area, returning the offset into
+  // the constant area where the literal resides.
+  size_t AddInt32(int32_t v) {
+    return constant_area_.AddInt32(v);
+  }
 
-  void StoreImmediateToFrame(FrameOffset dest, uint32_t imm, ManagedRegister scratch) OVERRIDE;
+  // Add an int32_t to the end of the constant area, returning the offset into
+  // the constant area where the literal resides.
+  size_t AppendInt32(int32_t v) {
+    return constant_area_.AppendInt32(v);
+  }
 
-  void StoreImmediateToThread32(ThreadOffset<4> dest, uint32_t imm, ManagedRegister scratch)
-      OVERRIDE;
+  // Add an int64_t to the constant area, returning the offset into
+  // the constant area where the literal resides.
+  size_t AddInt64(int64_t v) { return constant_area_.AddInt64(v); }
 
-  void StoreStackOffsetToThread32(ThreadOffset<4> thr_offs, FrameOffset fr_offs,
-                                  ManagedRegister scratch) OVERRIDE;
+  // Add the contents of the constant area to the assembler buffer.
+  void AddConstantArea();
 
-  void StoreStackPointerToThread32(ThreadOffset<4> thr_offs) OVERRIDE;
+  // Is the constant area empty? Return true if there are no literals in the constant area.
+  bool IsConstantAreaEmpty() const { return constant_area_.IsEmpty(); }
 
-  void StoreSpanning(FrameOffset dest, ManagedRegister src, FrameOffset in_off,
-                     ManagedRegister scratch) OVERRIDE;
-
-  // Load routines
-  void Load(ManagedRegister dest, FrameOffset src, size_t size) OVERRIDE;
-
-  void LoadFromThread32(ManagedRegister dest, ThreadOffset<4> src, size_t size) OVERRIDE;
-
-  void LoadRef(ManagedRegister dest, FrameOffset src) OVERRIDE;
-
-  void LoadRef(ManagedRegister dest, ManagedRegister base, MemberOffset offs,
-               bool poison_reference) OVERRIDE;
-
-  void LoadRawPtr(ManagedRegister dest, ManagedRegister base, Offset offs) OVERRIDE;
-
-  void LoadRawPtrFromThread32(ManagedRegister dest, ThreadOffset<4> offs) OVERRIDE;
-
-  // Copying routines
-  void Move(ManagedRegister dest, ManagedRegister src, size_t size) OVERRIDE;
-
-  void CopyRawPtrFromThread32(FrameOffset fr_offs, ThreadOffset<4> thr_offs,
-                              ManagedRegister scratch) OVERRIDE;
-
-  void CopyRawPtrToThread32(ThreadOffset<4> thr_offs, FrameOffset fr_offs, ManagedRegister scratch)
-      OVERRIDE;
-
-  void CopyRef(FrameOffset dest, FrameOffset src, ManagedRegister scratch) OVERRIDE;
-
-  void Copy(FrameOffset dest, FrameOffset src, ManagedRegister scratch, size_t size) OVERRIDE;
-
-  void Copy(FrameOffset dest, ManagedRegister src_base, Offset src_offset, ManagedRegister scratch,
-            size_t size) OVERRIDE;
-
-  void Copy(ManagedRegister dest_base, Offset dest_offset, FrameOffset src, ManagedRegister scratch,
-            size_t size) OVERRIDE;
-
-  void Copy(FrameOffset dest, FrameOffset src_base, Offset src_offset, ManagedRegister scratch,
-            size_t size) OVERRIDE;
-
-  void Copy(ManagedRegister dest, Offset dest_offset, ManagedRegister src, Offset src_offset,
-            ManagedRegister scratch, size_t size) OVERRIDE;
-
-  void Copy(FrameOffset dest, Offset dest_offset, FrameOffset src, Offset src_offset,
-            ManagedRegister scratch, size_t size) OVERRIDE;
-
-  void MemoryBarrier(ManagedRegister) OVERRIDE;
-
-  // Sign extension
-  void SignExtend(ManagedRegister mreg, size_t size) OVERRIDE;
-
-  // Zero extension
-  void ZeroExtend(ManagedRegister mreg, size_t size) OVERRIDE;
-
-  // Exploit fast access in managed code to Thread::Current()
-  void GetCurrentThread(ManagedRegister tr) OVERRIDE;
-  void GetCurrentThread(FrameOffset dest_offset, ManagedRegister scratch) OVERRIDE;
-
-  // Set up out_reg to hold a Object** into the handle scope, or to be null if the
-  // value is null and null_allowed. in_reg holds a possibly stale reference
-  // that can be used to avoid loading the handle scope entry to see if the value is
-  // null.
-  void CreateHandleScopeEntry(ManagedRegister out_reg, FrameOffset handlescope_offset,
-                              ManagedRegister in_reg, bool null_allowed) OVERRIDE;
-
-  // Set up out_off to hold a Object** into the handle scope, or to be null if the
-  // value is null and null_allowed.
-  void CreateHandleScopeEntry(FrameOffset out_off, FrameOffset handlescope_offset,
-                              ManagedRegister scratch, bool null_allowed) OVERRIDE;
-
-  // src holds a handle scope entry (Object**) load this into dst
-  void LoadReferenceFromHandleScope(ManagedRegister dst, ManagedRegister src) OVERRIDE;
-
-  // Heap::VerifyObject on src. In some cases (such as a reference to this) we
-  // know that src may not be null.
-  void VerifyObject(ManagedRegister src, bool could_be_null) OVERRIDE;
-  void VerifyObject(FrameOffset src, bool could_be_null) OVERRIDE;
-
-  // Call to address held at [base+offset]
-  void Call(ManagedRegister base, Offset offset, ManagedRegister scratch) OVERRIDE;
-  void Call(FrameOffset base, Offset offset, ManagedRegister scratch) OVERRIDE;
-  void CallFromThread32(ThreadOffset<4> offset, ManagedRegister scratch) OVERRIDE;
-
-  // Generate code to check if Thread::Current()->exception_ is non-null
-  // and branch to a ExceptionSlowPath if it is.
-  void ExceptionPoll(ManagedRegister scratch, size_t stack_adjust) OVERRIDE;
+  // Return the current size of the constant area.
+  size_t ConstantAreaSize() const { return constant_area_.GetSize(); }
 
  private:
   inline void EmitUint8(uint8_t value);
@@ -625,14 +827,17 @@ class X86Assembler FINAL : public Assembler {
   inline void EmitOperandSizeOverride();
 
   void EmitOperand(int rm, const Operand& operand);
-  void EmitImmediate(const Immediate& imm);
-  void EmitComplex(int rm, const Operand& operand, const Immediate& immediate);
+  void EmitImmediate(const Immediate& imm, bool is_16_op = false);
+  void EmitComplex(
+      int rm, const Operand& operand, const Immediate& immediate, bool is_16_op = false);
   void EmitLabel(Label* label, int instruction_size);
   void EmitLabelLink(Label* label);
-  void EmitNearLabelLink(Label* label);
+  void EmitLabelLink(NearLabel* label);
 
   void EmitGenericShift(int rm, const Operand& operand, const Immediate& imm);
   void EmitGenericShift(int rm, const Operand& operand, Register shifter);
+
+  ConstantArea constant_area_;
 
   DISALLOW_COPY_AND_ASSIGN(X86Assembler);
 };
@@ -662,15 +867,6 @@ inline void X86Assembler::EmitFixup(AssemblerFixup* fixup) {
 inline void X86Assembler::EmitOperandSizeOverride() {
   EmitUint8(0x66);
 }
-
-// Slowpath entered when Thread::Current()->_exception is non-null
-class X86ExceptionSlowPath FINAL : public SlowPath {
- public:
-  explicit X86ExceptionSlowPath(size_t stack_adjust) : stack_adjust_(stack_adjust) {}
-  virtual void Emit(Assembler *sp_asm) OVERRIDE;
- private:
-  const size_t stack_adjust_;
-};
 
 }  // namespace x86
 }  // namespace art

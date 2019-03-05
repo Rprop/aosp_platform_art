@@ -14,191 +14,344 @@
  * limitations under the License.
  */
 
-#ifdef HAVE_ANDROID_OS
-#include <android/log.h>
-#else
-#include <stdarg.h>
-#include <iostream>
-#endif
-
 #include <dlfcn.h>
+#include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
+#include <algorithm>
+#include <initializer_list>
+#include <mutex>
+#include <type_traits>
+#include <utility>
+
+#include "log.h"
 #include "sigchain.h"
 
 #if defined(__APPLE__)
 #define _NSIG NSIG
 #define sighandler_t sig_t
+
+// Darwin has an #error when ucontext.h is included without _XOPEN_SOURCE defined.
+#define _XOPEN_SOURCE
 #endif
+
+#include <ucontext.h>
+
+// libsigchain provides an interception layer for signal handlers, to allow ART and others to give
+// their signal handlers the first stab at handling signals before passing them on to user code.
+//
+// It implements wrapper functions for signal, sigaction, and sigprocmask, and a handler that
+// forwards signals appropriately.
+//
+// In our handler, we start off with all signals blocked, fetch the original signal mask from the
+// passed in ucontext, and then adjust our signal mask appropriately for the user handler.
+//
+// It's somewhat tricky for us to properly handle some flag cases:
+//   SA_NOCLDSTOP and SA_NOCLDWAIT: shouldn't matter, we don't have special handlers for SIGCHLD.
+//   SA_NODEFER: unimplemented, we can manually change the signal mask appropriately.
+//  ~SA_ONSTACK: always silently enable this
+//   SA_RESETHAND: unimplemented, but we can probably do this?
+//  ~SA_RESTART: unimplemented, maybe we can reserve an RT signal, register an empty handler that
+//               doesn't have SA_RESTART, and raise the signal to avoid restarting syscalls that are
+//               expected to be interrupted?
+
+#if defined(__BIONIC__) && !defined(__LP64__) && !defined(__mips__)
+static int sigismember(const sigset64_t* sigset, int signum) {
+  return sigismember64(sigset, signum);
+}
+
+static int sigemptyset(sigset64_t* sigset) {
+  return sigemptyset64(sigset);
+}
+
+static int sigaddset(sigset64_t* sigset, int signum) {
+  return sigaddset64(sigset, signum);
+}
+
+static int sigdelset(sigset64_t* sigset, int signum) {
+  return sigdelset64(sigset, signum);
+}
+#endif
+
+template<typename SigsetType>
+static int sigorset(SigsetType* dest, SigsetType* left, SigsetType* right) {
+  sigemptyset(dest);
+  for (size_t i = 0; i < sizeof(SigsetType) * CHAR_BIT; ++i) {
+    if (sigismember(left, i) == 1 || sigismember(right, i) == 1) {
+      sigaddset(dest, i);
+    }
+  }
+  return 0;
+}
 
 namespace art {
 
-typedef int (*SigActionFnPtr)(int, const struct sigaction*, struct sigaction*);
+static decltype(&sigaction) linked_sigaction;
+static decltype(&sigprocmask) linked_sigprocmask;
 
-class SignalAction {
+#if defined(__BIONIC__)
+static decltype(&sigaction64) linked_sigaction64;
+static decltype(&sigprocmask64) linked_sigprocmask64;
+#endif
+
+template<typename T>
+static void lookup_next_symbol(T* output, T wrapper, const char* name) {
+  void* sym = dlsym(RTLD_NEXT, name);
+  if (sym == nullptr) {
+    sym = dlsym(RTLD_DEFAULT, name);
+    if (sym == wrapper || sym == sigaction) {
+      fatal("Unable to find next %s in signal chain", name);
+    }
+  }
+  *output = reinterpret_cast<T>(sym);
+}
+
+__attribute__((constructor)) static void InitializeSignalChain() {
+  static std::once_flag once;
+  std::call_once(once, []() {
+    lookup_next_symbol(&linked_sigaction, sigaction, "sigaction");
+    lookup_next_symbol(&linked_sigprocmask, sigprocmask, "sigprocmask");
+
+#if defined(__BIONIC__)
+    lookup_next_symbol(&linked_sigaction64, sigaction64, "sigaction64");
+    lookup_next_symbol(&linked_sigprocmask64, sigprocmask64, "sigprocmask64");
+#endif
+  });
+}
+
+static pthread_key_t GetHandlingSignalKey() {
+  static pthread_key_t key;
+  static std::once_flag once;
+  std::call_once(once, []() {
+    int rc = pthread_key_create(&key, nullptr);
+    if (rc != 0) {
+      fatal("failed to create sigchain pthread key: %s", strerror(rc));
+    }
+  });
+  return key;
+}
+
+static bool GetHandlingSignal() {
+  void* result = pthread_getspecific(GetHandlingSignalKey());
+  return reinterpret_cast<uintptr_t>(result);
+}
+
+static void SetHandlingSignal(bool value) {
+  pthread_setspecific(GetHandlingSignalKey(),
+                      reinterpret_cast<void*>(static_cast<uintptr_t>(value)));
+}
+
+class ScopedHandlingSignal {
  public:
-  SignalAction() : claimed_(false), uses_old_style_(false), special_handler_(nullptr) {
+  ScopedHandlingSignal() : original_value_(GetHandlingSignal()) {
   }
 
-  // Claim the signal and keep the action specified.
-  void Claim(const struct sigaction& action) {
-    action_ = action;
-    claimed_ = true;
-  }
-
-  // Unclaim the signal and restore the old action.
-  void Unclaim(int signal) {
-    claimed_ = false;
-    sigaction(signal, &action_, nullptr);        // Restore old action.
-  }
-
-  // Get the action associated with this signal.
-  const struct sigaction& GetAction() const {
-    return action_;
-  }
-
-  // Is the signal claimed?
-  bool IsClaimed() const {
-    return claimed_;
-  }
-
-  // Change the recorded action to that specified.
-  // If oldstyle is true then this action is from an older style signal()
-  // call as opposed to sigaction().  In this case the sa_handler is
-  // used when invoking the user's handler.
-  void SetAction(const struct sigaction& action, bool oldstyle) {
-    action_ = action;
-    uses_old_style_ = oldstyle;
-  }
-
-  bool OldStyle() const {
-    return uses_old_style_;
-  }
-
-  void SetSpecialHandler(SpecialSignalHandlerFn fn) {
-    special_handler_ = fn;
-  }
-
-  SpecialSignalHandlerFn GetSpecialHandler() {
-    return special_handler_;
+  ~ScopedHandlingSignal() {
+    SetHandlingSignal(original_value_);
   }
 
  private:
-  struct sigaction action_;                 // Action to be performed.
-  bool claimed_;                            // Whether signal is claimed or not.
-  bool uses_old_style_;                     // Action is created using signal().  Use sa_handler.
-  SpecialSignalHandlerFn special_handler_;  // A special handler executed before user handlers.
+  bool original_value_;
 };
 
-// User's signal handlers
-static SignalAction user_sigactions[_NSIG];
-static bool initialized;
-static void* linked_sigaction_sym;
-static void* linked_sigprocmask_sym;
+class SignalChain {
+ public:
+  SignalChain() : claimed_(false) {
+  }
 
-static void log(const char* format, ...) {
-  char buf[256];
-  va_list ap;
-  va_start(ap, format);
-  vsnprintf(buf, sizeof(buf), format, ap);
-#ifdef HAVE_ANDROID_OS
-  __android_log_write(ANDROID_LOG_ERROR, "libsigchain", buf);
+  bool IsClaimed() {
+    return claimed_;
+  }
+
+  void Claim(int signo) {
+    if (!claimed_) {
+      Register(signo);
+      claimed_ = true;
+    }
+  }
+
+  // Register the signal chain with the kernel if needed.
+  void Register(int signo) {
+#if defined(__BIONIC__)
+    struct sigaction64 handler_action = {};
+    sigfillset64(&handler_action.sa_mask);
 #else
-  std::cout << buf << "\n";
+    struct sigaction handler_action = {};
+    sigfillset(&handler_action.sa_mask);
 #endif
-  va_end(ap);
-}
 
-static void CheckSignalValid(int signal) {
-  if (signal <= 0 || signal >= _NSIG) {
-    log("Invalid signal %d", signal);
-    abort();
-  }
-}
+    handler_action.sa_sigaction = SignalChain::Handler;
+    handler_action.sa_flags = SA_RESTART | SA_SIGINFO | SA_ONSTACK;
 
-// Sigchainlib's own handler so we can ensure a managed handler is called first even if nobody
-// claimed a chain. Simply forward to InvokeUserSignalHandler.
-static void sigchainlib_managed_handler_sigaction(int sig, siginfo_t* info, void* context) {
-  InvokeUserSignalHandler(sig, info, context);
-}
-
-// Claim a signal chain for a particular signal.
-extern "C" void ClaimSignalChain(int signal, struct sigaction* oldaction) {
-  CheckSignalValid(signal);
-
-  user_sigactions[signal].Claim(*oldaction);
-}
-
-extern "C" void UnclaimSignalChain(int signal) {
-  CheckSignalValid(signal);
-
-  user_sigactions[signal].Unclaim(signal);
-}
-
-// Invoke the user's signal handler.
-extern "C" void InvokeUserSignalHandler(int sig, siginfo_t* info, void* context) {
-  // Check the arguments.
-  CheckSignalValid(sig);
-
-  // The signal must have been claimed in order to get here.  Check it.
-  if (!user_sigactions[sig].IsClaimed()) {
-    abort();
+#if defined(__BIONIC__)
+    linked_sigaction64(signo, &handler_action, &action_);
+#else
+    linked_sigaction(signo, &handler_action, &action_);
+#endif
   }
 
-  // Do we have a managed handler? If so, run it first.
-  SpecialSignalHandlerFn managed = user_sigactions[sig].GetSpecialHandler();
-  if (managed != nullptr) {
-    // Call the handler. If it succeeds, we're done.
-    if (managed(sig, info, context)) {
-      return;
-    }
-  }
-
-  const struct sigaction& action = user_sigactions[sig].GetAction();
-  if (user_sigactions[sig].OldStyle()) {
-    if (action.sa_handler != nullptr) {
-      action.sa_handler(sig);
+  template <typename SigactionType>
+  SigactionType GetAction() {
+    if constexpr (std::is_same_v<decltype(action_), SigactionType>) {
+      return action_;
     } else {
-      signal(sig, SIG_DFL);
-      raise(sig);
+      SigactionType result;
+      result.sa_flags = action_.sa_flags;
+      result.sa_handler = action_.sa_handler;
+#if defined(SA_RESTORER)
+      result.sa_restorer = action_.sa_restorer;
+#endif
+      memcpy(&result.sa_mask, &action_.sa_mask,
+             std::min(sizeof(action_.sa_mask), sizeof(result.sa_mask)));
+      return result;
     }
+  }
+
+  template <typename SigactionType>
+  void SetAction(const SigactionType* new_action) {
+    if constexpr (std::is_same_v<decltype(action_), SigactionType>) {
+      action_ = *new_action;
+    } else {
+      action_.sa_flags = new_action->sa_flags;
+      action_.sa_handler = new_action->sa_handler;
+#if defined(SA_RESTORER)
+      action_.sa_restorer = new_action->sa_restorer;
+#endif
+      sigemptyset(&action_.sa_mask);
+      memcpy(&action_.sa_mask, &new_action->sa_mask,
+             std::min(sizeof(action_.sa_mask), sizeof(new_action->sa_mask)));
+    }
+  }
+
+  void AddSpecialHandler(SigchainAction* sa) {
+    for (SigchainAction& slot : special_handlers_) {
+      if (slot.sc_sigaction == nullptr) {
+        slot = *sa;
+        return;
+      }
+    }
+
+    fatal("too many special signal handlers");
+  }
+
+  void RemoveSpecialHandler(bool (*fn)(int, siginfo_t*, void*)) {
+    // This isn't thread safe, but it's unlikely to be a real problem.
+    size_t len = sizeof(special_handlers_)/sizeof(*special_handlers_);
+    for (size_t i = 0; i < len; ++i) {
+      if (special_handlers_[i].sc_sigaction == fn) {
+        for (size_t j = i; j < len - 1; ++j) {
+          special_handlers_[j] = special_handlers_[j + 1];
+        }
+        special_handlers_[len - 1].sc_sigaction = nullptr;
+        return;
+      }
+    }
+
+    fatal("failed to find special handler to remove");
+  }
+
+
+  static void Handler(int signo, siginfo_t* siginfo, void*);
+
+ private:
+  bool claimed_;
+#if defined(__BIONIC__)
+  struct sigaction64 action_;
+#else
+  struct sigaction action_;
+#endif
+  SigchainAction special_handlers_[2];
+};
+
+// _NSIG is 1 greater than the highest valued signal, but signals start from 1.
+// Leave an empty element at index 0 for convenience.
+static SignalChain chains[_NSIG + 1];
+
+void SignalChain::Handler(int signo, siginfo_t* siginfo, void* ucontext_raw) {
+  // Try the special handlers first.
+  // If one of them crashes, we'll reenter this handler and pass that crash onto the user handler.
+  if (!GetHandlingSignal()) {
+    for (const auto& handler : chains[signo].special_handlers_) {
+      if (handler.sc_sigaction == nullptr) {
+        break;
+      }
+
+      // The native bridge signal handler might not return.
+      // Avoid setting the thread local flag in this case, since we'll never
+      // get a chance to restore it.
+      bool handler_noreturn = (handler.sc_flags & SIGCHAIN_ALLOW_NORETURN);
+      sigset_t previous_mask;
+      linked_sigprocmask(SIG_SETMASK, &handler.sc_mask, &previous_mask);
+
+      ScopedHandlingSignal restorer;
+      if (!handler_noreturn) {
+        SetHandlingSignal(true);
+      }
+
+      if (handler.sc_sigaction(signo, siginfo, ucontext_raw)) {
+        return;
+      }
+
+      linked_sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
+    }
+  }
+
+  // Forward to the user's signal handler.
+  int handler_flags = chains[signo].action_.sa_flags;
+  ucontext_t* ucontext = static_cast<ucontext_t*>(ucontext_raw);
+#if defined(__BIONIC__)
+  sigset64_t mask;
+  sigorset(&mask, &ucontext->uc_sigmask64, &chains[signo].action_.sa_mask);
+#else
+  sigset_t mask;
+  sigorset(&mask, &ucontext->uc_sigmask, &chains[signo].action_.sa_mask);
+#endif
+  if (!(handler_flags & SA_NODEFER)) {
+    sigaddset(&mask, signo);
+  }
+
+#if defined(__BIONIC__)
+  linked_sigprocmask64(SIG_SETMASK, &mask, nullptr);
+#else
+  linked_sigprocmask(SIG_SETMASK, &mask, nullptr);
+#endif
+
+  if ((handler_flags & SA_SIGINFO)) {
+    chains[signo].action_.sa_sigaction(signo, siginfo, ucontext_raw);
   } else {
-    if (action.sa_sigaction != nullptr) {
-      action.sa_sigaction(sig, info, context);
+    auto handler = chains[signo].action_.sa_handler;
+    if (handler == SIG_IGN) {
+      return;
+    } else if (handler == SIG_DFL) {
+      fatal("exiting due to SIG_DFL handler for signal %d", signo);
     } else {
-      signal(sig, SIG_DFL);
-      raise(sig);
+      handler(signo);
     }
   }
 }
 
-extern "C" void EnsureFrontOfChain(int signal, struct sigaction* expected_action) {
-  CheckSignalValid(signal);
-  // Read the current action without looking at the chain, it should be the expected action.
-  SigActionFnPtr linked_sigaction = reinterpret_cast<SigActionFnPtr>(linked_sigaction_sym);
-  struct sigaction current_action;
-  linked_sigaction(signal, nullptr, &current_action);
-  // If the sigactions don't match then we put the current action on the chain and make ourself as
-  // the main action.
-  if (current_action.sa_sigaction != expected_action->sa_sigaction) {
-    log("Warning: Unexpected sigaction action found %p\n", current_action.sa_sigaction);
-    user_sigactions[signal].Claim(current_action);
-    linked_sigaction(signal, expected_action, nullptr);
-  }
-}
-
-extern "C" int sigaction(int signal, const struct sigaction* new_action, struct sigaction* old_action) {
+template <typename SigactionType>
+static int __sigaction(int signal, const SigactionType* new_action,
+                       SigactionType* old_action,
+                       int (*linked)(int, const SigactionType*,
+                                     SigactionType*)) {
   // If this signal has been claimed as a signal chain, record the user's
   // action but don't pass it on to the kernel.
   // Note that we check that the signal number is in range here.  An out of range signal
   // number should behave exactly as the libc sigaction.
-  if (signal > 0 && signal < _NSIG && user_sigactions[signal].IsClaimed() &&
-      (new_action == nullptr || new_action->sa_handler != SIG_DFL)) {
-    struct sigaction saved_action = user_sigactions[signal].GetAction();
+  if (signal <= 0 || signal >= _NSIG) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  if (chains[signal].IsClaimed()) {
+    SigactionType saved_action = chains[signal].GetAction<SigactionType>();
     if (new_action != nullptr) {
-      user_sigactions[signal].SetAction(*new_action, false);
+      chains[signal].SetAction(new_action);
     }
     if (old_action != nullptr) {
       *old_action = saved_action;
@@ -208,73 +361,81 @@ extern "C" int sigaction(int signal, const struct sigaction* new_action, struct 
 
   // Will only get here if the signal chain has not been claimed.  We want
   // to pass the sigaction on to the kernel via the real sigaction in libc.
-
-  if (linked_sigaction_sym == nullptr) {
-    // Perform lazy initialization.
-    // This will only occur outside of a signal context since we have
-    // not been initialized and therefore cannot be within the ART
-    // runtime.
-    InitializeSignalChain();
-  }
-
-  if (linked_sigaction_sym == nullptr) {
-    log("Unable to find next sigaction in signal chain");
-    abort();
-  }
-  SigActionFnPtr linked_sigaction = reinterpret_cast<SigActionFnPtr>(linked_sigaction_sym);
-  return linked_sigaction(signal, new_action, old_action);
+  return linked(signal, new_action, old_action);
 }
 
-extern "C" sighandler_t signal(int signal, sighandler_t handler) {
-  struct sigaction sa;
+extern "C" int sigaction(int signal, const struct sigaction* new_action,
+                         struct sigaction* old_action) {
+  InitializeSignalChain();
+  return __sigaction(signal, new_action, old_action, linked_sigaction);
+}
+
+#if defined(__BIONIC__)
+extern "C" int sigaction64(int signal, const struct sigaction64* new_action,
+                           struct sigaction64* old_action) {
+  InitializeSignalChain();
+  return __sigaction(signal, new_action, old_action, linked_sigaction64);
+}
+#endif
+
+extern "C" sighandler_t signal(int signo, sighandler_t handler) {
+  InitializeSignalChain();
+
+  if (signo <= 0 || signo >= _NSIG) {
+    errno = EINVAL;
+    return SIG_ERR;
+  }
+
+  struct sigaction sa = {};
   sigemptyset(&sa.sa_mask);
   sa.sa_handler = handler;
-  sa.sa_flags = SA_RESTART;
+  sa.sa_flags = SA_RESTART | SA_ONSTACK;
   sighandler_t oldhandler;
 
   // If this signal has been claimed as a signal chain, record the user's
   // action but don't pass it on to the kernel.
-  // Note that we check that the signal number is in range here.  An out of range signal
-  // number should behave exactly as the libc sigaction.
-  if (signal > 0 && signal < _NSIG && user_sigactions[signal].IsClaimed() && handler != SIG_DFL) {
-    oldhandler = reinterpret_cast<sighandler_t>(user_sigactions[signal].GetAction().sa_handler);
-    user_sigactions[signal].SetAction(sa, true);
+  if (chains[signo].IsClaimed()) {
+    oldhandler = reinterpret_cast<sighandler_t>(
+        chains[signo].GetAction<struct sigaction>().sa_handler);
+    chains[signo].SetAction(&sa);
     return oldhandler;
   }
 
   // Will only get here if the signal chain has not been claimed.  We want
   // to pass the sigaction on to the kernel via the real sigaction in libc.
-
-  if (linked_sigaction_sym == nullptr) {
-    // Perform lazy initialization.
-    InitializeSignalChain();
-  }
-
-  if (linked_sigaction_sym == nullptr) {
-    log("Unable to find next sigaction in signal chain");
-    abort();
-  }
-
-  typedef int (*SigAction)(int, const struct sigaction*, struct sigaction*);
-  SigAction linked_sigaction = reinterpret_cast<SigAction>(linked_sigaction_sym);
-  if (linked_sigaction(signal, &sa, &sa) == -1) {
+  if (linked_sigaction(signo, &sa, &sa) == -1) {
     return SIG_ERR;
   }
 
   return reinterpret_cast<sighandler_t>(sa.sa_handler);
 }
 
-extern "C" int sigprocmask(int how, const sigset_t* bionic_new_set, sigset_t* bionic_old_set) {
-  const sigset_t* new_set_ptr = bionic_new_set;
-  sigset_t tmpset;
-  if (bionic_new_set != nullptr) {
-    tmpset = *bionic_new_set;
+#if !defined(__LP64__)
+extern "C" sighandler_t bsd_signal(int signo, sighandler_t handler) {
+  InitializeSignalChain();
 
-    if (how == SIG_BLOCK) {
+  return signal(signo, handler);
+}
+#endif
+
+template <typename SigsetType>
+int __sigprocmask(int how, const SigsetType* new_set, SigsetType* old_set,
+                  int (*linked)(int, const SigsetType*, SigsetType*)) {
+  // When inside a signal handler, forward directly to the actual sigprocmask.
+  if (GetHandlingSignal()) {
+    return linked(how, new_set, old_set);
+  }
+
+  const SigsetType* new_set_ptr = new_set;
+  SigsetType tmpset;
+  if (new_set != nullptr) {
+    tmpset = *new_set;
+
+    if (how == SIG_BLOCK || how == SIG_SETMASK) {
       // Don't allow claimed signals in the mask.  If a signal chain has been claimed
       // we can't allow the user to block that signal.
-      for (int i = 0 ; i < _NSIG; ++i) {
-        if (user_sigactions[i].IsClaimed() && sigismember(&tmpset, i)) {
+      for (int i = 1; i < _NSIG; ++i) {
+        if (chains[i].IsClaimed() && sigismember(&tmpset, i)) {
           sigdelset(&tmpset, i);
         }
       }
@@ -282,69 +443,61 @@ extern "C" int sigprocmask(int how, const sigset_t* bionic_new_set, sigset_t* bi
     new_set_ptr = &tmpset;
   }
 
-  if (linked_sigprocmask_sym == nullptr) {
-    // Perform lazy initialization.
-    InitializeSignalChain();
-  }
-
-  if (linked_sigprocmask_sym == nullptr) {
-    log("Unable to find next sigprocmask in signal chain");
-    abort();
-  }
-
-  typedef int (*SigProcMask)(int how, const sigset_t*, sigset_t*);
-  SigProcMask linked_sigprocmask= reinterpret_cast<SigProcMask>(linked_sigprocmask_sym);
-  return linked_sigprocmask(how, new_set_ptr, bionic_old_set);
+  return linked(how, new_set_ptr, old_set);
 }
 
-extern "C" void InitializeSignalChain() {
-  // Warning.
-  // Don't call this from within a signal context as it makes calls to
-  // dlsym.  Calling into the dynamic linker will result in locks being
-  // taken and if it so happens that a signal occurs while one of these
-  // locks is already taken, dlsym will block trying to reenter a
-  // mutex and we will never get out of it.
-  if (initialized) {
-    // Don't initialize twice.
-    return;
-  }
-  linked_sigaction_sym = dlsym(RTLD_NEXT, "sigaction");
-  if (linked_sigaction_sym == nullptr) {
-    linked_sigaction_sym = dlsym(RTLD_DEFAULT, "sigaction");
-    if (linked_sigaction_sym == nullptr ||
-        linked_sigaction_sym == reinterpret_cast<void*>(sigaction)) {
-      linked_sigaction_sym = nullptr;
-    }
-  }
-
-  linked_sigprocmask_sym = dlsym(RTLD_NEXT, "sigprocmask");
-  if (linked_sigprocmask_sym == nullptr) {
-    linked_sigprocmask_sym = dlsym(RTLD_DEFAULT, "sigprocmask");
-    if (linked_sigprocmask_sym == nullptr ||
-        linked_sigprocmask_sym == reinterpret_cast<void*>(sigprocmask)) {
-      linked_sigprocmask_sym = nullptr;
-    }
-  }
-  initialized = true;
+extern "C" int sigprocmask(int how, const sigset_t* new_set,
+                           sigset_t* old_set) {
+  InitializeSignalChain();
+  return __sigprocmask(how, new_set, old_set, linked_sigprocmask);
 }
 
-extern "C" void SetSpecialSignalHandlerFn(int signal, SpecialSignalHandlerFn fn) {
-  CheckSignalValid(signal);
+#if defined(__BIONIC__)
+extern "C" int sigprocmask64(int how, const sigset64_t* new_set,
+                             sigset64_t* old_set) {
+  InitializeSignalChain();
+  return __sigprocmask(how, new_set, old_set, linked_sigprocmask64);
+}
+#endif
+
+extern "C" void AddSpecialSignalHandlerFn(int signal, SigchainAction* sa) {
+  InitializeSignalChain();
+
+  if (signal <= 0 || signal >= _NSIG) {
+    fatal("Invalid signal %d", signal);
+  }
 
   // Set the managed_handler.
-  user_sigactions[signal].SetSpecialHandler(fn);
+  chains[signal].AddSpecialHandler(sa);
+  chains[signal].Claim(signal);
+}
 
-  // In case the chain isn't claimed, claim it for ourself so we can ensure the managed handler
-  // goes first.
-  if (!user_sigactions[signal].IsClaimed()) {
-    struct sigaction tmp;
-    tmp.sa_sigaction = sigchainlib_managed_handler_sigaction;
-    sigemptyset(&tmp.sa_mask);
-    tmp.sa_flags = SA_SIGINFO | SA_ONSTACK;
-#if !defined(__APPLE__) && !defined(__mips__)
-    tmp.sa_restorer = nullptr;
-#endif
-    user_sigactions[signal].Claim(tmp);
+extern "C" void RemoveSpecialSignalHandlerFn(int signal, bool (*fn)(int, siginfo_t*, void*)) {
+  InitializeSignalChain();
+
+  if (signal <= 0 || signal >= _NSIG) {
+    fatal("Invalid signal %d", signal);
+  }
+
+  chains[signal].RemoveSpecialHandler(fn);
+}
+
+extern "C" void EnsureFrontOfChain(int signal) {
+  InitializeSignalChain();
+
+  if (signal <= 0 || signal >= _NSIG) {
+    fatal("Invalid signal %d", signal);
+  }
+
+  // Read the current action without looking at the chain, it should be the expected action.
+  struct sigaction current_action;
+  linked_sigaction(signal, nullptr, &current_action);
+
+  // If the sigactions don't match then we put the current action on the chain and make ourself as
+  // the main action.
+  if (current_action.sa_sigaction != SignalChain::Handler) {
+    log("Warning: Unexpected sigaction action found %p\n", current_action.sa_sigaction);
+    chains[signal].Register(signal);
   }
 }
 

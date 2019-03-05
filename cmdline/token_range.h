@@ -18,10 +18,12 @@
 #define ART_CMDLINE_TOKEN_RANGE_H_
 
 #include <assert.h>
-#include <vector>
-#include <string>
 #include <algorithm>
 #include <memory>
+#include <string>
+#include <vector>
+
+#include "android-base/strings.h"
 
 namespace art {
 // A range of tokens to make token matching algorithms easier.
@@ -45,7 +47,7 @@ struct TokenRange {
 
   // Copying-from-iterator constructor
   template <typename ForwardIterator>
-  explicit TokenRange(ForwardIterator it_begin, ForwardIterator it_end)
+  TokenRange(ForwardIterator it_begin, ForwardIterator it_end)
     : token_list_(new TokenList(it_begin, it_end)),
       begin_(token_list_->begin()),
       end_(token_list_->end())
@@ -374,7 +376,7 @@ struct TokenRange {
   // e.g. ["hello", "world"].join('$') == "hello$world"
   std::string Join(char separator) const {
     TokenList tmp(begin(), end());
-    return art::Join(tmp, separator);
+    return android::base::Join(tmp, separator);
     // TODO: Join should probably take an offset or iterators
   }
 

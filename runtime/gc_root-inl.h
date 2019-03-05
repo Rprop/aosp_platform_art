@@ -21,19 +21,25 @@
 
 #include <sstream>
 
+#include "obj_ptr-inl.h"
 #include "read_barrier-inl.h"
 
 namespace art {
 
 template<class MirrorType>
 template<ReadBarrierOption kReadBarrierOption>
-inline MirrorType* GcRoot<MirrorType>::Read() const {
+inline MirrorType* GcRoot<MirrorType>::Read(GcRootSource* gc_root_source) const {
   return down_cast<MirrorType*>(
-      ReadBarrier::BarrierForRoot<mirror::Object, kReadBarrierOption>(&root_));
+      ReadBarrier::BarrierForRoot<mirror::Object, kReadBarrierOption>(&root_, gc_root_source));
 }
+
 template<class MirrorType>
 inline GcRoot<MirrorType>::GcRoot(MirrorType* ref)
     : root_(mirror::CompressedReference<mirror::Object>::FromMirrorPtr(ref)) { }
+
+template<class MirrorType>
+inline GcRoot<MirrorType>::GcRoot(ObjPtr<MirrorType> ref)
+    : GcRoot(ref.Ptr()) { }
 
 inline std::string RootInfo::ToString() const {
   std::ostringstream oss;

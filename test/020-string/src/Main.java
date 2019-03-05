@@ -25,6 +25,7 @@ public class Main {
         basicTest();
         indexTest();
         constructorTest();
+        copyTest();
     }
 
     public static void basicTest() {
@@ -44,7 +45,14 @@ public class Main {
         if (testStr.length() != testStr2.length())
             System.out.println("WARNING: stringTest length mismatch");
 
-        System.out.println("Compare result is " + testStr.compareTo(testStr2));
+        int compareResult = testStr.compareTo(testStr2);
+        if (compareResult > 0) {
+          System.out.println("Compare result is greater than zero");
+        } else if (compareResult == 0) {
+          System.out.println("Compare result is equal to zero");
+        } else {
+          System.out.println("Compare result is less than zero");
+        }
 
         // expected: -65302
         String s1 = "\u0c6d\u0cb6\u0d00\u0000\u0080\u0080\u0080\u0000\u0002\u0002\u0002\u0000\u00e9\u00e9\u00e9";
@@ -116,5 +124,49 @@ public class Main {
         String s13 = new String(stringBuffer);
         String s14 = new String(codePoints, 1, 3);
         String s15 = new String(stringBuilder);
+    }
+
+    public static void copyTest() {
+        String src = new String("Hello Android");
+        char[] dst = new char[7];
+        char[] tmp = null;
+
+        try {
+            src.getChars(2, 9, tmp, 0);
+            System.out.println("GLITCH: expected exception");
+        } catch (NullPointerException npe) {
+            System.out.println("Got expected exception");
+        }
+
+        try {
+            src.getChars(-1, 9, dst, 0);
+            System.out.println("GLITCH: expected exception");
+        } catch (StringIndexOutOfBoundsException sioobe) {
+            System.out.println("Got expected exception");
+        }
+
+        try {
+            src.getChars(2, 19, dst, 0);
+            System.out.println("GLITCH: expected exception");
+        } catch (StringIndexOutOfBoundsException sioobe) {
+            System.out.println("Got expected exception");
+        }
+
+        try {
+            src.getChars(2, 1, dst, 0);
+            System.out.println("GLITCH: expected exception");
+        } catch (StringIndexOutOfBoundsException sioobe) {
+            System.out.println("Got expected exception");
+        }
+
+        try {
+            src.getChars(2, 10, dst, 0);
+            System.out.println("GLITCH: expected exception");
+        } catch (ArrayIndexOutOfBoundsException aioobe) {
+            System.out.println("Got expected exception");
+        }
+
+        src.getChars(2, 9, dst, 0);
+        System.out.println(new String(dst));
     }
 }

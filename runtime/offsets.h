@@ -19,7 +19,8 @@
 
 #include <ostream>
 
-#include "globals.h"
+#include "base/enums.h"
+#include "base/globals.h"
 
 namespace art {
 
@@ -51,11 +52,14 @@ class FrameOffset : public Offset {
 };
 
 // Offsets relative to the current running thread.
-template<size_t pointer_size>
+template<PointerSize pointer_size>
 class ThreadOffset : public Offset {
  public:
   explicit ThreadOffset(size_t val) : Offset(val) {}
 };
+
+using ThreadOffset32 = ThreadOffset<PointerSize::k32>;
+using ThreadOffset64 = ThreadOffset<PointerSize::k64>;
 
 // Offsets relative to an object.
 class MemberOffset : public Offset {

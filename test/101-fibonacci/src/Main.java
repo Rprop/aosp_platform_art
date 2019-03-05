@@ -43,7 +43,7 @@ class Main {
     }
 
     public static void main(String[] args) {
-        String arg = (args.length > 0) ? args[0] : "10";
+        String arg = (args.length > 1) ? args[1] : "10";
         try {
             int x = Integer.parseInt(arg);
             int y = fibonacci(x);
@@ -51,7 +51,7 @@ class Main {
             y = fibonacci(x + 1);
             System.out.printf("fibonacci(%d)=%d\n", x + 1, y);
         } catch (NumberFormatException ex) {
-            System.err.println(ex);
+            System.out.println(ex);
             System.exit(1);
         }
     }

@@ -23,7 +23,9 @@
 
 namespace art {
 
-void ResetQuickAllocEntryPoints(QuickEntryPoints* qpoints);
+// is_marking is only used for CC, if the GC is marking the allocation entrypoint is the marking
+// one.
+void ResetQuickAllocEntryPoints(QuickEntryPoints* qpoints, bool is_marking);
 
 // Runtime shutdown lock is necessary to prevent races in thread initialization. When the thread is
 // starting it doesn't hold the mutator lock until after it has been added to the thread list.
@@ -31,10 +33,10 @@ void ResetQuickAllocEntryPoints(QuickEntryPoints* qpoints);
 // holding the runtime shutdown lock and the mutator lock when we update the entrypoints.
 
 void SetQuickAllocEntryPointsAllocator(gc::AllocatorType allocator)
-    EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_, Locks::runtime_shutdown_lock_);
+    REQUIRES(Locks::mutator_lock_, Locks::runtime_shutdown_lock_);
 
 void SetQuickAllocEntryPointsInstrumented(bool instrumented)
-    EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_, Locks::runtime_shutdown_lock_);
+    REQUIRES(Locks::mutator_lock_, Locks::runtime_shutdown_lock_);
 
 }  // namespace art
 

@@ -16,41 +16,68 @@
 
 #include "java_lang_reflect_Constructor.h"
 
+#include "nativehelper/jni_macros.h"
+
 #include "art_method-inl.h"
+#include "base/enums.h"
 #include "class_linker.h"
-#include "jni_internal.h"
+#include "class_root.h"
+#include "dex/dex_file_annotations.h"
+#include "jni/jni_internal.h"
 #include "mirror/class-inl.h"
 #include "mirror/method.h"
 #include "mirror/object-inl.h"
+#include "native_util.h"
 #include "reflection.h"
-#include "scoped_fast_native_object_access.h"
+#include "scoped_fast_native_object_access-inl.h"
 #include "well_known_classes.h"
 
 namespace art {
+
+static jobjectArray Constructor_getExceptionTypes(JNIEnv* env, jobject javaMethod) {
+  ScopedFastNativeObjectAccess soa(env);
+  ArtMethod* method = ArtMethod::FromReflectedMethod(soa, javaMethod)
+      ->GetInterfaceMethodIfProxy(kRuntimePointerSize);
+  ObjPtr<mirror::ObjectArray<mirror::Class>> result_array =
+      annotations::GetExceptionTypesForMethod(method);
+  if (result_array == nullptr) {
+    // Return an empty array instead of a null pointer.
+    ObjPtr<mirror::Class> class_array_class = GetClassRoot<mirror::ObjectArray<mirror::Class>>();
+    DCHECK(class_array_class != nullptr);
+    ObjPtr<mirror::ObjectArray<mirror::Class>> empty_array =
+        mirror::ObjectArray<mirror::Class>::Alloc(soa.Self(), class_array_class, 0);
+    return soa.AddLocalReference<jobjectArray>(empty_array);
+  } else {
+    return soa.AddLocalReference<jobjectArray>(result_array);
+  }
+}
 
 /*
  * We can also safely assume the constructor isn't associated
  * with an interface, array, or primitive class. If this is coming from
  * native, it is OK to avoid access checks since JNI does not enforce them.
  */
-static jobject Constructor_newInstance(JNIEnv* env, jobject javaMethod, jobjectArray javaArgs) {
+static jobject Constructor_newInstance0(JNIEnv* env, jobject javaMethod, jobjectArray javaArgs) {
   ScopedFastNativeObjectAccess soa(env);
-  mirror::Constructor* m = soa.Decode<mirror::Constructor*>(javaMethod);
+  ObjPtr<mirror::Constructor> m = soa.Decode<mirror::Constructor>(javaMethod);
+  ArtMethod* constructor_art_method = m->GetArtMethod();
   StackHandleScope<1> hs(soa.Self());
   Handle<mirror::Class> c(hs.NewHandle(m->GetDeclaringClass()));
   if (UNLIKELY(c->IsAbstract())) {
     soa.Self()->ThrowNewExceptionF("Ljava/lang/InstantiationException;", "Can't instantiate %s %s",
                                    c->IsInterface() ? "interface" : "abstract class",
-                                   PrettyDescriptor(c.Get()).c_str());
+                                   c->PrettyDescriptor().c_str());
     return nullptr;
   }
   // Verify that we can access the class.
   if (!m->IsAccessible() && !c->IsPublic()) {
-    auto* caller = GetCallingClass(soa.Self(), 1);
+    // Go 2 frames back, this method is always called from newInstance0, which is called from
+    // Constructor.newInstance(Object... args).
+    ObjPtr<mirror::Class> caller = GetCallingClass(soa.Self(), 2);
     // If caller is null, then we called from JNI, just avoid the check since JNI avoids most
     // access checks anyways. TODO: Investigate if this the correct behavior.
     if (caller != nullptr && !caller->CanAccess(c.Get())) {
-      if (PrettyDescriptor(c.Get()) == "dalvik.system.DexPathList$Element") {
+      if (c->PrettyDescriptor() == "dalvik.system.DexPathList$Element") {
         // b/20699073.
         LOG(WARNING) << "The dalvik.system.DexPathList$Element constructor is not accessible by "
                         "default. This is a temporary workaround for backwards compatibility "
@@ -58,7 +85,8 @@ static jobject Constructor_newInstance(JNIEnv* env, jobject javaMethod, jobjectA
       } else {
         soa.Self()->ThrowNewExceptionF(
             "Ljava/lang/IllegalAccessException;", "%s is not accessible from %s",
-            PrettyClass(c.Get()).c_str(), PrettyClass(caller).c_str());
+            c->PrettyClass().c_str(),
+            caller->PrettyClass().c_str());
         return nullptr;
       }
     }
@@ -73,23 +101,34 @@ static jobject Constructor_newInstance(JNIEnv* env, jobject javaMethod, jobjectA
   }
 
   // String constructor is replaced by a StringFactory method in InvokeMethod.
-  if (c->IsStringClass()) {
-    return InvokeMethod(soa, javaMethod, nullptr, javaArgs, 1);
+  if (UNLIKELY(c->IsStringClass())) {
+    return InvokeMethod(soa, javaMethod, nullptr, javaArgs, 2);
   }
 
-  mirror::Object* receiver =
+  ObjPtr<mirror::Object> receiver =
       movable ? c->AllocObject(soa.Self()) : c->AllocNonMovableObject(soa.Self());
-  if (receiver == nullptr) {
+  if (UNLIKELY(receiver == nullptr)) {
+    DCHECK(soa.Self()->IsExceptionPending());
     return nullptr;
   }
   jobject javaReceiver = soa.AddLocalReference<jobject>(receiver);
-  InvokeMethod(soa, javaMethod, javaReceiver, javaArgs, 1);
-  // Constructors are ()V methods, so we shouldn't touch the result of InvokeMethod.
+
+  InvokeConstructor(soa, constructor_art_method, receiver, javaArgs);
+
   return javaReceiver;
 }
 
+static jobject Constructor_newInstanceFromSerialization(JNIEnv* env, jclass unused ATTRIBUTE_UNUSED,
+                                                        jclass ctorClass, jclass allocClass) {
+    jmethodID ctor = env->GetMethodID(ctorClass, "<init>", "()V");
+    DCHECK(ctor != NULL);
+    return env->NewObject(allocClass, ctor);
+}
+
 static JNINativeMethod gMethods[] = {
-  NATIVE_METHOD(Constructor, newInstance, "!([Ljava/lang/Object;)Ljava/lang/Object;"),
+  FAST_NATIVE_METHOD(Constructor, getExceptionTypes, "()[Ljava/lang/Class;"),
+  FAST_NATIVE_METHOD(Constructor, newInstance0, "([Ljava/lang/Object;)Ljava/lang/Object;"),
+  FAST_NATIVE_METHOD(Constructor, newInstanceFromSerialization, "(Ljava/lang/Class;Ljava/lang/Class;)Ljava/lang/Object;"),
 };
 
 void register_java_lang_reflect_Constructor(JNIEnv* env) {

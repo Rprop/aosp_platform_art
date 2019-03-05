@@ -16,11 +16,14 @@
 
 #include "intern_table.h"
 
+#include "base/hash_set.h"
 #include "common_runtime_test.h"
-#include "mirror/object.h"
+#include "dex/utf.h"
+#include "gc_root-inl.h"
 #include "handle_scope-inl.h"
+#include "mirror/object.h"
 #include "mirror/string.h"
-#include "scoped_thread_state_change.h"
+#include "scoped_thread_state_change-inl.h"
 
 namespace art {
 
@@ -35,12 +38,14 @@ TEST_F(InternTableTest, Intern) {
   Handle<mirror::String> foo_3(
       hs.NewHandle(mirror::String::AllocFromModifiedUtf8(soa.Self(), "foo")));
   Handle<mirror::String> bar(hs.NewHandle(intern_table.InternStrong(3, "bar")));
+  ASSERT_TRUE(foo_1 != nullptr);
+  ASSERT_TRUE(foo_2 != nullptr);
+  ASSERT_TRUE(foo_3 != nullptr);
+  ASSERT_TRUE(bar != nullptr);
+  EXPECT_EQ(foo_1.Get(), foo_2.Get());
   EXPECT_TRUE(foo_1->Equals("foo"));
   EXPECT_TRUE(foo_2->Equals("foo"));
   EXPECT_TRUE(foo_3->Equals("foo"));
-  EXPECT_TRUE(foo_1.Get() != nullptr);
-  EXPECT_TRUE(foo_2.Get() != nullptr);
-  EXPECT_EQ(foo_1.Get(), foo_2.Get());
   EXPECT_NE(foo_1.Get(), bar.Get());
   EXPECT_NE(foo_2.Get(), bar.Get());
   EXPECT_NE(foo_3.Get(), bar.Get());
@@ -60,9 +65,28 @@ TEST_F(InternTableTest, Size) {
   EXPECT_EQ(2U, t.Size());
 }
 
-class TestPredicate {
+// Check if table indexes match on 64 and 32 bit machines.
+// This is done by ensuring hash values are the same on every machine and limited to 32-bit wide.
+// Otherwise cross compilation can cause a table to be filled on host using one indexing algorithm
+// and later on a device with different sizeof(size_t) can use another indexing algorithm.
+// Thus the table may provide wrong data.
+TEST_F(InternTableTest, CrossHash) {
+  ScopedObjectAccess soa(Thread::Current());
+  InternTable t;
+
+  // A string that has a negative hash value.
+  GcRoot<mirror::String> str(mirror::String::AllocFromModifiedUtf8(soa.Self(), "00000000"));
+
+  MutexLock mu(Thread::Current(), *Locks::intern_table_lock_);
+  for (InternTable::Table::UnorderedSet& table : t.strong_interns_.tables_) {
+    // The negative hash value shall be 32-bit wide on every host.
+    ASSERT_TRUE(IsUint<32>(table.hashfn_(str)));
+  }
+}
+
+class TestPredicate : public IsMarkedVisitor {
  public:
-  bool IsMarked(const mirror::Object* s) const {
+  mirror::Object* IsMarked(mirror::Object* s) OVERRIDE REQUIRES_SHARED(Locks::mutator_lock_) {
     bool erased = false;
     for (auto it = expected_.begin(), end = expected_.end(); it != end; ++it) {
       if (*it == s) {
@@ -72,7 +96,7 @@ class TestPredicate {
       }
     }
     EXPECT_TRUE(erased);
-    return false;
+    return nullptr;
   }
 
   void Expect(const mirror::String* s) {
@@ -86,13 +110,6 @@ class TestPredicate {
  private:
   mutable std::vector<const mirror::String*> expected_;
 };
-
-mirror::Object* IsMarkedSweepingCallback(mirror::Object* object, void* arg) {
-  if (reinterpret_cast<TestPredicate*>(arg)->IsMarked(object)) {
-    return object;
-  }
-  return nullptr;
-}
 
 TEST_F(InternTableTest, SweepInternTableWeaks) {
   ScopedObjectAccess soa(Thread::Current());
@@ -115,7 +132,7 @@ TEST_F(InternTableTest, SweepInternTableWeaks) {
   p.Expect(s1.Get());
   {
     ReaderMutexLock mu(soa.Self(), *Locks::heap_bitmap_lock_);
-    t.SweepInternTableWeaks(IsMarkedSweepingCallback, &p);
+    t.SweepInternTableWeaks(&p);
   }
 
   EXPECT_EQ(2U, t.Size());
@@ -180,6 +197,41 @@ TEST_F(InternTableTest, ContainsWeak) {
     EXPECT_FALSE(t.ContainsWeak(interned_foo_2.Get()));
     EXPECT_EQ(interned_foo_1.Get(), interned_foo_2.Get());
   }
+}
+
+TEST_F(InternTableTest, LookupStrong) {
+  ScopedObjectAccess soa(Thread::Current());
+  InternTable intern_table;
+  StackHandleScope<3> hs(soa.Self());
+  Handle<mirror::String> foo(hs.NewHandle(intern_table.InternStrong(3, "foo")));
+  Handle<mirror::String> bar(hs.NewHandle(intern_table.InternStrong(3, "bar")));
+  Handle<mirror::String> foobar(hs.NewHandle(intern_table.InternStrong(6, "foobar")));
+  ASSERT_TRUE(foo != nullptr);
+  ASSERT_TRUE(bar != nullptr);
+  ASSERT_TRUE(foobar != nullptr);
+  ASSERT_TRUE(foo->Equals("foo"));
+  ASSERT_TRUE(bar->Equals("bar"));
+  ASSERT_TRUE(foobar->Equals("foobar"));
+  ASSERT_NE(foo.Get(), bar.Get());
+  ASSERT_NE(foo.Get(), foobar.Get());
+  ASSERT_NE(bar.Get(), foobar.Get());
+  ObjPtr<mirror::String> lookup_foo = intern_table.LookupStrong(soa.Self(), 3, "foo");
+  EXPECT_OBJ_PTR_EQ(lookup_foo, foo.Get());
+  ObjPtr<mirror::String> lookup_bar = intern_table.LookupStrong(soa.Self(), 3, "bar");
+  EXPECT_OBJ_PTR_EQ(lookup_bar, bar.Get());
+  ObjPtr<mirror::String> lookup_foobar = intern_table.LookupStrong(soa.Self(), 6, "foobar");
+  EXPECT_OBJ_PTR_EQ(lookup_foobar, foobar.Get());
+  ObjPtr<mirror::String> lookup_foox = intern_table.LookupStrong(soa.Self(), 4, "foox");
+  EXPECT_TRUE(lookup_foox == nullptr);
+  ObjPtr<mirror::String> lookup_fooba = intern_table.LookupStrong(soa.Self(), 5, "fooba");
+  EXPECT_TRUE(lookup_fooba == nullptr);
+  ObjPtr<mirror::String> lookup_foobaR = intern_table.LookupStrong(soa.Self(), 6, "foobaR");
+  EXPECT_TRUE(lookup_foobaR == nullptr);
+  // Try a hash conflict.
+  ASSERT_EQ(ComputeUtf16HashFromModifiedUtf8("foobar", 6),
+            ComputeUtf16HashFromModifiedUtf8("foobbS", 6));
+  ObjPtr<mirror::String> lookup_foobbS = intern_table.LookupStrong(soa.Self(), 6, "foobbS");
+  EXPECT_TRUE(lookup_foobbS == nullptr);
 }
 
 }  // namespace art
